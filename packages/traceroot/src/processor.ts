@@ -1,11 +1,6 @@
 // src/processor.ts
 import { trace as otelTrace, Context, Span } from '@opentelemetry/api';
-import {
-  BatchSpanProcessor,
-  ReadableSpan,
-  SimpleSpanProcessor,
-  SpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
+import { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { getAttributesFromContext } from '@arizeai/openinference-core';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -21,12 +16,12 @@ export interface TraceRootSpanProcessorOptions {
 }
 
 /**
- * Wraps an inner SpanProcessor (Batch or Simple) and injects TraceRoot SDK
- * metadata attributes on every span start. This is the only processor TraceRoot
- * registers; the inner processor handles actual export batching.
+ * Wraps an inner SpanProcessor and injects TraceRoot SDK metadata attributes
+ * on every span start. The inner processor handles export batching and, when
+ * the Vercel AI SDK is in use, OpenInference attribute enrichment.
  */
 export class TraceRootSpanProcessor implements SpanProcessor {
-  private readonly inner: BatchSpanProcessor | SimpleSpanProcessor;
+  private readonly inner: SpanProcessor;
   private readonly _environment: string | undefined;
   private readonly _gitRepo: string | undefined;
   private readonly _gitRef: string | undefined;
@@ -36,10 +31,7 @@ export class TraceRootSpanProcessor implements SpanProcessor {
   private readonly _idsPathBySpanId = new Map<string, string[]>();
   private readonly _namePathBySpanId = new Map<string, string[]>();
 
-  constructor(
-    inner: BatchSpanProcessor | SimpleSpanProcessor,
-    opts: TraceRootSpanProcessorOptions = {},
-  ) {
+  constructor(inner: SpanProcessor, opts: TraceRootSpanProcessorOptions = {}) {
     this.inner = inner;
     this._environment = opts.environment;
     this._gitRepo = opts.gitRepo;

@@ -92,6 +92,9 @@ importers:
       '@arizeai/openinference-semantic-conventions':
         specifier: ^2.1.7
         version: 2.1.7
+      '@arizeai/openinference-vercel':
+        specifier: ^2.7.2
+        version: 2.7.4(@opentelemetry/api@1.9.1)(@opentelemetry/semantic-conventions@1.40.0)
       '@opentelemetry/api':
         specifier: ^1.9.1
         version: 1.9.1
@@ -114,9 +117,6 @@ importers:
         specifier: ^1.40.0
         version: 1.40.0
     devDependencies:
-      '@arizeai/openinference-vercel':
-        specifier: ^2.7.2
-        version: 2.7.4(@opentelemetry/api@1.9.1)(@opentelemetry/semantic-conventions@1.40.0)
       '@eslint/js':
         specifier: ^9.0.0
         version: 9.39.4
