@@ -47,27 +47,25 @@ export function initialize(options: InitializeOptions): CursorTracingHandle {
     ? new SimpleSpanProcessor(exporter)
     : new BatchSpanProcessor(exporter);
 
-  provider = new BasicTracerProvider({
+  const localProvider = new BasicTracerProvider({
     spanProcessors: [processor],
   });
+  provider = localProvider;
 
-  const tracer = provider.getTracer(TRACER_NAME, TRACER_VERSION);
-
-  handle = {
-    tracer,
+  const newHandle: CursorTracingHandle = {
+    tracer: localProvider.getTracer(TRACER_NAME, TRACER_VERSION),
     async flush() {
-      if (provider) await provider.forceFlush();
+      await localProvider.forceFlush();
     },
     async shutdown() {
-      if (provider) {
-        await provider.shutdown();
-        provider = undefined;
-      }
-      handle = undefined;
+      await localProvider.shutdown();
+      if (handle === newHandle) handle = undefined;
+      if (provider === localProvider) provider = undefined;
     },
   };
 
-  return handle;
+  handle = newHandle;
+  return newHandle;
 }
 
 export function getCursorTracer(): Tracer | undefined {

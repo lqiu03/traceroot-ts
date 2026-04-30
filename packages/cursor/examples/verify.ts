@@ -36,41 +36,44 @@ initialize({
   baseUrl,
 });
 
-console.log(`[verify] creating Cursor agent`);
-const rawAgent = await Agent.create({
-  apiKey: cursorApiKey,
-  name: 'traceroot-verify',
-  model: { id: process.env.CURSOR_MODEL ?? 'composer-2' },
-  local: { cwd: process.cwd() },
-});
+try {
+  console.log(`[verify] creating Cursor agent`);
+  const rawAgent = await Agent.create({
+    apiKey: cursorApiKey,
+    name: 'traceroot-verify',
+    model: { id: process.env.CURSOR_MODEL ?? 'composer-2' },
+    local: { cwd: process.cwd() },
+  });
 
-console.log(`[verify] wrapping agent (sessionId=${sessionId}, userId=${userId})`);
-const agent = wrapAgent(rawAgent, { sessionId, userId });
+  console.log(`[verify] wrapping agent (sessionId=${sessionId}, userId=${userId})`);
+  const agent = wrapAgent(rawAgent, { sessionId, userId });
 
-const prompt = 'List the 3 files in this directory and explain what they do in one short sentence.';
-console.log(`[verify] sending prompt: ${prompt}`);
-const run = await agent.send(prompt);
+  const prompt =
+    'List the 3 files in this directory and explain what they do in one short sentence.';
+  console.log(`[verify] sending prompt: ${prompt}`);
+  const run = await agent.send(prompt);
 
-console.log(`[verify] streaming events from run.stream()...\n`);
-process.stdout.write('--- assistant output ---\n');
-for await (const event of run.stream()) {
-  if (event.type === 'assistant') {
-    for (const block of event.message.content) {
-      if (block.type === 'text') process.stdout.write(block.text);
+  console.log(`[verify] streaming events from run.stream()...\n`);
+  process.stdout.write('--- assistant output ---\n');
+  for await (const event of run.stream()) {
+    if (event.type === 'assistant') {
+      for (const block of event.message.content) {
+        if (block.type === 'text') process.stdout.write(block.text);
+      }
     }
   }
+  process.stdout.write('\n--- end assistant output ---\n');
+
+  console.log(`[verify] awaiting run.wait()...`);
+  const result = await run.wait();
+  console.log(`[verify] run.wait result:`, JSON.stringify(result, null, 2));
+} finally {
+  console.log(`[verify] flushing spans to TraceRoot...`);
+  await flush();
+
+  console.log(`[verify] shutting down tracer...`);
+  await shutdown();
 }
-process.stdout.write('\n--- end assistant output ---\n');
-
-console.log(`[verify] awaiting run.wait()...`);
-const result = await run.wait();
-console.log(`[verify] run.wait result:`, JSON.stringify(result, null, 2));
-
-console.log(`[verify] flushing spans to TraceRoot...`);
-await flush();
-
-console.log(`[verify] shutting down tracer...`);
-await shutdown();
 
 console.log(`\n[verify] DONE.`);
 console.log(`[verify] Open http://localhost:3000 and look for a trace with:`);

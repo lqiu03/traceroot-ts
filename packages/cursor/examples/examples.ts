@@ -54,22 +54,24 @@ async function runScenario(label: string, prompts: string[]): Promise<void> {
   }
 }
 
-await runScenario('multiturn', [
-  "What's the most prominent language by file count in this folder?",
-  'Now show me the smallest non-empty TypeScript file in this folder and explain its purpose in one sentence.',
-]);
+try {
+  await runScenario('multiturn', [
+    "What's the most prominent language by file count in this folder?",
+    'Now show me the smallest non-empty TypeScript file in this folder and explain its purpose in one sentence.',
+  ]);
 
-await runScenario('explore', [
-  "Find every file under this folder that mentions 'TraceRoot' (case-insensitive) and summarize what each does in one short bullet. Use glob, grep, and read tools.",
-]);
+  await runScenario('explore', [
+    "Find every file under this folder that mentions 'TraceRoot' (case-insensitive) and summarize what each does in one short bullet. Use glob, grep, and read tools.",
+  ]);
 
-await runScenario('reasoning', [
-  'If I wanted to add real-time streaming of shell tool output to my OTel traces (so each shell line becomes a span event), describe the minimal change to make in a TypeScript wrapper. Plan only — no code. Use read tool to look at any local file you find that might be relevant.',
-]);
-
-console.log('\n[examples] flushing spans + shutting down...');
-await flush();
-await shutdown();
-console.log(
-  '[examples] DONE. Open http://localhost:3000 cursor-sdk project, sort by recent traces.',
-);
+  await runScenario('reasoning', [
+    'If I wanted to add real-time streaming of shell tool output to my OTel traces (so each shell line becomes a span event), describe the minimal change to make in a TypeScript wrapper. Plan only — no code. Use read tool to look at any local file you find that might be relevant.',
+  ]);
+} finally {
+  console.log('\n[examples] flushing spans + shutting down...');
+  await flush();
+  await shutdown();
+  console.log(
+    '[examples] DONE. Open http://localhost:3000 cursor-sdk project, sort by recent traces.',
+  );
+}

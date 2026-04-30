@@ -12,9 +12,7 @@ dotenv.config();
 
 const apiKey = process.env.CURSOR_API_KEY;
 if (!apiKey) {
-  console.error(
-    `[capture] CURSOR_API_KEY not found. Expected CURSOR_API_KEY/TRACEROOT_API_KEY in environment or .env at cwd`,
-  );
+  console.error('[capture] CURSOR_API_KEY not found in environment or .env at cwd');
   process.exit(1);
 }
 
