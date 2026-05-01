@@ -11,4 +11,4 @@ export { usingAttributes } from './usingAttributes';
 export { SpanAttributes } from './constants';
 export type { SpanType, ObserveOptions, InitializeOptions } from './types';
 export type { UsingAttributesOptions } from './usingAttributes';
-export { TraceRootTracingProcessor } from './openai-agents';
+export { OpenAIAgentsProcessor } from './openai-agents';

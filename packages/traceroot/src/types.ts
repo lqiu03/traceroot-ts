@@ -54,7 +54,15 @@ export interface InitializeOptions {
     langchain?: unknown;
     claudeAgentSDK?: unknown;
     bedrock?: unknown;
-    openaiAgents?: unknown; // @openai/agents module ref (ESM — pass `import * as x from '@openai/agents'`)
+    /**
+     * @openai/agents module ref. Pass `import * as agents from '@openai/agents'`.
+     *
+     * Replaces the SDK's default OpenAI tracing processor with TraceRoot's —
+     * spans go to TraceRoot only, NOT to OpenAI's tracing backend.
+     * To dual-export, call `addTraceProcessor(...)` from `@openai/agents`
+     * after `initialize()`.
+     */
+    openaiAgents?: unknown;
   };
   /** Use SimpleSpanProcessor instead of BatchSpanProcessor. Useful for scripts/tests. */
   disableBatch?: boolean;

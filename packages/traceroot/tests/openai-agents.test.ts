@@ -6,10 +6,10 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import {
   getSpanName,
   getSpanAttributes,
-  TraceRootTracingProcessor,
+  OpenAIAgentsProcessor,
   wireOpenAIAgentsProcessor,
 } from '../src/openai-agents';
-import type { OASpanData } from '../src/openai-agents';
+import type { SpanData } from '@openai/agents';
 
 describe('getSpanName()', () => {
   it('agent → agent name', () => {
@@ -61,7 +61,7 @@ describe('getSpanName()', () => {
 
 describe('getSpanAttributes()', () => {
   it('all types set openinference.span.kind', () => {
-    const cases: Array<[OASpanData, string]> = [
+    const cases: Array<[SpanData, string]> = [
       [{ type: 'agent', name: 'x', tools: [], handoffs: [] }, 'AGENT'],
       [{ type: 'function', name: 'x', input: '', output: '' }, 'TOOL'],
       [{ type: 'generation' }, 'LLM'],
@@ -169,10 +169,10 @@ describe('getSpanAttributes()', () => {
   });
 });
 
-describe('TraceRootTracingProcessor', () => {
+describe('OpenAIAgentsProcessor', () => {
   let exporter: InMemorySpanExporter;
   let provider: NodeTracerProvider;
-  let processor: TraceRootTracingProcessor;
+  let processor: OpenAIAgentsProcessor;
 
   const mockTrace = { type: 'trace' as const, traceId: 'trace_abc', name: 'Test Workflow' };
 
@@ -181,7 +181,7 @@ describe('TraceRootTracingProcessor', () => {
     provider = new NodeTracerProvider();
     provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
     provider.register();
-    processor = new TraceRootTracingProcessor();
+    processor = new OpenAIAgentsProcessor();
   });
 
   afterEach(async () => {
@@ -364,31 +364,28 @@ describe('TraceRootTracingProcessor', () => {
 });
 
 describe('wireOpenAIAgentsProcessor()', () => {
-  it('calls registerProcessor on the module provider with a TraceRootTracingProcessor', () => {
-    let registered: unknown;
+  it('calls setTraceProcessors with a single OpenAIAgentsProcessor (replace mode)', () => {
+    let registered: unknown[] | undefined;
     const mockModule = {
-      getGlobalTraceProvider: () => ({
-        registerProcessor: (p: unknown) => {
-          registered = p;
-        },
-      }),
+      setTraceProcessors: (procs: unknown[]) => {
+        registered = procs;
+      },
     };
 
     wireOpenAIAgentsProcessor(mockModule);
-    assert.ok(registered instanceof TraceRootTracingProcessor);
+    assert.ok(Array.isArray(registered), 'setTraceProcessors not called');
+    assert.equal(registered!.length, 1);
+    assert.ok(registered![0] instanceof OpenAIAgentsProcessor);
   });
 
-  it('throws if module does not expose getGlobalTraceProvider', () => {
-    assert.throws(() => wireOpenAIAgentsProcessor({}), /getGlobalTraceProvider/);
+  it('throws if module does not expose setTraceProcessors', () => {
+    assert.throws(() => wireOpenAIAgentsProcessor({}), /setTraceProcessors/);
   });
 
-  it('throws if provider.registerProcessor is not a function', () => {
+  it('throws if setTraceProcessors is not a function', () => {
     assert.throws(
-      () =>
-        wireOpenAIAgentsProcessor({
-          getGlobalTraceProvider: () => ({ registerProcessor: 'not-a-function' }),
-        }),
-      /registerProcessor/,
+      () => wireOpenAIAgentsProcessor({ setTraceProcessors: 'not-a-function' }),
+      /setTraceProcessors/,
     );
   });
 });

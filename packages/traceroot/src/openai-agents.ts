@@ -1,44 +1,30 @@
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { Context, Span as OTelSpan } from '@opentelemetry/api';
+import type { SpanData } from '@openai/agents';
 
-// Minimal type mirrors for @openai/agents shapes — no runtime import needed.
-export type OASpanData =
-  | { type: 'agent'; name: string; tools?: string[]; handoffs?: string[]; output_type?: string }
-  | { type: 'function'; name: string; input: string; output: string; mcp_data?: string }
-  | {
-      type: 'generation';
-      model?: string;
-      input?: unknown[];
-      output?: unknown[];
-      usage?: { input_tokens?: number; output_tokens?: number };
-    }
-  | { type: 'response'; response_id?: string; _input?: unknown; _response?: unknown }
-  | { type: 'handoff'; from_agent?: string; to_agent?: string }
-  | { type: 'custom'; name: string; data: Record<string, unknown> }
-  | { type: 'guardrail'; name: string; triggered: boolean }
-  | { type: 'transcription'; input?: unknown; output?: string; model?: string }
-  | { type: 'speech'; input?: string; output?: unknown; model?: string }
-  | { type: 'speech_group'; input?: string }
-  | { type: 'mcp_tools'; server?: string; result?: string[] };
-
-export interface OATrace {
-  type: 'trace';
-  traceId: string;
-  name?: string; // optional — SDK may omit it
-}
-
-export interface OASpan {
+// Structural mirrors of the public read-surface of @openai/agents `Span` and `Trace`.
+// We can't use the SDK class types directly because they hold their state in
+// ECMAScript `#private` fields, which makes plain object fixtures (used in tests)
+// unassignable to them. The runtime objects we receive from the SDK satisfy these
+// shapes via public getters.
+export interface OpenAIAgentsSpan {
   type: 'trace.span';
   spanId: string;
   traceId: string;
   parentId?: string | null;
-  spanData: OASpanData;
+  spanData: SpanData;
   startedAt?: string | null;
   endedAt?: string | null;
   error?: { message: string } | null;
 }
 
-const SPAN_KIND: Record<OASpanData['type'], string> = {
+export interface OpenAIAgentsTrace {
+  type?: 'trace';
+  traceId: string;
+  name?: string;
+}
+
+const SPAN_KIND: Record<SpanData['type'], string> = {
   agent: 'AGENT',
   function: 'TOOL',
   generation: 'LLM',
@@ -52,7 +38,7 @@ const SPAN_KIND: Record<OASpanData['type'], string> = {
   mcp_tools: 'TOOL',
 };
 
-export function getSpanName(data: OASpanData): string {
+export function getSpanName(data: SpanData): string {
   switch (data.type) {
     case 'agent':
       return data.name;
@@ -79,7 +65,7 @@ export function getSpanName(data: OASpanData): string {
   }
 }
 
-export function getSpanAttributes(data: OASpanData): Record<string, string | number | boolean> {
+export function getSpanAttributes(data: SpanData): Record<string, string | number | boolean> {
   const attrs: Record<string, string | number | boolean> = {
     'openinference.span.kind': SPAN_KIND[data.type],
   };
@@ -144,16 +130,12 @@ export function getSpanAttributes(data: OASpanData): Record<string, string | num
   return attrs;
 }
 
-export class TraceRootTracingProcessor {
-  private static readonly MAX_SPANS = 2000;
+export class OpenAIAgentsProcessor {
   private readonly spanMap = new Map<string, OTelSpan>();
   private readonly ctxMap = new Map<string, Context>();
-  private get tracer() {
-    return trace.getTracer('@traceroot-ai/openai-agents');
-  }
+  private readonly tracer = trace.getTracer('@traceroot-ai/openai-agents');
 
-  async onTraceStart(t: OATrace): Promise<void> {
-    if (this.spanMap.size >= TraceRootTracingProcessor.MAX_SPANS) return;
+  async onTraceStart(t: OpenAIAgentsTrace): Promise<void> {
     const span = this.tracer.startSpan(t.name ?? 'Agent workflow', {
       attributes: { 'openinference.span.kind': 'CHAIN' },
     });
@@ -161,14 +143,13 @@ export class TraceRootTracingProcessor {
     this.ctxMap.set(t.traceId, trace.setSpan(context.active(), span));
   }
 
-  async onTraceEnd(t: OATrace): Promise<void> {
+  async onTraceEnd(t: OpenAIAgentsTrace): Promise<void> {
     this.spanMap.get(t.traceId)?.end();
     this.spanMap.delete(t.traceId);
     this.ctxMap.delete(t.traceId);
   }
 
-  async onSpanStart(s: OASpan): Promise<void> {
-    if (this.spanMap.size >= TraceRootTracingProcessor.MAX_SPANS) return;
+  async onSpanStart(s: OpenAIAgentsSpan): Promise<void> {
     const parentCtx =
       (s.parentId != null && this.ctxMap.get(s.parentId)) ||
       this.ctxMap.get(s.traceId) ||
@@ -182,7 +163,7 @@ export class TraceRootTracingProcessor {
     this.ctxMap.set(s.spanId, trace.setSpan(parentCtx, otelSpan));
   }
 
-  async onSpanEnd(s: OASpan): Promise<void> {
+  async onSpanEnd(s: OpenAIAgentsSpan): Promise<void> {
     const otelSpan = this.spanMap.get(s.spanId);
     if (otelSpan) {
       const attrs = getSpanAttributes(s.spanData);
@@ -198,18 +179,24 @@ export class TraceRootTracingProcessor {
   async forceFlush(): Promise<void> {}
 }
 
+/**
+ * Replaces @openai/agents' default tracing processors with TraceRoot's.
+ *
+ * The SDK's umbrella package eagerly registers an OpenAI-hosted exporter at
+ * import time (sends spans to api.openai.com). Calling `setTraceProcessors`
+ * here replaces that default — spans go to TraceRoot only.
+ *
+ * To dual-export (e.g. ship to both TraceRoot *and* OpenAI), call
+ * `addTraceProcessor(otherProcessor)` from `@openai/agents` after `initialize()`.
+ */
 export function wireOpenAIAgentsProcessor(mod: unknown): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const provider = (mod as any).getGlobalTraceProvider?.();
-  if (!provider) {
+  const setTraceProcessors = (mod as any)?.setTraceProcessors;
+  if (typeof setTraceProcessors !== 'function') {
     throw new Error(
-      '[TraceRoot] instrumentModules.openaiAgents does not expose getGlobalTraceProvider. Check your @openai/agents version (>=0.0.1 required).',
+      '[TraceRoot] instrumentModules.openaiAgents does not expose setTraceProcessors. ' +
+        'Pass `import * as agents from "@openai/agents"` (the module namespace, not a sub-export).',
     );
   }
-  if (typeof provider.registerProcessor !== 'function') {
-    throw new Error(
-      '[TraceRoot] provider.registerProcessor is not a function. Check your @openai/agents version (>=0.0.1 required).',
-    );
-  }
-  provider.registerProcessor(new TraceRootTracingProcessor());
+  setTraceProcessors([new OpenAIAgentsProcessor()]);
 }
