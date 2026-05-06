@@ -493,19 +493,38 @@ describe('Vercel AI SDK integration via OpenInference', () => {
       );
 
       await rig.provider.forceFlush();
-      const wrapper = findSpan(rig.exporter.getFinishedSpans(), 'ai.generateText');
+      const spans = rig.exporter.getFinishedSpans();
+      const wrapper = findSpan(spans, 'ai.generateText');
+      const inner = findSpan(spans, 'ai.generateText.doGenerate');
 
+      // Wrapper (AGENT, root of the AI SDK call): the #2651 case.
       assert.equal(
         wrapper.attributes['session.id'],
         'sess-42',
-        'session.id must propagate from usingAttributes() to ai.generateText (the #2651 case)',
+        'session.id must propagate from usingAttributes() to ai.generateText',
       );
       assert.equal(wrapper.attributes['user.id'], 'u-7');
-      const tagsAttr = wrapper.attributes['tag.tags'];
-      assert.ok(tagsAttr, 'tag.tags must be set');
+      const wrapperTags = wrapper.attributes['tag.tags'];
+      assert.ok(wrapperTags, 'tag.tags must be set on wrapper');
       assert.ok(
-        String(tagsAttr).includes('prod') && String(tagsAttr).includes('beta'),
-        `tag.tags should contain prod and beta; got: ${tagsAttr}`,
+        String(wrapperTags).includes('prod') && String(wrapperTags).includes('beta'),
+        `wrapper tag.tags should contain prod and beta; got: ${wrapperTags}`,
+      );
+
+      // Inner doGenerate (LLM child): must inherit too. Guards against a
+      // regression where the onStart hook only fires for root spans, or where
+      // OI Context propagation breaks across the wrapper -> child boundary.
+      assert.equal(
+        inner.attributes['session.id'],
+        'sess-42',
+        'session.id must also propagate to the doGenerate child span',
+      );
+      assert.equal(inner.attributes['user.id'], 'u-7');
+      const innerTags = inner.attributes['tag.tags'];
+      assert.ok(innerTags, 'tag.tags must be set on inner');
+      assert.ok(
+        String(innerTags).includes('prod') && String(innerTags).includes('beta'),
+        `inner tag.tags should contain prod and beta; got: ${innerTags}`,
       );
     });
   });
