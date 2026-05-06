@@ -1,5 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { ROOT_CONTEXT } from '@opentelemetry/api';
 import { TraceRoot, _resetForTesting } from '../src/traceroot';
 import { TraceRootSpanProcessor } from '../src/processor';
 
@@ -108,7 +109,9 @@ function makeProcessorFixture() {
     forceFlush: () => Promise.resolve(),
     shutdown: () => Promise.resolve(),
   } as unknown as import('@opentelemetry/sdk-trace-base').SimpleSpanProcessor;
-  const ctx = {} as import('@opentelemetry/api').Context;
+  // Use the real ROOT_CONTEXT so getAttributesFromContext() (called inside
+  // TraceRootSpanProcessor.onStart for the OI #2651 fix) has a working .getValue().
+  const ctx = ROOT_CONTEXT;
   return { span, inner, attributes, ctx };
 }
 

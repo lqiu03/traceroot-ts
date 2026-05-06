@@ -1,6 +1,7 @@
 // src/processor.ts
 import { Context, Span } from '@opentelemetry/api';
 import { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { getAttributesFromContext } from '@arizeai/openinference-core';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { version } = require('../package.json') as { version: string };
@@ -20,16 +21,13 @@ export interface TraceRootSpanProcessorOptions {
  * the Vercel AI SDK is in use, OpenInference attribute enrichment.
  */
 export class TraceRootSpanProcessor implements SpanProcessor {
-  private readonly inner: SpanProcessor; // ← WIDENED from BatchSpanProcessor | SimpleSpanProcessor
+  private readonly inner: SpanProcessor;
 
   private readonly _environment: string | undefined;
   private readonly _gitRepo: string | undefined;
   private readonly _gitRef: string | undefined;
 
-  constructor(
-    inner: SpanProcessor, // ← WIDENED
-    opts: TraceRootSpanProcessorOptions = {},
-  ) {
+  constructor(inner: SpanProcessor, opts: TraceRootSpanProcessorOptions = {}) {
     this.inner = inner;
     this._environment = opts.environment;
     this._gitRepo = opts.gitRepo;
@@ -49,6 +47,14 @@ export class TraceRootSpanProcessor implements SpanProcessor {
     }
     if (this._gitRef !== undefined) {
       span.setAttribute('traceroot.git.ref', this._gitRef);
+    }
+    // Propagate session.id / user.id / metadata / tags set via usingAttributes()
+    // to ALL spans, including those created outside observe() (notably Vercel AI
+    // SDK spans, which @arizeai/openinference-vercel does not lift from Context —
+    // see Arize-ai/openinference#2651).
+    const ctxAttrs = getAttributesFromContext(parentContext);
+    if (ctxAttrs && Object.keys(ctxAttrs).length > 0) {
+      span.setAttributes(ctxAttrs);
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.inner.onStart(span as any, parentContext);
