@@ -449,6 +449,115 @@ describe('Vercel AI SDK integration via OpenInference', () => {
 
       assert.equal(manual.attributes['traceroot.sdk.name'], 'traceroot-ts');
     });
+
+    it('preserves attributes on a span shaped like an OI Instrumentor emission (LangChain/OpenAI/Anthropic)', async () => {
+      // Simulates a span emitted by @arizeai/openinference-instrumentation-{langchain,openai,anthropic,bedrock,claude-agent-sdk}.
+      // These Instrumentors set OI conventions directly at span creation. The Vercel SpanProcessor
+      // must not stomp on those values.
+      const tracer = trace.getTracer('langchain-sim');
+      await new Promise<void>((resolve) => {
+        tracer.startActiveSpan('ChatOpenAI', (span) => {
+          span.setAttribute('openinference.span.kind', 'LLM');
+          span.setAttribute('llm.model_name', 'gpt-4o');
+          span.setAttribute('llm.token_count.prompt', 42);
+          span.setAttribute('llm.token_count.completion', 17);
+          span.setAttribute('input.value', 'instrumentor-input');
+          span.setAttribute('output.value', 'instrumentor-output');
+          span.setAttribute('llm.provider', 'openai');
+          span.end();
+          resolve();
+        });
+      });
+
+      await rig.provider.forceFlush();
+      const spans = rig.exporter.getFinishedSpans();
+      const lc = findSpan(spans, 'ChatOpenAI');
+
+      // Every OI-shaped attribute set by the simulated Instrumentor must round-trip unchanged.
+      assert.equal(lc.attributes['openinference.span.kind'], 'LLM');
+      assert.equal(lc.attributes['llm.model_name'], 'gpt-4o');
+      assert.equal(lc.attributes['llm.token_count.prompt'], 42);
+      assert.equal(lc.attributes['llm.token_count.completion'], 17);
+      assert.equal(lc.attributes['input.value'], 'instrumentor-input');
+      assert.equal(lc.attributes['output.value'], 'instrumentor-output');
+      assert.equal(lc.attributes['llm.provider'], 'openai');
+
+      // Span name must not be renamed (maybeRenameRootSpan is gated on isLikelyAISDKSpan).
+      assert.equal(lc.name, 'ChatOpenAI');
+
+      // Status must not be force-set (maybeSet*Status is gated on isLikelyAISDKSpan).
+      assert.notEqual(lc.status.code, SpanStatusCode.ERROR);
+
+      // TraceRoot SDK markers still applied.
+      assert.equal(lc.attributes['traceroot.sdk.name'], 'traceroot-ts');
+    });
+
+    it('does not contaminate a non-Vercel root span that shares a trace with a Vercel AI SDK call', async () => {
+      // Critical regression case: TraceAggregateManager flips agg.isAISDKTrace=true when ANY span
+      // in the trace looks like an AI SDK span. Verifies the non-AI root sibling/parent does not
+      // get its name, status, or attributes mutated as a side effect.
+      const tracer = trace.getTracer('mixed-trace-sim');
+      await new Promise<void>((resolve, reject) => {
+        tracer.startActiveSpan('app.checkout', async (rootSpan) => {
+          try {
+            rootSpan.setAttribute('app.feature', 'checkout');
+            rootSpan.setAttribute('input.value', 'root-preserved');
+            // Vercel call as a child — flips agg.isAISDKTrace for the whole trace.
+            await generateText({
+              model: staticTextModel('ok'),
+              prompt: 'p',
+              experimental_telemetry: { isEnabled: true },
+            });
+            rootSpan.end();
+            resolve();
+          } catch (err) {
+            rootSpan.end();
+            reject(err);
+          }
+        });
+      });
+
+      await rig.provider.forceFlush();
+      const spans = rig.exporter.getFinishedSpans();
+
+      const root = findSpan(spans, 'app.checkout');
+      const aiWrapper = findSpan(spans, 'ai.generateText');
+
+      // 1. Same trace.
+      assert.equal(
+        root.spanContext().traceId,
+        aiWrapper.spanContext().traceId,
+        'root and AI wrapper must share trace id (the case agg.isAISDKTrace covers)',
+      );
+
+      // 2. Root span is NOT renamed (maybeRenameRootSpan gated).
+      assert.equal(root.name, 'app.checkout', 'non-AI root must not be renamed by operation.name');
+
+      // 3. Root attributes preserved.
+      assert.equal(root.attributes['app.feature'], 'checkout');
+      assert.equal(
+        root.attributes['input.value'],
+        'root-preserved',
+        'non-AI root input.value must not be overwritten',
+      );
+
+      // 4. Root has no AI/LLM attrs forced onto it.
+      assert.equal(root.attributes['llm.model_name'], undefined);
+      assert.equal(root.attributes['llm.token_count.prompt'], undefined);
+      assert.equal(root.attributes['openinference.span.kind'], undefined);
+
+      // 5. Root status NOT touched by maybeSetRootStatus (gated on isLikelyAISDKSpan).
+      // Asserts UNSET (not just "not ERROR") — if the gate breaks, status would silently flip to OK.
+      assert.equal(
+        root.status.code,
+        SpanStatusCode.UNSET,
+        'non-AI root status must remain UNSET; OK or ERROR would mean the AI SDK gate broke',
+      );
+
+      // 6. Vercel wrapper still gets full OI mapping (proves OI processor still works in mixed trace).
+      assert.equal(aiWrapper.attributes['openinference.span.kind'], 'AGENT');
+      assert.equal(aiWrapper.attributes['llm.model_name'], 'mock-static');
+    });
   });
 
   // ── 7. TraceRootSpanProcessor injection survives the processor swap ───────
