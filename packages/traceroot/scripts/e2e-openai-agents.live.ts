@@ -15,12 +15,7 @@
 //   TRACEROOT_HOST_URL — default http://localhost:8000
 //   CLICKHOUSE_URL     — default http://localhost:8123
 
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { OpenInferenceSimpleSpanProcessor } from '@arizeai/openinference-vercel';
-
-import { TraceRootSpanProcessor } from '../src/processor';
-import { wireOpenAIAgentsProcessor } from '../src/openai-agents';
+import { TraceRoot } from '../src/traceroot';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TRACEROOT_API_KEY = process.env.TRACEROOT_API_KEY;
@@ -54,36 +49,22 @@ async function sleep(ms: number) {
 }
 
 async function main() {
-  // ── Build production-shaped pipeline: ──
-  //   OTLPTraceExporter → OpenInferenceSimpleSpanProcessor (PR #66)
-  //                     → TraceRootSpanProcessor (outer, applies SDK markers)
-  const exporter = new OTLPTraceExporter({
-    url: `${TRACEROOT_HOST_URL}/api/v1/public/traces`,
-    headers: {
-      'x-traceroot-sdk-name': 'traceroot-ts',
-      'x-traceroot-sdk-version': '0.1.3',
-      Authorization: `Bearer ${TRACEROOT_API_KEY}`,
-    },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    compression: 'gzip' as any,
-  });
-  // OI Vercel processor (PR #66) wraps the exporter directly.
-  const oi = new OpenInferenceSimpleSpanProcessor({ exporter });
-
-  const provider = new NodeTracerProvider();
-  provider.addSpanProcessor(
-    new TraceRootSpanProcessor(oi, {
-      environment: 'live-e2e-openai-agents',
-      gitRepo: 'lqiu03/traceroot-ts',
-      gitRef: RUN_TAG,
-    }),
-  );
-  provider.register();
-
-  // ── PR #78: wire @openai/agents tracing processor ──
+  // ── Use the production initialization path, exactly as a real user would. ──
+  // TraceRoot.initialize() builds the pipeline:
+  //   OTLPTraceExporter → OpenInferenceBatchSpanProcessor (PR #66)
+  //                     → TraceRootSpanProcessor (PR #66 + Context lift)
+  // and wires PR #78's @openai/agents processor when instrumentModules.openaiAgents is set.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const agents = require('@openai/agents');
-  wireOpenAIAgentsProcessor(agents);
+  TraceRoot.initialize({
+    apiKey: TRACEROOT_API_KEY,
+    baseUrl: TRACEROOT_HOST_URL,
+    environment: 'live-e2e-openai-agents',
+    gitRepo: 'lqiu03/traceroot-ts',
+    gitRef: RUN_TAG,
+    disableBatch: true, // export each span immediately so the script can poll quickly
+    instrumentModules: { openaiAgents: agents },
+  });
 
   console.log(`[e2e] run tag = ${RUN_TAG}`);
   console.log('[e2e] running Agent...');
@@ -99,7 +80,7 @@ async function main() {
   console.log(`[e2e] agent output = ${result.finalOutput ?? '(none)'}`);
 
   // ── Force flush + wait for OTLP delivery ──
-  await provider.forceFlush();
+  await TraceRoot.flush();
   await sleep(3000);
 
   // ── Query ClickHouse for the spans we just emitted ──
@@ -201,7 +182,7 @@ async function main() {
     for (const f of failures) console.log(`  - ${f}`);
   }
 
-  await provider.shutdown();
+  await TraceRoot.shutdown();
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
