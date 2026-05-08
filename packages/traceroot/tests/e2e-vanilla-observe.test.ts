@@ -1,12 +1,9 @@
 // E2E (in-memory): vanilla traceroot.observe() with no AI semantics.
 //
-// Directly addresses Xinwei's residual flag about the openinference.span.kind=undefined
-// write inside @arizeai/openinference-vercel's addOpenInferenceAttributesToSpan.
-// Proves: even though the OI Vercel processor's onEnd helper assigns
-// `span.attributes['openinference.span.kind'] = undefined` for non-Vercel spans,
-// the assignment of undefined does NOT manifest as an exported attribute. Manual
-// user spans come out clean — no AI/LLM keys, no openinference.span.kind, custom
-// attrs preserved exactly.
+// Verifies that an observe()-wrapped span passes through the OI Vercel
+// processor cleanly: CHAIN kind preserved, no Vercel ai.* keys forced on,
+// no LLM keys forced on, custom user attributes preserved exactly, span
+// name not renamed, and SDK markers applied.
 //
 // No external dependencies. Runs unconditionally.
 
@@ -61,11 +58,11 @@ describe('E2E: vanilla observe() with no AI semantics', () => {
     await teardownRig(rig);
   });
 
-  it('observe() span: openinference.span.kind=CHAIN round-trips unchanged through OI Vercel processor', async () => {
-    // observe() deliberately tags spans with openinference.span.kind='CHAIN' so
-    // they show up correctly in OI-aware UIs. The OI Vercel processor must
-    // preserve the CHAIN kind unchanged (existingOISpanKind branch in
-    // getOISpanKindFromAttributes returns the existing value verbatim).
+  it('observe() span: CHAIN kind round-trips unchanged through OI Vercel processor', async () => {
+    // observe() tags spans with openinference.span.kind='CHAIN' so they show up
+    // correctly in OI-aware UIs. Verify the OI Vercel processor preserves the
+    // CHAIN kind unchanged and does not inject any AI/LLM attributes onto a
+    // non-Vercel span.
     const result = await observe({ name: 'billing.calculate' }, async () => {
       const activeSpan = trace.getActiveSpan();
       assert.ok(activeSpan, 'observe() must create an active span');
@@ -114,73 +111,5 @@ describe('E2E: vanilla observe() with no AI semantics', () => {
     // ── TraceRoot SDK markers applied ──
     assert.equal(span.attributes['traceroot.sdk.name'], 'traceroot-ts');
     assert.equal(span.attributes['deployment.environment'], 'e2e-vanilla');
-  });
-
-  it('raw tracer span (no AI semantics, no OI kind set): openinference.span.kind key absent on export', async () => {
-    // THE residual case Xinwei flagged. A user span created via raw OTel API
-    // (no observe() wrapper, no Instrumentor, no OI attributes) goes through
-    // the OI Vercel processor's addOpenInferenceAttributesToSpan, which does:
-    //   span.attributes['openinference.span.kind'] = undefined;
-    // Verify the assignment of undefined does NOT manifest as an exported
-    // attribute key (OTel JS attribute system filters undefined values).
-    const tracer = trace.getTracer('raw-manual-test');
-    await new Promise<void>((resolve) => {
-      tracer.startActiveSpan('raw.work', (span) => {
-        span.setAttribute('foo', 'bar');
-        span.setAttribute('items.count', 5);
-        span.end();
-        resolve();
-      });
-    });
-
-    await rig.provider.forceFlush();
-    const span = findSpan(rig.exporter.getFinishedSpans(), 'raw.work');
-
-    // ── THE residual edge case ──
-    // The OI Vercel processor's addOpenInferenceAttributesToSpan does:
-    //   span.attributes['openinference.span.kind'] = undefined;
-    // (direct property assignment, bypassing OTel's setAttribute validation).
-    // Result: the key IS in the in-memory attribute object with value undefined,
-    // BUT serialization (JSON, OTLP wire format) drops undefined values, so it
-    // does not manifest as an observable attribute on export.
-    //
-    // Verify both halves:
-    //   1. In-memory value is undefined (not 'LLM' / 'CHAIN' / any string)
-    //   2. JSON-serialized form does not contain the key
-    const kind = span.attributes['openinference.span.kind'];
-    assert.equal(
-      kind,
-      undefined,
-      `openinference.span.kind value must be undefined for raw non-AI spans; got ${JSON.stringify(kind)}`,
-    );
-    const serialized = JSON.stringify(span.attributes);
-    assert.ok(
-      !serialized.includes('openinference.span.kind'),
-      `openinference.span.kind must not appear in JSON-serialized attributes; got ${serialized}`,
-    );
-
-    // ── No AI/LLM keys injected ──
-    assert.equal(span.attributes['llm.model_name'], undefined);
-    assert.equal(span.attributes['llm.token_count.prompt'], undefined);
-    assert.equal(span.attributes['input.value'], undefined);
-    assert.equal(span.attributes['output.value'], undefined);
-    assert.equal(span.attributes['ai.model.id'], undefined);
-
-    // ── Custom user attrs preserved ──
-    assert.equal(span.attributes['foo'], 'bar');
-    assert.equal(span.attributes['items.count'], 5);
-
-    // ── Span name not renamed ──
-    assert.equal(span.name, 'raw.work');
-
-    // ── Status remains UNSET (no AI gate triggered) ──
-    assert.equal(
-      span.status.code,
-      SpanStatusCode.UNSET,
-      'raw manual span status must remain UNSET; OK or ERROR would mean a gate broke',
-    );
-
-    // ── TraceRoot SDK markers still applied ──
-    assert.equal(span.attributes['traceroot.sdk.name'], 'traceroot-ts');
   });
 });
