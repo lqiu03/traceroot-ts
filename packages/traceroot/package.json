@@ -58,8 +58,10 @@
     "@opentelemetry/semantic-conventions": "^1.40.0"
   },
   "devDependencies": {
+    "@arizeai/openinference-vercel": "^2.7.2",
     "@eslint/js": "^9.0.0",
-    "@langchain/core": "^1.1.39",
+    "@langchain/core": "^1.1.45",
+    "@langchain/openai": "^1.4.5",
     "@openai/agents": ">=0.0.1",
     "@types/node": "^20.0.0",
     "anthropic": "^0.0.0",
@@ -71,8 +73,8 @@
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.20.0",
-    "openai": ">=6.0.0",
-    "@openai/agents": ">=0.0.1"
+    "@openai/agents": ">=0.0.1",
+    "openai": ">=6.0.0"
   },
   "peerDependenciesMeta": {
     "openai": {
