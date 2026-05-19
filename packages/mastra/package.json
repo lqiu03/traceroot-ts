@@ -1,6 +1,6 @@
 {
   "name": "@traceroot-ai/mastra",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Traceroot observability exporter for Mastra",
   "keywords": [
     "traceroot",
@@ -27,6 +27,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
@@ -58,6 +59,7 @@
     "@eslint/js": "^9.0.0",
     "@types/node": "^20.0.0",
     "eslint": "^9.0.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.5.0",
     "typescript-eslint": "^8.0.0"
   }

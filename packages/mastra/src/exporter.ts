@@ -31,6 +31,10 @@ import {
   ATTR_TELEMETRY_SDK_VERSION,
 } from '@opentelemetry/semantic-conventions';
 
+// Span path attribute keys — must match TraceRootSpanProcessor (packages/traceroot/src/processor.ts)
+const TR_SPAN_PATH = 'traceroot.span.path';
+const TR_SPAN_IDS_PATH = 'traceroot.span.ids_path';
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { version: SDK_VERSION } = require('../package.json') as { version: string };
 const SDK_NAME = 'traceroot-mastra';
@@ -94,6 +98,11 @@ export interface TraceRootExporterConfig extends BaseExporterConfig {
    * OTLP export timeout in milliseconds.
    */
   timeoutMillis?: number;
+  /**
+   * Override the leaf SpanExporter. When set, skips OTLPTraceExporter entirely.
+   * Intended for testing — pass an InMemorySpanExporter to capture exported spans.
+   */
+  _spanExporter?: SpanExporter;
 }
 
 type ResolvedConfig = {
@@ -103,6 +112,7 @@ type ResolvedConfig = {
   disableBatch: boolean;
   batchSize: number;
   timeoutMillis: number;
+  _spanExporter: SpanExporter | undefined;
 };
 
 export class TraceRootExporter extends BaseExporter {
@@ -110,6 +120,11 @@ export class TraceRootExporter extends BaseExporter {
 
   private resolvedConfig: ResolvedConfig | null;
   private traceMap = new Map<string, TraceState>();
+
+  // Span path ancestry maps — same two-map pattern as TraceRootSpanProcessor (PR #71).
+  // Keyed by spanId; populated on SPAN_STARTED, consumed on SPAN_ENDED, deleted after export.
+  private _namePathBySpanId = new Map<string, string[]>();
+  private _idsPathBySpanId = new Map<string, string[]>();
 
   private resource?: Resource;
   private scope?: InstrumentationScope;
@@ -145,6 +160,7 @@ export class TraceRootExporter extends BaseExporter {
       disableBatch: config.disableBatch ?? false,
       batchSize: config.batchSize ?? 512,
       timeoutMillis: config.timeoutMillis ?? 30_000,
+      _spanExporter: config._spanExporter,
     };
   }
 
@@ -181,6 +197,25 @@ export class TraceRootExporter extends BaseExporter {
   private trackSpanStart(span: AnyExportedSpan): void {
     const state = this.getOrCreateTraceState(span.traceId);
     state.activeSpanIds.add(span.id);
+
+    // Compute ancestry paths using the parent map — same pattern as TraceRootSpanProcessor.
+    // Gate on parentNamePath (not parentSpanId) to keep path/ids_path in sync:
+    // if the parent was never tracked, treat this span as a root rather than emitting
+    // a path with no parent prefix but a non-empty ids_path.
+    const parentSpanId = span.parentSpanId;
+    const parentNamePath = parentSpanId ? this._namePathBySpanId.get(parentSpanId) : undefined;
+    const parentIdsPath = parentSpanId ? this._idsPathBySpanId.get(parentSpanId) : undefined;
+
+    const namePath: string[] = parentNamePath ? [...parentNamePath, span.name] : [span.name];
+    const idsPath: string[] =
+      parentNamePath && parentSpanId
+        ? parentIdsPath
+          ? [...parentIdsPath, parentSpanId]
+          : [parentSpanId]
+        : [];
+
+    this._namePathBySpanId.set(span.id, namePath);
+    this._idsPathBySpanId.set(span.id, idsPath);
   }
 
   private async handleSpanEnded(span: AnyExportedSpan): Promise<void> {
@@ -191,8 +226,12 @@ export class TraceRootExporter extends BaseExporter {
 
     const state = this.getOrCreateTraceState(span.traceId);
 
+    // Capture paths before the finally block cleans the maps.
+    const namePath = this._namePathBySpanId.get(span.id);
+    const idsPath = this._idsPathBySpanId.get(span.id);
+
     try {
-      const otelSpan = this.convertToOtelSpan(span);
+      const otelSpan = this.convertToOtelSpan(span, namePath, idsPath);
       this.processor.onEnd(otelSpan);
 
       if (this.resolvedConfig.realtime) {
@@ -209,6 +248,8 @@ export class TraceRootExporter extends BaseExporter {
       if (state.activeSpanIds.size === 0) {
         this.traceMap.delete(span.traceId);
       }
+      this._namePathBySpanId.delete(span.id);
+      this._idsPathBySpanId.delete(span.id);
     }
   }
 
@@ -232,7 +273,11 @@ export class TraceRootExporter extends BaseExporter {
     return this.scope;
   }
 
-  private convertToOtelSpan(span: AnyExportedSpan): ReadableSpan {
+  private convertToOtelSpan(
+    span: AnyExportedSpan,
+    namePath?: string[],
+    idsPath?: string[],
+  ): ReadableSpan {
     const resource = this.getResource();
     const instrumentationScope = this.getScope();
 
@@ -263,7 +308,7 @@ export class TraceRootExporter extends BaseExporter {
       startTime,
       endTime,
       status,
-      attributes: buildTraceRootAttributes(span),
+      attributes: buildTraceRootAttributes(span, namePath, idsPath),
       links,
       events,
       duration,
@@ -287,13 +332,15 @@ export class TraceRootExporter extends BaseExporter {
   private async setupIfNeeded(): Promise<void> {
     if (this.isSetup || !this.resolvedConfig) return;
 
-    this.otlpExporter = new OTLPTraceExporter({
-      url: this.resolvedConfig.endpoint,
-      headers: this.resolvedConfig.headers,
-      timeoutMillis: this.resolvedConfig.timeoutMillis,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      compression: 'gzip' as any,
-    });
+    this.otlpExporter =
+      this.resolvedConfig._spanExporter ??
+      new OTLPTraceExporter({
+        url: this.resolvedConfig.endpoint,
+        headers: this.resolvedConfig.headers,
+        timeoutMillis: this.resolvedConfig.timeoutMillis,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        compression: 'gzip' as any,
+      });
 
     this.processor = this.resolvedConfig.disableBatch
       ? new SimpleSpanProcessor(this.otlpExporter)
@@ -319,6 +366,8 @@ export class TraceRootExporter extends BaseExporter {
       await this.processor?.shutdown();
     } finally {
       this.traceMap.clear();
+      this._namePathBySpanId.clear();
+      this._idsPathBySpanId.clear();
       await super.shutdown();
     }
   }
@@ -328,7 +377,11 @@ export class TraceRootExporter extends BaseExporter {
 // Attribute building — OpenInference mapping is internal to this function
 // ---------------------------------------------------------------------------
 
-function buildTraceRootAttributes(span: AnyExportedSpan): Attributes {
+function buildTraceRootAttributes(
+  span: AnyExportedSpan,
+  namePath?: string[],
+  idsPath?: string[],
+): Attributes {
   const attrs: Attributes = {};
 
   // SDK identity (always present)
@@ -374,6 +427,11 @@ function buildTraceRootAttributes(span: AnyExportedSpan): Attributes {
     if (modelAttrs.responseModel) attrs[GEN_AI_RESPONSE_MODEL] = modelAttrs.responseModel;
     Object.assign(attrs, buildUsageAttributes(modelAttrs.usage));
   }
+
+  // Live tracing — span ancestry for real-time UI streaming.
+  // Mirrors the Map-based path propagation in TraceRootSpanProcessor (PR #71).
+  if (namePath !== undefined) attrs[TR_SPAN_PATH] = namePath;
+  if (idsPath !== undefined) attrs[TR_SPAN_IDS_PATH] = idsPath;
 
   return attrs;
 }
