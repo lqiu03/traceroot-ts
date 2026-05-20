@@ -67,7 +67,22 @@ const TR_METADATA_PREFIX = 'traceroot.metadata';
 
 type TraceState = {
   activeSpanIds: Set<string>;
+  // Every span (live or completed) seen for this trace. Lets us clean up the
+  // ancestry maps when a trace is TTL-evicted because some SPAN_ENDED never
+  // arrived.
+  knownSpanIds: Set<string>;
+  // Wall-clock ms of the last event touching this trace. Drives TTL eviction
+  // for traces that never receive a closing SPAN_ENDED.
+  lastTouched: number;
 };
+
+// Traces whose lastTouched is older than this are evicted on the next sweep.
+// Bounds memory under "SPAN_ENDED never delivered" conditions (process crash
+// mid-span upstream, dropped event, integration bug).
+const STALE_TRACE_TTL_MS = 5 * 60 * 1000;
+// Skip the eviction sweep entirely if traceMap is small — saves the linear
+// walk for the common case where everything is closing normally.
+const SWEEP_THRESHOLD = 64;
 
 // Alias so we can swap between SDK versions easily
 type InstrumentationScope = InstrumentationLibrary;
@@ -195,8 +210,11 @@ export class TraceRootExporter extends BaseExporter {
   }
 
   private trackSpanStart(span: AnyExportedSpan): void {
+    this.sweepStaleTracesIfNeeded();
     const state = this.getOrCreateTraceState(span.traceId);
     state.activeSpanIds.add(span.id);
+    state.knownSpanIds.add(span.id);
+    state.lastTouched = Date.now();
 
     // Compute ancestry paths using the parent map — same pattern as TraceRootSpanProcessor.
     // Gate on parentNamePath (not parentSpanId) to keep path/ids_path in sync:
@@ -224,7 +242,9 @@ export class TraceRootExporter extends BaseExporter {
     await this.setupIfNeeded();
     if (!this.processor) return;
 
+    this.sweepStaleTracesIfNeeded();
     const state = this.getOrCreateTraceState(span.traceId);
+    state.lastTouched = Date.now();
 
     // Capture paths before the finally block cleans the maps.
     const namePath = this._namePathBySpanId.get(span.id);
@@ -245,11 +265,29 @@ export class TraceRootExporter extends BaseExporter {
       });
     } finally {
       state.activeSpanIds.delete(span.id);
+      state.knownSpanIds.delete(span.id);
       if (state.activeSpanIds.size === 0) {
         this.traceMap.delete(span.traceId);
       }
       this._namePathBySpanId.delete(span.id);
       this._idsPathBySpanId.delete(span.id);
+    }
+  }
+
+  // Periodic eviction guard: if traces accumulate beyond SWEEP_THRESHOLD and any
+  // are older than STALE_TRACE_TTL_MS since their last event, drop them and
+  // their associated ancestry-map entries. Cheap when traceMap is small.
+  private sweepStaleTracesIfNeeded(): void {
+    if (this.traceMap.size < SWEEP_THRESHOLD) return;
+    const cutoff = Date.now() - STALE_TRACE_TTL_MS;
+    for (const [traceId, state] of this.traceMap) {
+      if (state.lastTouched < cutoff) {
+        for (const orphanId of state.knownSpanIds) {
+          this._namePathBySpanId.delete(orphanId);
+          this._idsPathBySpanId.delete(orphanId);
+        }
+        this.traceMap.delete(traceId);
+      }
     }
   }
 
@@ -324,7 +362,11 @@ export class TraceRootExporter extends BaseExporter {
   private getOrCreateTraceState(traceId: string): TraceState {
     const existing = this.traceMap.get(traceId);
     if (existing) return existing;
-    const created: TraceState = { activeSpanIds: new Set() };
+    const created: TraceState = {
+      activeSpanIds: new Set(),
+      knownSpanIds: new Set(),
+      lastTouched: Date.now(),
+    };
     this.traceMap.set(traceId, created);
     return created;
   }

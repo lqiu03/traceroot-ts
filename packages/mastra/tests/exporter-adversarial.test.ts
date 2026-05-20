@@ -564,3 +564,41 @@ describe('flush and shutdown robustness', () => {
     await assert.doesNotReject(() => exporter.shutdown());
   });
 });
+
+// ---------------------------------------------------------------------------
+// 13. TTL eviction guards against unbounded growth when SPAN_ENDED never arrives
+// ---------------------------------------------------------------------------
+
+describe('TTL eviction of stale traces', () => {
+  it('evicts traces whose SPAN_ENDED never fires once TTL elapses and threshold is reached', async () => {
+    const { exporter } = makeRig();
+
+    // Seed 65 traces (one above SWEEP_THRESHOLD=64) with SPAN_STARTED only.
+    const NUM = 65;
+    for (let i = 0; i < NUM; i++) {
+      await start(exporter, makeSpan({ name: `orphan-${i}` }));
+    }
+
+    const m = pathMaps(exporter);
+    assert.equal(m.trace.size, NUM, 'all traces present before sweep');
+    assert.equal(m.name.size, NUM, 'name-path map fully populated');
+    assert.equal(m.ids.size, NUM, 'ids-path map fully populated');
+
+    // Backdate every trace past the 5-minute TTL.
+    const longAgo = Date.now() - 10 * 60 * 1000;
+    const reach = exporter as unknown as {
+      traceMap: Map<string, { lastTouched: number }>;
+    };
+    for (const state of reach.traceMap.values()) {
+      state.lastTouched = longAgo;
+    }
+
+    // Trigger the sweep via a fresh SPAN_STARTED (sweep runs at the top of
+    // trackSpanStart and handleSpanEnded).
+    await start(exporter, makeSpan({ name: 'fresh' }));
+
+    assert.equal(m.trace.size, 1, 'stale traces evicted, only the fresh one remains');
+    assert.equal(m.name.size, 1, 'name-path entries for stale spans were swept');
+    assert.equal(m.ids.size, 1, 'ids-path entries for stale spans were swept');
+  });
+});
