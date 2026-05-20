@@ -59,6 +59,9 @@ importers:
       eslint:
         specifier: ^9.0.0
         version: 9.39.4
+      tsx:
+        specifier: ^4.19.0
+        version: 4.21.0
       typescript:
         specifier: ^5.5.0
         version: 5.9.3
