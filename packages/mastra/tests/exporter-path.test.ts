@@ -184,6 +184,66 @@ describe('path computation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. ids_path normalization parity with OTLP spanIds
+// ---------------------------------------------------------------------------
+// The backend joins a child's traceroot.span.ids_path entries against the
+// parent's exported OTLP spanId. convertToOtelSpan normalizes the exported
+// spanId via normalizeHex(_, 16), so ids_path entries must use the same
+// normalization or ancestry joins break for any non-canonical upstream ID.
+
+describe('ids_path normalization parity with OTLP spanIds', () => {
+  it('non-canonical parent id: ids_path entry matches normalized OTLP spanId', async () => {
+    const { exporter, capture } = makeRig();
+    const traceId = uid();
+    // Mixed case + 0x prefix + short — exercises every transformation normalizeHex applies.
+    const root = makeSpan({ traceId, id: '0xABcD', name: 'root' });
+    const child = makeSpan({ traceId, parentSpanId: root.id, name: 'child' });
+
+    await startSpan(exporter, root);
+    await startSpan(exporter, child);
+    await endSpan(exporter, child);
+    await endSpan(exporter, root);
+
+    const findByPath = (path: string[]) =>
+      capture.spans.findIndex(
+        (s) =>
+          (s.attributes as Record<string, unknown>)['traceroot.span.path']?.toString() ===
+          path.toString(),
+      );
+    const childIdx = findByPath(['root', 'child']);
+    const rootIdx = findByPath(['root']);
+    assert.notEqual(childIdx, -1, 'child span exported');
+    assert.notEqual(rootIdx, -1, 'root span exported');
+
+    const exportedRootSpanId = capture.spans[rootIdx].spanContext().spanId;
+    const childIdsPath = (capture.spans[childIdx].attributes as Record<string, unknown>)[
+      'traceroot.span.ids_path'
+    ] as string[];
+
+    assert.match(exportedRootSpanId, /^[0-9a-f]{16}$/, 'exported spanId is canonical');
+    assert.deepEqual(
+      childIdsPath,
+      [exportedRootSpanId],
+      'child ids_path[0] joins against parent exported spanId',
+    );
+  });
+
+  it('canonical parent id: ids_path unchanged (no regression)', async () => {
+    const { exporter, capture } = makeRig();
+    const traceId = uid();
+    const root = makeSpan({ traceId, name: 'root' }); // uid() already canonical
+    const child = makeSpan({ traceId, parentSpanId: root.id, name: 'child' });
+
+    await startSpan(exporter, root);
+    await startSpan(exporter, child);
+    await endSpan(exporter, child);
+
+    const attrs = getAttrs(capture);
+    assert.deepEqual(attrs['traceroot.span.ids_path'], [root.id]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. isEvent guard: SPAN_STARTED for event spans is a no-op
 // ---------------------------------------------------------------------------
 

@@ -220,17 +220,23 @@ export class TraceRootExporter extends BaseExporter {
     // Gate on parentNamePath (not parentSpanId) to keep path/ids_path in sync:
     // if the parent was never tracked, treat this span as a root rather than emitting
     // a path with no parent prefix but a non-empty ids_path.
+    //
+    // Normalize the parent ID before appending so ids_path entries match the OTLP spanIds
+    // produced by convertToOtelSpan (which also runs every ID through normalizeHex).
+    // Without this, a non-canonical upstream ID would break the backend's join between
+    // path entries and exported span IDs.
     const parentSpanId = span.parentSpanId;
     const parentNamePath = parentSpanId ? this._namePathBySpanId.get(parentSpanId) : undefined;
     const parentIdsPath = parentSpanId ? this._idsPathBySpanId.get(parentSpanId) : undefined;
 
     const namePath: string[] = parentNamePath ? [...parentNamePath, span.name] : [span.name];
-    const idsPath: string[] =
-      parentNamePath && parentSpanId
-        ? parentIdsPath
-          ? [...parentIdsPath, parentSpanId]
-          : [parentSpanId]
-        : [];
+    const normalizedParentSpanId =
+      parentNamePath && parentSpanId ? normalizeHex(parentSpanId, 16) : undefined;
+    const idsPath: string[] = normalizedParentSpanId
+      ? parentIdsPath
+        ? [...parentIdsPath, normalizedParentSpanId]
+        : [normalizedParentSpanId]
+      : [];
 
     this._namePathBySpanId.set(span.id, namePath);
     this._idsPathBySpanId.set(span.id, idsPath);
