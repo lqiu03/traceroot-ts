@@ -62,7 +62,15 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   if (mod[WRAPPED]) return sdk;
   Object.defineProperty(mod, WRAPPED, { value: true, enumerable: false });
 
-  const { tracer } = createTracing(resolved);
+  const { tracer, shutdown } = createTracing(resolved);
+  // The BatchSpanProcessor holds spans for up to a couple seconds before
+  // exporting — without this, a short-lived script (the common case for a
+  // one-shot Pi prompt) would exit before anything is ever sent, matching
+  // packages/traceroot/src/traceroot.ts's own process.once('beforeExit', ...)
+  // auto-flush convention.
+  process.once('beforeExit', () => {
+    void shutdown();
+  });
 
   const pendingInput = new WeakMap<AgentSessionInstance, string>();
   const subscribedSessions = new WeakSet<AgentSessionInstance>();
