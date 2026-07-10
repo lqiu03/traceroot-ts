@@ -208,7 +208,11 @@ test('agent_end while a tool span is still open force-closes it instead of leaki
   assert.equal(capture.spans.length, 3, 'root, LLM, and the force-closed dangling tool span');
   const dangling = capture.spans.find((s) => attrs(s)['gen_ai.tool.name'] === 'bash');
   assert.ok(dangling);
-  assert.ok(dangling!.endTime, 'a force-closed span must still have an end time set');
+  assert.equal(
+    attrs(dangling!)['traceroot.pi.force_closed'],
+    true,
+    'must be marked as abnormally closed, not indistinguishable from a clean tool span',
+  );
 });
 
 test('message_start/message_end for non-assistant roles never opens an LLM span', async () => {

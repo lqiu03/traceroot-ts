@@ -118,6 +118,18 @@ function handleEvent(
 ): void {
   switch (event.type) {
     case 'agent_start': {
+      // A fresh agent_start while a previous run's root span is still open
+      // means that run's agent_end never fired (e.g. the loop crashed and
+      // restarted rather than cleanly finishing) — force-close everything
+      // left open from it instead of silently leaking those spans, and
+      // instead of leaving their now-stale context around to be picked up
+      // as the parent of this new run's spans.
+      if (state.rootSpan) {
+        for (const span of state.toolSpans.values()) closeDanglingSpan(span);
+        state.toolSpans.clear();
+        closeDanglingSpan(state.llmSpan);
+        closeDanglingSpan(state.rootSpan);
+      }
       const parentCtx = context.active();
       state.rootSpan = openRootSpan(tracer, parentCtx, {
         text: pendingInput.get(session),
@@ -125,6 +137,8 @@ function handleEvent(
         captureContent: config.captureContent,
       });
       state.rootCtx = trace.setSpan(parentCtx, state.rootSpan);
+      state.llmSpan = undefined;
+      state.llmCtx = undefined;
       break;
     }
     case 'message_start': {
@@ -145,10 +159,26 @@ function handleEvent(
       break;
     }
     case 'turn_end': {
+      // Normally message_end already closed and cleared state.llmSpan before
+      // turn_end fires. If it didn't (e.g. a stream error cut the turn short
+      // so message_end never arrived), the LLM span would otherwise stay
+      // open indefinitely until something else happens to overwrite the
+      // state reference — force-close it here instead of leaking it.
+      if (state.llmSpan) closeDanglingSpan(state.llmSpan);
+      state.llmSpan = undefined;
       state.llmCtx = undefined;
       break;
     }
     case 'tool_execution_start': {
+      // A tool_execution_start for a toolCallId that is already open (no
+      // intervening tool_execution_end) would otherwise have its Map slot
+      // silently overwritten below — since a span only exports once end()
+      // is called, the abandoned first span would be lost forever rather
+      // than merely "left open". Force-close it first so it still surfaces,
+      // matching the same never-leak-silently philosophy applied to dangling
+      // spans everywhere else in this handler (agent_start, turn_end, agent_end).
+      const existing = state.toolSpans.get(event.toolCallId);
+      if (existing) closeDanglingSpan(existing);
       const parentCtx = state.llmCtx ?? state.rootCtx ?? context.active();
       const span = openToolSpan(
         tracer,

@@ -36,10 +36,27 @@ export interface ResolvedPiInstrumentationConfig {
   spanExporterOverride: SpanExporter | undefined;
 }
 
+// Strips trailing slashes and collapses a slashes-only (or empty) string to
+// undefined so a degenerate value like "" or "///" falls through to the next
+// candidate instead of surviving as a truthy-but-unusable base URL.
+function normalizeBaseUrl(value: string | undefined): string | undefined {
+  const stripped = value?.replace(/\/+$/, '');
+  return stripped ? stripped : undefined;
+}
+
 export function resolveConfig(config?: PiInstrumentationConfig): ResolvedPiInstrumentationConfig {
   const apiKey = config?.apiKey ?? process.env.TRACEROOT_API_KEY;
-  const rawBaseUrl = config?.baseUrl ?? process.env.TRACEROOT_HOST_URL ?? DEFAULT_BASE_URL;
-  const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+  // baseUrl deliberately does not use a plain `??` chain on the raw strings:
+  // unlike apiKey (whose "" is caught by a downstream falsy check before it
+  // ever reaches an Authorization header, see instrumentation.ts), baseUrl has
+  // no such guard before it is spliced into the OTLP exporter URL — an
+  // explicit "" or "///" (or an env var interpolated to "" by a misconfigured
+  // shell) must fall through to the next candidate instead of silently
+  // producing a broken relative URL.
+  const baseUrl =
+    normalizeBaseUrl(config?.baseUrl) ??
+    normalizeBaseUrl(process.env.TRACEROOT_HOST_URL) ??
+    DEFAULT_BASE_URL;
   const captureContent = config?.captureContent ?? true;
   const captureToolIo = config?.captureToolIo ?? true;
   return {

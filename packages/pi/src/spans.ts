@@ -22,6 +22,7 @@ const TR_ATTRIBUTES = {
   SDK_VERSION: 'traceroot.sdk.version',
   COST_TOTAL: 'traceroot.pi.cost.total',
   WILL_RETRY: 'traceroot.pi.will_retry',
+  FORCE_CLOSED: 'traceroot.pi.force_closed',
 } as const;
 
 // OpenInference semconv keys — internal only, not exposed in public API.
@@ -173,6 +174,13 @@ export function closeToolSpan(
   endSpanSafe(span);
 }
 
+// Used whenever a span is closed because a later event force-cleaned it up
+// rather than its own normal close event arriving (e.g. an abandoned run's
+// spans on a fresh agent_start, or a turn_end that never saw its message_end).
+// Marks it so an abnormal trace is distinguishable from a clean one in the
+// backend, rather than looking identical to a span that closed normally.
 export function closeDanglingSpan(span: Span | undefined): void {
+  if (!span) return;
+  setAttr(span, TR_ATTRIBUTES.FORCE_CLOSED, true);
   endSpanSafe(span);
 }
