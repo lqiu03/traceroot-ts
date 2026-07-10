@@ -11,6 +11,8 @@ TraceRoot observability instrumentation for the [Pi coding agent](https://pi.dev
 
 This package instruments Pi's SDK for developers embedding `@earendil-works/pi-coding-agent` in their own Node/TypeScript app. If you're tracing the interactive `pi` CLI tool itself, see [`@traceroot-ai/pi-extension`](https://github.com/traceroot-ai/traceroot-pi-extension) instead.
 
+`@earendil-works/pi-coding-agent` is ESM-only (no CommonJS `require()` export) and requires Node >=22.19. Your consuming code must use `import`.
+
 ## Installation
 
 ```bash
@@ -21,18 +23,28 @@ npm install @traceroot-ai/pi @earendil-works/pi-coding-agent
 
 ```ts
 import * as pi from "@earendil-works/pi-coding-agent";
+import { AuthStorage, createAgentSession, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { instrumentPiCodingAgent } from "@traceroot-ai/pi";
 
+// Instrument BEFORE creating any session.
 instrumentPiCodingAgent(pi, {
   apiKey: process.env.TRACEROOT_API_KEY,
 });
 
-const session = new pi.AgentSession({
-  /* ... */
-});
+const authStorage = AuthStorage.create();
+const modelRegistry = ModelRegistry.create(authStorage);
+const [model] = await modelRegistry.getAvailable();
 
-await session.prompt("Fix the failing test in src/math.ts");
+const { session } = await createAgentSession({ model, authStorage, modelRegistry });
+
+try {
+  await session.prompt("Fix the failing test in src/math.ts");
+} finally {
+  session.dispose();
+}
 ```
+
+Use `createAgentSession()` — Pi's own documented SDK entry point — rather than constructing `AgentSession` directly; its constructor requires assembling several internal objects (`Agent`, `SessionManager`, `SettingsManager`, `ResourceLoader`) that `createAgentSession()` builds for you. `instrumentPiCodingAgent()` patches `AgentSession.prototype`, so it instruments sessions built either way.
 
 ## Configuration
 
