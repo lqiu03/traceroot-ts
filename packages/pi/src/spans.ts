@@ -1,0 +1,178 @@
+/**
+ * Span construction and attribute mapping for Pi coding agent traces.
+ *
+ * Attribute triad (matching every other traceroot-ts integration):
+ * OpenInference span-kind/input/output (internal, drives UI rendering),
+ * standard OTel gen_ai.* semconv, and a traceroot.* namespace for SDK
+ * identity. Span path/ids_path (Mastra's live-ancestry feature) is not
+ * emitted here — Pi delivers a discrete AgentEvent per lifecycle step, so
+ * parent/child relationships are already explicit via OTel Context, not
+ * reconstructed from a flat event stream the way Mastra's exporter does.
+ */
+import { SpanKind, SpanStatusCode, type Context, type Span, type Tracer } from '@opentelemetry/api';
+import { SDK_NAME } from './config';
+import { describeToolCallSpan } from './span-name';
+import { SDK_VERSION } from './package-version';
+import type { AgentMessage, AssistantMessage } from './types';
+
+// Span path keys intentionally omitted — see file header. Everything else
+// mirrors packages/mastra/src/exporter.ts's attribute constant shape.
+const TR_ATTRIBUTES = {
+  SDK_NAME: 'traceroot.sdk.name',
+  SDK_VERSION: 'traceroot.sdk.version',
+  COST_TOTAL: 'traceroot.pi.cost.total',
+  WILL_RETRY: 'traceroot.pi.will_retry',
+} as const;
+
+// OpenInference semconv keys — internal only, not exposed in public API.
+const OI_ATTRIBUTES = {
+  SPAN_KIND: 'openinference.span.kind',
+  INPUT_VALUE: 'input.value',
+  OUTPUT_VALUE: 'output.value',
+  SESSION_ID: 'session.id',
+} as const;
+
+// gen_ai semconv (standard, used by multiple platforms)
+const GEN_AI_ATTRIBUTES = {
+  SYSTEM: 'gen_ai.system',
+  REQUEST_MODEL: 'gen_ai.request.model',
+  RESPONSE_MODEL: 'gen_ai.response.model',
+  USAGE_INPUT_TOKENS: 'gen_ai.usage.input_tokens',
+  USAGE_OUTPUT_TOKENS: 'gen_ai.usage.output_tokens',
+  CACHE_WRITE_INPUT_TOKENS: 'gen_ai.usage.cache_creation_input_tokens',
+  CACHE_READ_INPUT_TOKENS: 'gen_ai.usage.cache_read_input_tokens',
+  TOOL_NAME: 'gen_ai.tool.name',
+  TOOL_CALL_ID: 'gen_ai.tool.call.id',
+} as const;
+
+function setAttr(
+  span: Span,
+  key: string,
+  value: string | number | boolean | undefined | null,
+): void {
+  if (value === undefined || value === null) return;
+  span.setAttribute(key, value);
+}
+
+function endSpanSafe(span: Span | undefined): void {
+  if (!span) return;
+  try {
+    span.end();
+  } catch {
+    // Never let a misbehaving OTel exporter/processor crash the host app.
+  }
+}
+
+function textOf(message: AgentMessage | undefined): string | undefined {
+  if (!message) return undefined;
+  if (message.role === 'user' && typeof message.content === 'string') return message.content;
+  if (message.role !== 'assistant') return undefined;
+  const parts = message.content
+    .filter((c): c is { type: 'text'; text: string } => {
+      return typeof c === 'object' && c !== null && (c as { type?: unknown }).type === 'text';
+    })
+    .map((c) => c.text);
+  return parts.length > 0 ? parts.join('') : undefined;
+}
+
+export function openRootSpan(
+  tracer: Tracer,
+  parentCtx: Context,
+  input: { text: string | undefined; sessionId: string | undefined; captureContent: boolean },
+): Span {
+  const span = tracer.startSpan('AgentSession.prompt', { kind: SpanKind.INTERNAL }, parentCtx);
+  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'AGENT');
+  setAttr(span, OI_ATTRIBUTES.SESSION_ID, input.sessionId);
+  setAttr(span, TR_ATTRIBUTES.SDK_NAME, SDK_NAME);
+  setAttr(span, TR_ATTRIBUTES.SDK_VERSION, SDK_VERSION);
+  if (input.captureContent) setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, input.text);
+  return span;
+}
+
+export function closeRootSpan(
+  span: Span,
+  finalMessages: AgentMessage[],
+  willRetry: boolean | undefined,
+  captureContent: boolean,
+): void {
+  setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
+  if (captureContent) {
+    const lastAssistant = [...finalMessages].reverse().find((m) => m.role === 'assistant');
+    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
+  }
+  endSpanSafe(span);
+}
+
+export function openLlmSpan(tracer: Tracer, parentCtx: Context, message: AssistantMessage): Span {
+  const span = tracer.startSpan(message.model || 'pi.llm', { kind: SpanKind.CLIENT }, parentCtx);
+  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'LLM');
+  setAttr(span, GEN_AI_ATTRIBUTES.SYSTEM, message.provider);
+  setAttr(span, GEN_AI_ATTRIBUTES.REQUEST_MODEL, message.model);
+  return span;
+}
+
+export function closeLlmSpan(span: Span, message: AssistantMessage): void {
+  span.updateName(message.responseModel || message.model || 'pi.llm');
+  setAttr(span, GEN_AI_ATTRIBUTES.RESPONSE_MODEL, message.responseModel || message.model);
+  setAttr(span, GEN_AI_ATTRIBUTES.USAGE_INPUT_TOKENS, message.usage?.input);
+  setAttr(span, GEN_AI_ATTRIBUTES.USAGE_OUTPUT_TOKENS, message.usage?.output);
+  setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
+  setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
+  setAttr(span, TR_ATTRIBUTES.COST_TOTAL, message.usage?.cost?.total);
+  if (message.stopReason === 'error' || message.stopReason === 'aborted') {
+    span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: message.errorMessage || message.stopReason,
+    });
+  }
+  endSpanSafe(span);
+}
+
+export function openToolSpan(
+  tracer: Tracer,
+  parentCtx: Context,
+  toolCallId: string,
+  toolName: string,
+  args: unknown,
+  captureToolIo: boolean,
+): Span {
+  const span = tracer.startSpan(
+    describeToolCallSpan(toolName, args),
+    { kind: SpanKind.INTERNAL },
+    parentCtx,
+  );
+  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'TOOL');
+  setAttr(span, GEN_AI_ATTRIBUTES.TOOL_NAME, toolName);
+  setAttr(span, GEN_AI_ATTRIBUTES.TOOL_CALL_ID, toolCallId);
+  if (captureToolIo) {
+    try {
+      setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, JSON.stringify(args));
+    } catch {
+      // args may contain circular refs or BigInt — skip rather than crash.
+    }
+  }
+  return span;
+}
+
+export function closeToolSpan(
+  span: Span,
+  result: unknown,
+  isError: boolean,
+  captureToolIo: boolean,
+): void {
+  if (captureToolIo) {
+    try {
+      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, JSON.stringify(result));
+    } catch {
+      // result may contain circular refs or BigInt — skip rather than crash.
+    }
+  }
+  if (isError) {
+    span.setStatus({ code: SpanStatusCode.ERROR });
+  }
+  endSpanSafe(span);
+}
+
+export function closeDanglingSpan(span: Span | undefined): void {
+  endSpanSafe(span);
+}
