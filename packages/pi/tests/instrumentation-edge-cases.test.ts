@@ -87,6 +87,44 @@ test('instrumenting the same sdk object twice does not double-wrap prompt', asyn
   );
 });
 
+test('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES module namespace) does not throw', async () => {
+  // `import * as pi from "@earendil-works/pi-coding-agent"` — the exact
+  // usage documented in this package's own README — hands back an ES module
+  // namespace exotic object. Per the ECMAScript spec, module namespace
+  // objects are always non-extensible, even though the values reachable
+  // through them (like AgentSession and its prototype) are ordinary,
+  // extensible objects. `Object.preventExtensions` reproduces that shape
+  // precisely enough to catch a regression: instrumentPiCodingAgent() must
+  // never try to stamp its wrap-once guard directly onto `sdk` itself.
+  const capture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  const sdk = Object.preventExtensions({ AgentSession: Session });
+
+  assert.doesNotThrow(() => {
+    instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
+  });
+
+  const session = new Session();
+  await session.prompt('hi');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+
+  assert.equal(
+    capture.spans.length,
+    1,
+    'instrumentation still works end-to-end against a non-extensible sdk object',
+  );
+
+  // A second call against the same frozen namespace must still be an
+  // idempotent no-op, proving the wrap-once guard now lives somewhere that
+  // actually persists (AgentSession.prototype), not on the frozen `sdk`.
+  const wrappedOnce = Session.prototype.prompt;
+  assert.doesNotThrow(() => {
+    instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
+  });
+  assert.equal(Session.prototype.prompt, wrappedOnce);
+});
+
 test('missing API key returns the sdk unmodified and never throws', () => {
   const Session = makeFakeSessionClass();
   const originalPrompt = Session.prototype.prompt;

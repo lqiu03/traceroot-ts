@@ -41,7 +41,7 @@ interface SessionSpanState {
 }
 
 export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentationConfig): unknown {
-  const mod = sdk as PiCodingAgentModule & { [WRAPPED]?: boolean };
+  const mod = sdk as PiCodingAgentModule;
 
   const resolved = resolveConfig(config);
   if (!resolved.apiKey) {
@@ -51,7 +51,18 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     return sdk;
   }
 
-  const proto = mod?.AgentSession?.prototype;
+  // The wrap-once guard is stamped on AgentSession.prototype, never on `mod`
+  // itself. When `sdk` is obtained via `import * as pi from "..."` (the
+  // README's own documented usage, and the only way to consume an ESM-only
+  // package like @earendil-works/pi-coding-agent from Node), `mod` is an ES
+  // module namespace exotic object — the spec makes those permanently
+  // non-extensible, so `Object.defineProperty(mod, ...)` always throws
+  // TypeError. AgentSession.prototype is an ordinary, extensible object, and
+  // it's the thing actually being patched below, so it's also the correct
+  // place to record that the patch already happened.
+  const proto = mod?.AgentSession?.prototype as
+    | (AgentSessionInstance & { [WRAPPED]?: boolean })
+    | undefined;
   if (typeof proto?.prompt !== 'function' || typeof proto?.subscribe !== 'function') {
     console.warn(
       '[traceroot-pi] AgentSession.prototype.prompt/subscribe not found — instrumentation disabled.',
@@ -59,8 +70,8 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     return sdk;
   }
 
-  if (mod[WRAPPED]) return sdk;
-  Object.defineProperty(mod, WRAPPED, { value: true, enumerable: false });
+  if (proto[WRAPPED]) return sdk;
+  Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
 
   const { tracer, shutdown } = createTracing(resolved);
   // The BatchSpanProcessor holds spans for up to a couple seconds before
