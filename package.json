@@ -4,12 +4,12 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "build": "pnpm --filter '@traceroot-ai/*' build",
-    "test": "pnpm --filter @traceroot-ai/traceroot test",
+    "test": "pnpm --filter @traceroot-ai/traceroot test && pnpm --filter @traceroot-ai/pi test",
     "lint": "pnpm --filter '@traceroot-ai/*' lint",
     "typecheck": "pnpm --filter '@traceroot-ai/*' typecheck",
     "clean": "pnpm --filter '@traceroot-ai/*' clean",
-    "format": "prettier --write packages/traceroot/src packages/traceroot/tests packages/mastra/src",
-    "format:check": "prettier --check packages/traceroot/src packages/traceroot/tests packages/mastra/src",
+    "format": "prettier --write packages/traceroot/src packages/traceroot/tests packages/mastra/src packages/pi/src packages/pi/tests",
+    "format:check": "prettier --check packages/traceroot/src packages/traceroot/tests packages/mastra/src packages/pi/src packages/pi/tests",
     "prepare": "husky"
   },
   "lint-staged": {

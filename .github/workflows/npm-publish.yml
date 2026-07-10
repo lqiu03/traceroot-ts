@@ -95,3 +95,91 @@ jobs:
         run: pnpm --filter @traceroot-ai/mastra publish --provenance --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Triggered by tags like: pi-v0.1.0, pi-v1.0.0
+  #
+  # Split into a test job (no id-token) and a publish job (id-token: write
+  # only), carrying forward the security hardening from
+  # traceroot-pi-extension's own npm-publish.yml: no third-party code runs
+  # while an OIDC token is mintable, so a compromised dependency executing
+  # during install/lint/build/test cannot read ACTIONS_ID_TOKEN_REQUEST_*
+  # and mint a forged provenance token.
+  publish-pi-test:
+    if: startsWith(github.event.release.tag_name, 'pi-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Fail fast — verify tag matches package.json before running build/tests.
+      # The tag is read via env, NOT interpolated into the script: a release
+      # tag can contain shell metacharacters (backticks, $(), ;), and textual
+      # interpolation would execute them in this job.
+      - name: Verify release tag matches package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          PKG_VERSION=$(node -p "require('./packages/pi/package.json').version")
+          TAG_VERSION="${TAG#pi-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ packages/pi/package.json version ($PKG_VERSION) does not match release tag ($TAG)"
+            exit 1
+          fi
+          echo "✅ Version $PKG_VERSION matches tag $TAG"
+
+      - name: Lint
+        run: pnpm --filter @traceroot-ai/pi lint
+
+      - name: Build
+        run: pnpm --filter @traceroot-ai/pi build
+
+      - name: Typecheck
+        run: pnpm --filter @traceroot-ai/pi typecheck
+
+      - name: Test
+        run: pnpm --filter @traceroot-ai/pi test
+
+  # Publish with id-token: write in scope ONLY here. This job runs no
+  # third-party code while the token is available: install uses
+  # --ignore-scripts (no lifecycle scripts) and there is no lint/build/test
+  # step that imports dependency modules, so nothing between the token grant
+  # and `pnpm publish` can read ACTIONS_ID_TOKEN_REQUEST_* and mint a token.
+  publish-pi:
+    needs: publish-pi-test
+    if: startsWith(github.event.release.tag_name, 'pi-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance attestation via OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build
+        run: pnpm --filter @traceroot-ai/pi build
+
+      - name: Publish @traceroot-ai/pi
+        run: pnpm --filter @traceroot-ai/pi publish --provenance --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

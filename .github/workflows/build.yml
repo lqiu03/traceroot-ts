@@ -33,3 +33,6 @@ jobs:
 
       - name: Test
         run: pnpm --filter @traceroot-ai/traceroot test
+
+      - name: Test (pi)
+        run: pnpm --filter @traceroot-ai/pi test
