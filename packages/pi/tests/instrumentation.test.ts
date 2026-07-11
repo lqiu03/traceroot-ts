@@ -81,7 +81,12 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({
     type: 'message_end',
-    message: assistantMessage({ content: [{ type: 'toolCall', id: 't1', name: 'bash' }] }),
+    message: assistantMessage({
+      content: [
+        { type: 'text', text: "I'll list the files now." },
+        { type: 'toolCall', id: 't1', name: 'bash' },
+      ],
+    }),
   });
   session.emit({
     type: 'tool_execution_start',
@@ -125,6 +130,11 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   assert.equal(attrs(llmSpan)['gen_ai.usage.input_tokens'], 100);
   assert.equal(attrs(llmSpan)['gen_ai.usage.output_tokens'], 20);
   assert.equal(attrs(llmSpan)['traceroot.pi.cost.total'], 0.0016);
+  assert.equal(
+    attrs(llmSpan)['output.value'],
+    "I'll list the files now.",
+    'captureContent:true (the default) must populate output.value on the LLM span too, not just the root span',
+  );
   assert.equal(
     llmSpan.parentSpanId,
     rootSpan.spanContext().spanId,
@@ -250,16 +260,30 @@ test('captureContent: false suppresses input.value/output.value but keeps other 
 
   await session.prompt('sensitive prompt text');
   session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage() });
+  session.emit({
+    type: 'message_end',
+    message: assistantMessage({ content: [{ type: 'text', text: 'sensitive llm reply' }] }),
+  });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({
     type: 'agent_end',
     messages: [assistantMessage({ content: [{ type: 'text', text: 'sensitive reply' }] })],
     willRetry: false,
   });
 
-  const [rootSpan] = capture.spans;
+  const [llmSpan, rootSpan] = capture.spans;
   assert.equal(attrs(rootSpan!)['input.value'], undefined);
   assert.equal(attrs(rootSpan!)['output.value'], undefined);
   assert.equal(attrs(rootSpan!)['session.id'], 'sess-1');
+
+  assert.ok(llmSpan, 'expected an LLM span to have been captured');
+  assert.equal(attrs(llmSpan!)['openinference.span.kind'], 'LLM');
+  assert.equal(
+    attrs(llmSpan!)['output.value'],
+    undefined,
+    'captureContent:false must suppress output.value on the LLM span too, not just the root span',
+  );
 });
 
 test('captureToolIo: false suppresses tool input.value/output.value but keeps the tool name', async () => {

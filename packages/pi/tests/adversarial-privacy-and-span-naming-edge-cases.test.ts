@@ -1,3 +1,14 @@
+/**
+ * Lens: privacy-and-span-naming-edge-cases.
+ *
+ * Probes describeToolCallSpan's TOOL_PATH_ARGUMENT_KEYS resolution order,
+ * its handling of non-object-shaped args, directory-like paths, unusual
+ * toolName values, non-ASCII bash commands under the truncation limit, and
+ * the captureContent:false gate on the ROOT span for a falsy-but-present
+ * ('') prompt vs an absent (undefined) one. None of these are covered by
+ * span-name.test.ts or instrumentation.test.ts today (verified by reading
+ * both fully before writing this file).
+ */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ExportResult } from '@opentelemetry/core';
@@ -6,14 +17,6 @@ import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
 import { describeToolCallSpan } from '../src/span-name';
 import type { AgentEvent } from '../src/types';
-
-// Lens: privacy-and-span-naming-edge-cases. Probes describeToolCallSpan's
-// TOOL_PATH_ARGUMENT_KEYS resolution order, its handling of non-object-shaped
-// args, directory-like paths, unusual toolName values, non-ASCII bash
-// commands under the truncation limit, and the captureContent:false gate on
-// the ROOT span for a falsy-but-present ('') prompt vs an absent (undefined)
-// one. None of these are covered by span-name.test.ts or instrumentation.test.ts
-// today (verified by reading both fully before writing this file).
 
 // Copied locally — no shared state across test files, matching every other
 // adversarial-*.test.ts file's explicit convention in this package.

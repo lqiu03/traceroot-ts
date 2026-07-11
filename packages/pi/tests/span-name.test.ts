@@ -56,3 +56,60 @@ test('describeToolCallSpan ignores non-string path-like args', () => {
   assert.equal(describeToolCallSpan('read', { path: 42 }), 'read');
   assert.equal(describeToolCallSpan('read', { path: null }), 'read');
 });
+
+test('describeToolCallSpan bounds a path-like arg with no separators the same way it bounds a bash command', () => {
+  // basename() only strips separators — a string with none at all (or whose
+  // final segment is huge) passes through completely unchanged. Unlike the
+  // bash branch (explicitly capped at MAX_BASH_NAME via truncateSurrogateSafe
+  // — see the file header's stated privacy/size-bound rationale), the path
+  // branch had no equivalent cap: an untrusted/hallucinated "path" argument
+  // with no "/" or "\\" could inflate the span NAME itself without bound.
+  const hugeNoSeparators = 'x'.repeat(5000);
+  const name = describeToolCallSpan('read', { path: hugeNoSeparators });
+  assert.ok(
+    name.length <= 'read: '.length + 60 + 1,
+    `expected the span name to be bounded like the bash branch is, got length ${name.length}`,
+  );
+  assert.ok(name.startsWith('read: '));
+  assert.ok(
+    name.endsWith('…'),
+    'a truncated path-derived name must carry the same ellipsis marker',
+  );
+});
+
+test('describeToolCallSpan truncates an over-long basename without splitting a surrogate pair at the boundary', () => {
+  // Mirrors the equivalent bash surrogate-pair test above, but for the path
+  // branch: a filename component with no separators, long enough to force
+  // truncation, with a surrogate pair astride the cut boundary.
+  const name = describeToolCallSpan('read', { path: 'x'.repeat(59) + '\u{1F600}tail' });
+  assert.ok(name.startsWith('read: '));
+  assert.ok(name.endsWith('…'));
+  const body = name.slice('read: '.length, -1);
+  const lastCode = body.charCodeAt(body.length - 1);
+  assert.ok(lastCode < 0xd800 || lastCode > 0xdbff);
+});
+
+test('describeToolCallSpan falls back to the bare tool name when a non-empty path-like arg has NO basename component at all (win32.basename reduces a root/drive-only reference to "")', () => {
+  // Unlike the args.path === '' case (already covered above, where
+  // firstPathArgument itself skips the falsy candidate), these path values
+  // are genuinely non-empty and truthy — firstPathArgument happily returns
+  // them — but win32.basename() strips them down to nothing because they are
+  // ENTIRELY separators (or a bare drive letter) with no filename component
+  // to keep. A perfectly ordinary, non-adversarial tool call reading or
+  // listing a root directory (`{ path: '/' }`) must not produce a dangling
+  // "toolName: " with nothing after the colon — the exact pattern the
+  // args.path === '' test above already asserts must never happen.
+  assert.equal(describeToolCallSpan('list_dir', { path: '/' }), 'list_dir');
+  assert.equal(describeToolCallSpan('read', { path: '\\' }), 'read');
+  assert.equal(describeToolCallSpan('read', { path: '///' }), 'read');
+  assert.equal(describeToolCallSpan('read', { path: 'C:\\' }), 'read');
+  assert.equal(describeToolCallSpan('read', { path: 'C:/' }), 'read');
+  // A bash tool call whose ONLY path-like arg reduces to nothing must still
+  // fall through to the bash-command branch rather than emitting a dangling
+  // "bash: " and ignoring a perfectly good command right next to it.
+  assert.equal(
+    describeToolCallSpan('bash', { path: '/', command: 'ls -la' }),
+    'bash: ls -la',
+    'an empty-basename path must not shadow a real bash command in the same args object',
+  );
+});

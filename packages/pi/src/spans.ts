@@ -9,10 +9,11 @@
  * parent/child relationships are already explicit via OTel Context, not
  * reconstructed from a flat event stream the way Mastra's exporter does.
  */
-import { SpanKind, SpanStatusCode, type Context, type Span, type Tracer } from '@opentelemetry/api';
+import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
+import type { Context, Span, Tracer } from '@opentelemetry/api';
 import { SDK_NAME } from './config';
-import { describeToolCallSpan } from './span-name';
 import { SDK_VERSION } from './package-version';
+import { describeToolCallSpan } from './span-name';
 import type { AgentMessage, AssistantMessage } from './types';
 
 // Span path keys intentionally omitted — see file header. Everything else
@@ -64,6 +65,26 @@ function endSpanSafe(span: Span | undefined): void {
   }
 }
 
+// Tool args/results can be arbitrarily large (a big file read, a long shell
+// command's stdout) — cap the exported JSON so one tool call can't inflate a
+// span's attribute payload without bound. Mirrors span-name.ts's
+// MAX_BASH_NAME/truncateSurrogateSafe pattern: cut on a UTF-16 code-unit
+// boundary that never splits a surrogate pair, which would corrupt the UTF-8
+// an OTLP/proto collector requires.
+const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
+
+function truncateJsonSafe(json: string): string {
+  if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
+  let cut = MAX_TOOL_IO_JSON_CHARS;
+  const code = json.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff) {
+    // High surrogate sitting right at the cut boundary — back off one so we
+    // never emit a lone surrogate.
+    cut -= 1;
+  }
+  return `${json.slice(0, cut)}…[truncated]`;
+}
+
 function textOf(message: AgentMessage | undefined): string | undefined {
   if (!message) return undefined;
   if (message.role === 'user' && typeof message.content === 'string') return message.content;
@@ -112,7 +133,7 @@ export function openLlmSpan(tracer: Tracer, parentCtx: Context, message: Assista
   return span;
 }
 
-export function closeLlmSpan(span: Span, message: AssistantMessage): void {
+export function closeLlmSpan(span: Span, message: AssistantMessage, captureContent: boolean): void {
   span.updateName(message.responseModel || message.model || 'pi.llm');
   setAttr(span, GEN_AI_ATTRIBUTES.RESPONSE_MODEL, message.responseModel || message.model);
   setAttr(span, GEN_AI_ATTRIBUTES.USAGE_INPUT_TOKENS, message.usage?.input);
@@ -120,6 +141,9 @@ export function closeLlmSpan(span: Span, message: AssistantMessage): void {
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
   setAttr(span, TR_ATTRIBUTES.COST_TOTAL, message.usage?.cost?.total);
+  if (captureContent) {
+    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
+  }
   if (message.stopReason === 'error' || message.stopReason === 'aborted') {
     span.setStatus({
       code: SpanStatusCode.ERROR,
@@ -147,7 +171,7 @@ export function openToolSpan(
   setAttr(span, GEN_AI_ATTRIBUTES.TOOL_CALL_ID, toolCallId);
   if (captureToolIo) {
     try {
-      setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, JSON.stringify(args));
+      setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, truncateJsonSafe(JSON.stringify(args)));
     } catch {
       // args may contain circular refs or BigInt — skip rather than crash.
     }
@@ -163,7 +187,7 @@ export function closeToolSpan(
 ): void {
   if (captureToolIo) {
     try {
-      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, JSON.stringify(result));
+      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, truncateJsonSafe(JSON.stringify(result)));
     } catch {
       // result may contain circular refs or BigInt — skip rather than crash.
     }

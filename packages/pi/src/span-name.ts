@@ -2,15 +2,30 @@
  * Privacy-safe tool span naming, ported from traceroot-pi-extension
  * (the Pi CLI extension). Never emits a full file path — basename only,
  * handling both / and \ separators — and never emits more than
- * MAX_BASH_NAME chars of a bash command, truncated without splitting a
- * UTF-16 surrogate pair (which would corrupt the UTF-8 an OTLP/proto
- * collector requires).
+ * MAX_BASH_NAME chars of a bash command OR of a path-like argument's
+ * basename, truncated without splitting a UTF-16 surrogate pair (which
+ * would corrupt the UTF-8 an OTLP/proto collector requires).
  *
- * Truncating a bash command to 60 chars can still leak the start of a
- * pasted secret (e.g. an Authorization header) even when captureToolIo is
- * off — that tradeoff is deliberate: the alternative (no name at all)
- * makes traces far less useful, and the full command is only captured
- * as a span attribute when captureToolIo is explicitly enabled.
+ * The basename cap matters because basename() only strips path separators:
+ * a path-like argument with none at all (or whose final segment is itself
+ * huge — e.g. a hallucinated or adversarial tool-call argument) would
+ * otherwise pass through completely unbounded, the same OTLP-payload-bloat
+ * and leak risk the bash-command cap below exists to guard against.
+ *
+ * Truncating a bash command (or an unseparated "path") to 60 chars can
+ * still leak the start of a pasted secret (e.g. an Authorization header)
+ * even when captureToolIo is off — that tradeoff is deliberate: the
+ * alternative (no name at all) makes traces far less useful, and the full
+ * value is only captured as a span attribute when captureToolIo is
+ * explicitly enabled.
+ *
+ * A non-empty path-like argument can still basename() down to an EMPTY
+ * string — a root or drive-only reference such as "/", "\\", "///", "C:\\",
+ * or "C:/" has no filename component to keep. That is an ordinary,
+ * non-adversarial tool call (e.g. listing a root directory), so it falls
+ * through to the bare tool name (or the bash-command branch, if the same
+ * args object also carries a command) instead of emitting a dangling
+ * "toolName: " with nothing after the colon.
  */
 import { win32 } from 'node:path';
 
@@ -51,7 +66,26 @@ export function describeToolCallSpan(toolName: string, args: unknown): string {
   if (args && typeof args === 'object') {
     const a = args as Record<string, unknown>;
     const pathLike = firstPathArgument(a);
-    if (pathLike) return `${toolName}: ${basename(pathLike)}`;
+    if (pathLike) {
+      // basename() only strips path separators — a value with none at all
+      // (or whose final segment is itself huge) passes through completely
+      // unchanged. Truncate it the same way the bash branch below truncates
+      // a command, so an untrusted/hallucinated "path"-like argument can't
+      // inflate the span NAME without bound the same way a raw bash command
+      // could without MAX_BASH_NAME.
+      const base = basename(pathLike);
+      // A non-empty, truthy path-like value can still basename() down to an
+      // EMPTY string — e.g. "/", "\\", "///", "C:\\", "C:/": a root or
+      // drive-only reference with no filename component to keep. That is a
+      // perfectly ordinary, non-adversarial tool call (listing/reading a
+      // root directory), not an edge case worth degrading gracelessly for:
+      // falling through here (instead of returning) avoids emitting a
+      // dangling "toolName: " with nothing after the colon, matching the
+      // args.path === '' behavior a few lines below in firstPathArgument.
+      if (base) {
+        return `${toolName}: ${truncateSurrogateSafe(base, MAX_BASH_NAME)}`;
+      }
+    }
     if (toolName === 'bash' && typeof a.command === 'string' && a.command) {
       const cmd = a.command.replace(/\s+/g, ' ').trim();
       if (cmd) return `bash: ${truncateSurrogateSafe(cmd, MAX_BASH_NAME)}`;

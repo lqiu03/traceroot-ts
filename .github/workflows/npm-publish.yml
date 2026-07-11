@@ -7,7 +7,7 @@ on:
 jobs:
   # Triggered by tags like: v0.1.1, v1.0.0
   publish-traceroot:
-    if: "!startsWith(github.event.release.tag_name, 'mastra-')"
+    if: "!startsWith(github.event.release.tag_name, 'mastra-') && !startsWith(github.event.release.tag_name, 'pi-')"
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,10 +100,10 @@ jobs:
   #
   # Split into a test job (no id-token) and a publish job (id-token: write
   # only), carrying forward the security hardening from
-  # traceroot-pi-extension's own npm-publish.yml: no third-party code runs
-  # while an OIDC token is mintable, so a compromised dependency executing
-  # during install/lint/build/test cannot read ACTIONS_ID_TOKEN_REQUEST_*
-  # and mint a forged provenance token.
+  # traceroot-pi-extension's own npm-publish.yml: lint/build/test run only
+  # here, where no OIDC token is mintable, and the resulting dist/ is passed
+  # to publish-pi via artifact upload/download so the id-token-scoped job
+  # never runs a build step itself.
   publish-pi-test:
     if: startsWith(github.event.release.tag_name, 'pi-')
     runs-on: ubuntu-latest
@@ -150,11 +150,20 @@ jobs:
       - name: Test
         run: pnpm --filter @traceroot-ai/pi test
 
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-dist
+          path: packages/pi/dist
+          if-no-files-found: error
+          retention-days: 1
+
   # Publish with id-token: write in scope ONLY here. This job runs no
-  # third-party code while the token is available: install uses
-  # --ignore-scripts (no lifecycle scripts) and there is no lint/build/test
-  # step that imports dependency modules, so nothing between the token grant
-  # and `pnpm publish` can read ACTIONS_ID_TOKEN_REQUEST_* and mint a token.
+  # third-party build/lint/test code while the token is available: install
+  # uses --ignore-scripts (no lifecycle scripts) and dist/ is downloaded
+  # as an artifact built by publish-pi-test (which has no id-token), rather
+  # than rebuilt here, so nothing between the token grant and `pnpm publish`
+  # can read ACTIONS_ID_TOKEN_REQUEST_* and mint a forged provenance token.
   publish-pi:
     needs: publish-pi-test
     if: startsWith(github.event.release.tag_name, 'pi-')
@@ -176,8 +185,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Build
-        run: pnpm --filter @traceroot-ai/pi build
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-dist
+          path: packages/pi/dist
 
       - name: Publish @traceroot-ai/pi
         run: pnpm --filter @traceroot-ai/pi publish --provenance --access public --no-git-checks

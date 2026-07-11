@@ -1,3 +1,15 @@
+/**
+ * Lens: config-resolution-and-env-vars.
+ *
+ * Probes src/config.ts's resolveConfig() precedence and normalization rules
+ * in isolation: explicit config wins over TRACEROOT_API_KEY/TRACEROOT_HOST_URL
+ * env vars, which in turn win over the hosted default; baseUrl's
+ * trailing-slash stripping; and the deliberate "" vs undefined distinction
+ * for apiKey — plus one end-to-end check that an explicit empty-string
+ * apiKey still disables instrumentation exactly like a missing one, proving
+ * the safety net lives in instrumentPiCodingAgent() and not resolveConfig()
+ * itself.
+ */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ExportResult } from '@opentelemetry/core';

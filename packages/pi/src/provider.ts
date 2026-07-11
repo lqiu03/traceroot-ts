@@ -14,12 +14,12 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import type { Tracer } from '@opentelemetry/api';
 import { SDK_NAME } from './config';
-import { SDK_VERSION } from './package-version';
 import type { ResolvedPiInstrumentationConfig } from './config';
+import { SDK_VERSION } from './package-version';
 
 export interface TracingHandle {
   tracer: Tracer;
-  shutdown: () => Promise<void>;
+  forceFlush: () => Promise<void>;
 }
 
 export function createTracing(config: ResolvedPiInstrumentationConfig): TracingHandle {
@@ -52,13 +52,16 @@ export function createTracing(config: ResolvedPiInstrumentationConfig): TracingH
 
   const tracer = provider.getTracer(SDK_NAME, SDK_VERSION);
 
-  const shutdown = async (): Promise<void> => {
+  // Flushes any pending spans without tearing the provider down — safe to
+  // call repeatedly (e.g. once per 'beforeExit' in a long-lived process),
+  // unlike shutdown(), which permanently disables further export.
+  const forceFlush = async (): Promise<void> => {
     try {
-      await provider.shutdown();
+      await provider.forceFlush();
     } catch {
-      // A flush/export failure at shutdown must never block or crash the host app's exit.
+      // A flush failure must never block or crash the host app's exit.
     }
   };
 
-  return { tracer, shutdown };
+  return { tracer, forceFlush };
 }

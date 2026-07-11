@@ -107,6 +107,17 @@ export interface AgentSessionInstance {
   readonly sessionId?: string;
   prompt(text: string, options?: PromptOptions): Promise<void>;
   subscribe(listener: (event: AgentEvent) => void): () => void;
+  /**
+   * Removes every listener registered via subscribe() and disconnects from
+   * the underlying Agent. Confirmed against the real, installed
+   * @earendil-works/pi-coding-agent@0.80.6 dist/core/agent-session.js:
+   * dispose() reassigns the private `_eventListeners` array (the same array
+   * subscribe() pushes into and _emit() reads on every dispatch) to a fresh
+   * empty array, so no subscribe() listener — including instrumentation.ts's
+   * own — is ever invoked again after dispose() runs. See instrumentation.ts's
+   * module header comment for the full verified call chain.
+   */
+  dispose(): void;
 }
 
 export interface AgentSessionConstructor {
