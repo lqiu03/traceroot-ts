@@ -39,3 +39,15 @@ test('sliceSurrogateSafe appends no suffix — callers own their own marker', ()
   assert.equal(sliced, 'abc');
   assert.ok(!sliced.includes('…'), 'sliceSurrogateSafe itself must not add an ellipsis or marker');
 });
+
+test('sliceSurrogateSafe returns empty string for maxLen === 0 rather than slicing', () => {
+  assert.equal(sliceSurrogateSafe('abcdefghij', 0), '');
+});
+
+test('sliceSurrogateSafe returns empty string for a negative maxLen instead of slicing from the end', () => {
+  // Regression guard: text.slice(0, cut) with a negative cut slices from the
+  // END of the string (e.g. 'abcdefghij'.slice(0, -3) === 'abcdefg'), which
+  // is the opposite of capping. A negative maxLen must be treated as "cap to
+  // nothing" and return ''.
+  assert.equal(sliceSurrogateSafe('abcdefghij', -3), '');
+});
