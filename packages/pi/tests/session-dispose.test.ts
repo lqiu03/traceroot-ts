@@ -16,9 +16,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Span } from '@opentelemetry/sdk-trace-base';
-import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import { assistantMessage, CapturingExporter, makeFakeSessionClass } from './test-helpers';
+import { assistantMessage, attrs, CapturingExporter, makeFakeSessionClass } from './test-helpers';
 
 test('session.dispose() does not throw and requires no extra cleanup call from instrumentPiCodingAgent()', async () => {
   const capture = new CapturingExporter();
@@ -68,10 +67,6 @@ test('dispose() on a session that never had prompt() called (no traceroot-pi sub
   assert.equal(session.disposed, true);
   assert.equal(capture.spans.length, 0);
 });
-
-function attrs(span: ReadableSpan): Record<string, unknown> {
-  return span.attributes as Record<string, unknown>;
-}
 
 test('dispose() mid-run (before agent_end) force-closes and exports any still-open AGENT/LLM/TOOL spans instead of leaking them', async () => {
   const capture = new CapturingExporter();
