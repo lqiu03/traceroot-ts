@@ -159,6 +159,29 @@ function sweepDanglingSpans(
   }
 }
 
+// Shared by proto.prompt/proto.steer/proto.followUp below: each of those
+// three independently-callable entry points can be a session's first
+// interaction, and each must guarantee session.subscribe() has been called
+// exactly once for that session before delegating to the real method. All
+// three previously copy-pasted this identical 3-line
+// has()/add()/attachSpanListener() sequence; extracted here so future
+// changes to the guard (or to attachSpanListener's argument list) only need
+// to be made once. Pure structural extraction — no behavior change: the
+// three call sites always passed session, tracer, resolved, pendingInput,
+// sessionSpanState (all closed over here identically) to attachSpanListener.
+function ensureSubscribed(
+  session: AgentSessionInstance,
+  tracer: Tracer,
+  config: ResolvedPiInstrumentationConfig,
+  pendingInput: WeakMap<AgentSessionInstance, QueuedPrompt[]>,
+  subscribedSessions: WeakSet<AgentSessionInstance>,
+  sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
+): void {
+  if (subscribedSessions.has(session)) return;
+  subscribedSessions.add(session);
+  attachSpanListener(session, tracer, config, pendingInput, sessionSpanState);
+}
+
 export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentationConfig): unknown {
   const mod = sdk as PiCodingAgentModule;
 
@@ -326,10 +349,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       if (queue) queue.push(entry);
       else pendingInput.set(this, [entry]);
     }
-    if (!subscribedSessions.has(this)) {
-      subscribedSessions.add(this);
-      attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
-    }
+    ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
     // A prompt() call that never reaches agent_start (a synchronous throw,
     // or its returned Promise rejecting — e.g. a validation failure inside
     // Pi's own prompt() before the agent loop starts) must not leave its
@@ -389,20 +409,14 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   if (typeof proto.steer === 'function') {
     const originalSteer = proto.steer;
     proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-      if (!subscribedSessions.has(this)) {
-        subscribedSessions.add(this);
-        attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
-      }
+      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
       return originalSteer.call(this, text, images);
     };
   }
   if (typeof proto.followUp === 'function') {
     const originalFollowUp = proto.followUp;
     proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-      if (!subscribedSessions.has(this)) {
-        subscribedSessions.add(this);
-        attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
-      }
+      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
       return originalFollowUp.call(this, text, images);
     };
   }
