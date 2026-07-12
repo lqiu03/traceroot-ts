@@ -149,13 +149,7 @@ export function closeRootSpan(
 ): void {
   setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
   if (captureContent) {
-    let lastAssistant: AgentMessage | undefined;
-    for (let i = finalMessages.length - 1; i >= 0; i--) {
-      if (finalMessages[i].role === 'assistant') {
-        lastAssistant = finalMessages[i];
-        break;
-      }
-    }
+    const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
     setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
   }
   endSpanSafe(span);
