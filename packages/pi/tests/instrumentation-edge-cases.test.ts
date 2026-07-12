@@ -125,23 +125,30 @@ test('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES
   assert.equal(Session.prototype.prompt, wrappedOnce);
 });
 
-test('the wrap-once guard key is not a globally-interned Symbol.for() value', () => {
-  // Regression test for a cross-realm collision: Symbol.for(key) is looked up
-  // in the process-wide global symbol registry, so ANY code anywhere in the
+test('the wrap-once guard key is the globally-interned Symbol.for() value, and a second call warns and is rejected', () => {
+  // Regression test for silent double-instrumentation across two
+  // independently-loaded copies of this package sharing one
+  // AgentSession.prototype (e.g. a monorepo hoisting/dedup failure that
+  // leaves two differently-versioned installs of @traceroot-ai/pi both
+  // patching the same underlying @earendil-works/pi-coding-agent instance).
+  //
+  // A module-scoped `Symbol()` guard would fail this scenario silently: each
+  // loaded copy gets its own distinct, non-interned symbol, so one copy's
+  // wrap-once stamp is invisible to the other copy's guard check — both
+  // copies patch prompt/steer/followUp/dispose, and every real session call
+  // then runs through two independent listener layers, doubling every span
+  // export forever with zero warning. Symbol.for(key), by spec, is looked up
+  // in the process-wide global symbol registry: ANY code anywhere in the
   // process that calls Symbol.for() with this exact string gets back the
-  // IDENTICAL symbol value — including a second, independently-loaded copy of
-  // this very module (e.g. two different installed versions of
-  // @traceroot-ai/pi in a monorepo, both operating on the SAME shared
-  // AgentSession.prototype from one deduped peer-dependency install). A
-  // module-scoped `Symbol()` (no registry key) can never collide that way:
-  // each module instantiation gets its own distinct, non-interned symbol, so
-  // one copy's wrap-once stamp is invisible to another copy's guard check.
+  // IDENTICAL symbol value, so a second copy's guard check correctly sees the
+  // first copy's stamp and rejects (warn + no-op) instead of silently
+  // double-wrapping.
   //
   // Asserted directly against the registry rather than by loading two
   // physical copies of the module: Symbol.for(key) is spec-guaranteed to
   // return the exact same value on every call anywhere in the process, so
-  // "the stamped guard key does not equal Symbol.for(that same key)" is
-  // exactly the property that makes the cross-copy collision impossible.
+  // "the stamped guard key equals Symbol.for(that same key)" is exactly the
+  // property that makes cross-copy detection work.
   const Session = makeFakeSessionClass();
   const sdk = { AgentSession: Session };
 
@@ -151,13 +158,39 @@ test('the wrap-once guard key is not a globally-interned Symbol.for() value', ()
     (sym) => sym.description === 'traceroot.pi_coding_agent.wrapped',
   );
   assert.equal(guardKeys.length, 1, 'exactly one wrap-once guard key should be stamped');
-  assert.notEqual(
+  assert.equal(
     guardKeys[0],
     Symbol.for('traceroot.pi_coding_agent.wrapped'),
-    'the guard key must be a module-scoped Symbol(), not the globally-interned ' +
-      'Symbol.for() value — otherwise two independently-loaded copies of this ' +
-      'module sharing one AgentSession.prototype would silently collide, and ' +
-      "the second copy's instrumentPiCodingAgent() config would be dropped",
+    'the guard key must be the globally-interned Symbol.for() value — not a ' +
+      'module-scoped Symbol() — so that two independently-loaded copies of ' +
+      "this module sharing one AgentSession.prototype detect each other's " +
+      'stamp instead of silently double-wrapping and doubling every span export',
+  );
+
+  // Confirm the warn-and-reject path actually fires on a second call: a
+  // different config (a different tenant's apiKey, here) must be rejected,
+  // not silently applied on top of the first.
+  const originalWarn = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args);
+  };
+  try {
+    const wrappedOnce = Session.prototype.prompt;
+    instrumentPiCodingAgent(sdk, { apiKey: 'different-tenant-key' });
+    assert.equal(
+      Session.prototype.prompt,
+      wrappedOnce,
+      "a second instrumentPiCodingAgent() call with a different config must not re-wrap; it's a no-op",
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.ok(
+    warnings.some((args) =>
+      args.some((arg) => typeof arg === 'string' && arg.includes('already called for this sdk')),
+    ),
+    'the second call must log a console.warn explaining its config was dropped',
   );
 });
 

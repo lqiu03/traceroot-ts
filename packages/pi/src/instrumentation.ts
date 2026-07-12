@@ -45,7 +45,37 @@ import {
 } from './spans';
 import type { AgentEvent, AgentSessionInstance, PiCodingAgentModule } from './types';
 
-const WRAPPED = Symbol('traceroot.pi_coding_agent.wrapped');
+// Deliberately Symbol.for(), not a module-scoped Symbol(): this guard is
+// stamped onto AgentSession.prototype, a shared object that can legitimately
+// be reached by TWO independently-loaded copies of this package (e.g. a
+// monorepo with a hoisting/dedup failure that leaves two differently-versioned
+// installs of @traceroot-ai/pi both resolving to the same underlying
+// @earendil-works/pi-coding-agent instance). Weighing the two options by what
+// happens in that dual-copy scenario:
+//
+// - Symbol.for(key): looked up in the process-wide global symbol registry, so
+//   both copies compute the SAME symbol value and see each other's stamp. The
+//   second instrumentPiCodingAgent() call (e.g. a second tenant's config) is
+//   rejected with a console.warn and its tracing never activates. That failure
+//   is bounded to exactly one dropped config and is visible in logs — a
+//   maintainer or on-call engineer can grep for it and understand immediately
+//   what happened and why.
+// - Symbol() (module-scoped, no registry key): each copy gets its own
+//   distinct symbol, invisible to the other copy's guard check. Both copies
+//   successfully patch prompt/steer/followUp/dispose, so EVERY real session
+//   call runs through two independent listener layers — every span gets
+//   exported twice, forever, for both configs, with zero warning. That is
+//   strictly worse: unbounded (not one dropped config but every span,
+//   indefinitely), silent (no log line to notice or grep for), and it doubles
+//   real OTLP ingestion cost in production before anyone realizes.
+//
+// Properly supporting two distinct configs patching one shared prototype
+// simultaneously would require multiplexing every event to multiple tracers —
+// a real feature, out of scope here. Given the choice between those two
+// failure modes, Symbol.for()'s "warn and drop the second config" is the
+// safer default. Do not flip this back to a bare Symbol() without building
+// that multiplexing support first.
+const WRAPPED = Symbol.for('traceroot.pi_coding_agent.wrapped');
 
 // A queued prompt() call's text, boxed in its own object rather than stored
 // as a raw string: proto.prompt's rejection handler below needs to remove
