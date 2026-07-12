@@ -464,6 +464,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
           // called twice on the same session; a second call now takes the
           // same no-op path as a session with no SessionSpanState at all.
           sessionSpanState.delete(this);
+          pendingInput.delete(this);
           // subscribedSessions gates every "already subscribed?" check at
           // the top of proto.prompt/steer/followUp above. Nothing in the
           // real SDK stops a host from calling prompt()/steer()/followUp()
