@@ -12,23 +12,9 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { resolveConfig } from '../src/config';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
 import type { AgentEvent } from '../src/types';
-
-// Copied locally — no shared state across test files, matching every other
-// tests/*.test.ts file's explicit convention.
-class CapturingExporter implements SpanExporter {
-  readonly spans: ReadableSpan[] = [];
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.spans.push(...spans);
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  async shutdown(): Promise<void> {}
-}
 
 // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
 // patches AgentSession.prototype directly, so reusing one class across tests
