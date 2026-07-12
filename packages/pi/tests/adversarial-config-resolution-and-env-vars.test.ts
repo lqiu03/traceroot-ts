@@ -144,21 +144,25 @@ test('end-to-end: an explicit empty-string apiKey disables instrumentation exact
 });
 
 test('an explicit empty-string baseUrl does not silently collapse to a broken relative URL — it falls back like an unset baseUrl', () => {
-  const resolved = resolveConfig({ apiKey: 'k', baseUrl: '' });
-  // Unlike apiKey, baseUrl has no downstream falsy guard before it is spliced
-  // into the OTLP exporter URL (`${config.baseUrl}/api/v1/public/traces` in
-  // provider.ts) — an empty resolved.baseUrl would silently become a relative
-  // URL and break every span export with no warning at all.
-  assert.equal(resolved.baseUrl, 'https://app.traceroot.ai');
+  withEnv({ TRACEROOT_HOST_URL: undefined }, () => {
+    const resolved = resolveConfig({ apiKey: 'k', baseUrl: '' });
+    // Unlike apiKey, baseUrl has no downstream falsy guard before it is spliced
+    // into the OTLP exporter URL (`${config.baseUrl}/api/v1/public/traces` in
+    // provider.ts) — an empty resolved.baseUrl would silently become a relative
+    // URL and break every span export with no warning at all.
+    assert.equal(resolved.baseUrl, 'https://app.traceroot.ai');
+  });
 });
 
 test('a slashes-only baseUrl ("///") also falls back to the default, not to an empty string after stripping', () => {
-  // A naive truthy-check-before-stripping guard (e.g. `config?.baseUrl || ...`)
-  // would let "///" through because it is non-empty pre-strip, then the
-  // trailing-slash strip would still collapse it to "" afterward — the same
-  // broken-relative-URL failure mode as an explicit "", just reached one step
-  // later. The fix must normalize (strip, then check emptiness) before falling
-  // through to the next candidate, not check truthiness on the raw string.
-  const resolved = resolveConfig({ apiKey: 'k', baseUrl: '///' });
-  assert.equal(resolved.baseUrl, 'https://app.traceroot.ai');
+  withEnv({ TRACEROOT_HOST_URL: undefined }, () => {
+    // A naive truthy-check-before-stripping guard (e.g. `config?.baseUrl || ...`)
+    // would let "///" through because it is non-empty pre-strip, then the
+    // trailing-slash strip would still collapse it to "" afterward — the same
+    // broken-relative-URL failure mode as an explicit "", just reached one step
+    // later. The fix must normalize (strip, then check emptiness) before falling
+    // through to the next candidate, not check truthiness on the raw string.
+    const resolved = resolveConfig({ apiKey: 'k', baseUrl: '///' });
+    assert.equal(resolved.baseUrl, 'https://app.traceroot.ai');
+  });
 });

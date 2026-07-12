@@ -130,3 +130,84 @@ test('dispose() on a session that never had prompt() called (no traceroot-pi sub
   assert.equal(session.disposed, true);
   assert.equal(capture.spans.length, 0);
 });
+
+function attrs(span: ReadableSpan): Record<string, unknown> {
+  return span.attributes as Record<string, unknown>;
+}
+
+test('dispose() mid-run (before agent_end) force-closes and exports any still-open AGENT/LLM/TOOL spans instead of leaking them', async () => {
+  const capture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  const sdk = { AgentSession: Session };
+  instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
+  const session = new Session();
+
+  // Open a run and leave it mid-flight: agent_start opens the AGENT
+  // (root) span, message_start opens an LLM span, tool_execution_start
+  // opens a TOOL span — and crucially agent_end never fires, exactly the
+  // "host disposes while a run is in progress" scenario.
+  await session.prompt('long-running task');
+  session.emit({ type: 'agent_start' });
+  session.emit({
+    type: 'message_start',
+    message: assistantMessage({ model: 'mid-run-model' }),
+  });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'call-1',
+    toolName: 'read_file',
+    args: { path: '/tmp/x' },
+  });
+
+  // Nothing has exported yet — all three spans are still open.
+  assert.equal(capture.spans.length, 0, 'no span should export before dispose() while still open');
+
+  assert.doesNotThrow(() => {
+    session.dispose();
+  }, 'dispose() must never throw even though it now force-closes in-flight spans');
+  assert.equal(
+    session.disposed,
+    true,
+    'the real dispose() must still run and mark the session disposed',
+  );
+
+  assert.equal(
+    capture.spans.length,
+    3,
+    'the open AGENT root span, LLM span, and TOOL span must all be force-closed and exported by dispose()',
+  );
+
+  const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
+  const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'mid-run-model');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'call-1');
+
+  assert.ok(rootSpan, 'the AGENT root span must be exported');
+  assert.ok(llmSpan, 'the LLM span must be exported');
+  assert.ok(toolSpan, 'the TOOL span must be exported');
+
+  assert.equal(
+    attrs(rootSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the root span must be marked force_closed, distinguishing it from a normal agent_end close',
+  );
+  assert.equal(
+    attrs(llmSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the LLM span must be marked force_closed',
+  );
+  assert.equal(
+    attrs(toolSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the TOOL span must be marked force_closed',
+  );
+
+  // Firing more events post-dispose must produce no further spans — the
+  // real dispose() already cleared _eventListeners, and our own patch must
+  // not have reintroduced a way to reach the (now torn-down) state.
+  session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  assert.equal(
+    capture.spans.length,
+    3,
+    'no further spans may appear after dispose() already force-closed everything',
+  );
+});

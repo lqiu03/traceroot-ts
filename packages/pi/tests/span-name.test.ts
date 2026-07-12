@@ -113,3 +113,17 @@ test('describeToolCallSpan falls back to the bare tool name when a non-empty pat
     'an empty-basename path must not shadow a real bash command in the same args object',
   );
 });
+
+test('describeToolCallSpan keeps the bash command when a non-empty-basename path-like arg rides along in the same args object', () => {
+  // A bash tool call can carry an incidental path/file/target argument
+  // alongside `command` (plausible for tool schemas that add a
+  // target/cwd-like field). Unlike the empty-basename case above, this path
+  // arg resolves to a real, non-empty basename ("data") — but the bash
+  // command must still win, matching the file header's claimed
+  // leak-prevention/informativeness tradeoff for bash commands.
+  assert.equal(
+    describeToolCallSpan('bash', { command: 'rm -rf /data', target: '/data' }),
+    'bash: rm -rf /data',
+    'a non-empty path-like arg (e.g. target) must not shadow a real bash command',
+  );
+});

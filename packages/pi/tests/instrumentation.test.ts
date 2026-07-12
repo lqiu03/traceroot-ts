@@ -1,58 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
-import { instrumentPiCodingAgent } from '../src/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/types';
+import type { AssistantMessage } from '../src/types';
+import { assistantMessage as baseAssistantMessage, attrs, makeRig } from './test-helpers';
 
-// Capturing exporter — injected via _spanExporter to avoid OTLP network calls,
-// matching packages/mastra/tests/exporter-path.test.ts's convention.
-class CapturingExporter implements SpanExporter {
-  readonly spans: ReadableSpan[] = [];
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.spans.push(...spans);
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  async shutdown(): Promise<void> {}
-}
-
-// Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
-// patches AgentSession.prototype directly, so reusing one class across tests
-// would stack multiple wrap layers onto the same prototype method.
-function makeRig(config: { captureContent?: boolean; captureToolIo?: boolean } = {}) {
-  const capture = new CapturingExporter();
-
-  class FakeAgentSession {
-    sessionId = 'sess-1';
-    private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {
-      // Real prompt() runs the agent loop; tests drive the resulting events manually.
-    }
-    subscribe(listener: (event: AgentEvent) => void): () => void {
-      this.listeners.push(listener);
-      return () => {
-        this.listeners = this.listeners.filter((l) => l !== listener);
-      };
-    }
-    emit(event: AgentEvent): void {
-      for (const listener of this.listeners) listener(event);
-    }
-  }
-
-  const sdk = { AgentSession: FakeAgentSession };
-  instrumentPiCodingAgent(sdk, { apiKey: 'test-key', _spanExporter: capture, ...config });
-
-  return { capture, Session: FakeAgentSession };
-}
-
+// instrumentation.test.ts asserts on specific usage/cost numbers (see the LLM
+// span assertions below), so it overrides test-helpers.ts's minimal
+// placeholder usage with realistic values here — the one place a reader
+// needs to look to find them, rather than a second copy of assistantMessage()
+// with different numbers baked in silently (see test-helpers.ts's docstring).
 function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
-  return {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'done' }],
-    api: 'anthropic-messages',
-    provider: 'anthropic',
-    model: 'claude-sonnet-5',
+  return baseAssistantMessage({
     usage: {
       input: 100,
       output: 20,
@@ -61,14 +18,8 @@ function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantM
       totalTokens: 120,
       cost: { input: 0.001, output: 0.0006, cacheRead: 0, cacheWrite: 0, total: 0.0016 },
     },
-    stopReason: 'stop',
-    timestamp: 0,
     ...overrides,
-  } as AssistantMessage;
-}
-
-function attrs(span: ReadableSpan): Record<string, unknown> {
-  return span.attributes as Record<string, unknown>;
+  });
 }
 
 test('a full turn with one tool call produces a correctly nested AGENT -> LLM -> TOOL span tree', async () => {

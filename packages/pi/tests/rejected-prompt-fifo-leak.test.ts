@@ -9,66 +9,8 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/types';
-
-class CapturingExporter implements SpanExporter {
-  readonly spans: ReadableSpan[] = [];
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.spans.push(...spans);
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  async shutdown(): Promise<void> {}
-}
-
-function makeFakeSessionClass(shouldReject: (text: string) => boolean) {
-  return class FakeAgentSession {
-    sessionId = 'sess-1';
-    private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(text: string, _options?: unknown): Promise<void> {
-      if (shouldReject(text)) {
-        throw new Error(`validation failed for: ${text}`);
-      }
-    }
-    subscribe(listener: (event: AgentEvent) => void): () => void {
-      this.listeners.push(listener);
-      return () => {
-        this.listeners = this.listeners.filter((l) => l !== listener);
-      };
-    }
-    emit(event: AgentEvent): void {
-      for (const listener of this.listeners) listener(event);
-    }
-  };
-}
-
-function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
-  return {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'done' }],
-    api: 'anthropic-messages',
-    provider: 'anthropic',
-    model: 'claude-sonnet-5',
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: 'stop',
-    timestamp: 0,
-    ...overrides,
-  } as AssistantMessage;
-}
-
-function attrs(span: ReadableSpan): Record<string, unknown> {
-  return span.attributes as Record<string, unknown>;
-}
+import { assistantMessage, attrs, CapturingExporter, makeFakeSessionClass } from './test-helpers';
 
 test('a prompt() call that rejects before agent_start does not leak its stale text into a LATER successful prompt() root span', async () => {
   const capture = new CapturingExporter();

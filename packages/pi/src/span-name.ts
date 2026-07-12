@@ -28,6 +28,7 @@
  * "toolName: " with nothing after the colon.
  */
 import { win32 } from 'node:path';
+import { sliceSurrogateSafe } from './surrogate-safe';
 
 const basename = win32.basename;
 
@@ -50,26 +51,32 @@ function firstPathArgument(args: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+// Thin wrapper around the shared ./surrogate-safe boundary cut: appends the
+// ellipsis marker this file's span names use, but only when truncation
+// actually happened (an untruncated name gets no trailing "…").
 function truncateSurrogateSafe(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
-  let cut = maxLen;
-  const code = text.charCodeAt(cut - 1);
-  if (code >= 0xd800 && code <= 0xdbff) {
-    // High surrogate sitting right at the cut boundary — back off one so we
-    // never emit a lone surrogate, which would corrupt UTF-8 on export.
-    cut -= 1;
-  }
-  return `${text.slice(0, cut)}…`;
+  return `${sliceSurrogateSafe(text, maxLen)}…`;
 }
 
 export function describeToolCallSpan(toolName: string, args: unknown): string {
   if (args && typeof args === 'object') {
     const a = args as Record<string, unknown>;
+    // Bash calls are checked first and exclusively by their command: tool
+    // schemas can attach an incidental path/file/target-like argument
+    // alongside `command` (e.g. a cwd or target field), and the generic
+    // path-like check below has no bash-specific exemption. Resolving the
+    // command here, before that check, ensures such an argument never
+    // shadows the actual command being run.
+    if (toolName === 'bash' && typeof a.command === 'string' && a.command) {
+      const cmd = a.command.replace(/\s+/g, ' ').trim();
+      if (cmd) return `bash: ${truncateSurrogateSafe(cmd, MAX_BASH_NAME)}`;
+    }
     const pathLike = firstPathArgument(a);
     if (pathLike) {
       // basename() only strips path separators — a value with none at all
       // (or whose final segment is itself huge) passes through completely
-      // unchanged. Truncate it the same way the bash branch below truncates
+      // unchanged. Truncate it the same way the bash branch above truncates
       // a command, so an untrusted/hallucinated "path"-like argument can't
       // inflate the span NAME without bound the same way a raw bash command
       // could without MAX_BASH_NAME.
@@ -85,10 +92,6 @@ export function describeToolCallSpan(toolName: string, args: unknown): string {
       if (base) {
         return `${toolName}: ${truncateSurrogateSafe(base, MAX_BASH_NAME)}`;
       }
-    }
-    if (toolName === 'bash' && typeof a.command === 'string' && a.command) {
-      const cmd = a.command.replace(/\s+/g, ' ').trim();
-      if (cmd) return `bash: ${truncateSurrogateSafe(cmd, MAX_BASH_NAME)}`;
     }
   }
   return toolName;

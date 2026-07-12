@@ -125,6 +125,42 @@ test('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES
   assert.equal(Session.prototype.prompt, wrappedOnce);
 });
 
+test('the wrap-once guard key is not a globally-interned Symbol.for() value', () => {
+  // Regression test for a cross-realm collision: Symbol.for(key) is looked up
+  // in the process-wide global symbol registry, so ANY code anywhere in the
+  // process that calls Symbol.for() with this exact string gets back the
+  // IDENTICAL symbol value — including a second, independently-loaded copy of
+  // this very module (e.g. two different installed versions of
+  // @traceroot-ai/pi in a monorepo, both operating on the SAME shared
+  // AgentSession.prototype from one deduped peer-dependency install). A
+  // module-scoped `Symbol()` (no registry key) can never collide that way:
+  // each module instantiation gets its own distinct, non-interned symbol, so
+  // one copy's wrap-once stamp is invisible to another copy's guard check.
+  //
+  // Asserted directly against the registry rather than by loading two
+  // physical copies of the module: Symbol.for(key) is spec-guaranteed to
+  // return the exact same value on every call anywhere in the process, so
+  // "the stamped guard key does not equal Symbol.for(that same key)" is
+  // exactly the property that makes the cross-copy collision impossible.
+  const Session = makeFakeSessionClass();
+  const sdk = { AgentSession: Session };
+
+  instrumentPiCodingAgent(sdk, { apiKey: 'k' });
+
+  const guardKeys = Object.getOwnPropertySymbols(Session.prototype).filter(
+    (sym) => sym.description === 'traceroot.pi_coding_agent.wrapped',
+  );
+  assert.equal(guardKeys.length, 1, 'exactly one wrap-once guard key should be stamped');
+  assert.notEqual(
+    guardKeys[0],
+    Symbol.for('traceroot.pi_coding_agent.wrapped'),
+    'the guard key must be a module-scoped Symbol(), not the globally-interned ' +
+      'Symbol.for() value — otherwise two independently-loaded copies of this ' +
+      'module sharing one AgentSession.prototype would silently collide, and ' +
+      "the second copy's instrumentPiCodingAgent() config would be dropped",
+  );
+});
+
 test('missing API key returns the sdk unmodified and never throws', () => {
   const Session = makeFakeSessionClass();
   const originalPrompt = Session.prototype.prompt;

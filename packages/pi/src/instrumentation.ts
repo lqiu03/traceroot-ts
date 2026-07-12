@@ -45,7 +45,7 @@ import {
 } from './spans';
 import type { AgentEvent, AgentSessionInstance, PiCodingAgentModule } from './types';
 
-const WRAPPED = Symbol.for('traceroot.pi_coding_agent.wrapped');
+const WRAPPED = Symbol('traceroot.pi_coding_agent.wrapped');
 
 // A queued prompt() call's text, boxed in its own object rather than stored
 // as a raw string: proto.prompt's rejection handler below needs to remove
@@ -66,6 +66,31 @@ interface SessionSpanState {
   // pendingInput at agent_start) — kept around so agent_end can hand it
   // back to the queue if this run turns out to be retried.
   pendingInputText: string | undefined;
+}
+
+// Force-closes every span left open by an abandoned run: every open tool
+// span, then the LLM span, and — only when explicitly requested — the root
+// span. Shared by all 4 places that need this exact "abandon whatever state
+// was left dangling" sweep: agent_start (a previous run's agent_end never
+// fired), turn_end (a turn ending with an abandoned LLM/tool span), agent_end
+// (defensive cleanup before its own proper closeRootSpan() call), and
+// dispose() (mid-run teardown). closeDanglingSpan() is already a no-op on
+// `undefined`, and iterating + .clear()-ing an already-empty Map is already
+// a no-op, so callers never need their own `if (span)` / `if (size > 0)`
+// guard before calling this — a future change to sweep order or a new span
+// type added to SessionSpanState only has to be made here, once.
+function sweepDanglingSpans(
+  state: SessionSpanState,
+  options: { includeRoot?: boolean } = {},
+): void {
+  for (const span of state.toolSpans.values()) closeDanglingSpan(span);
+  state.toolSpans.clear();
+  closeDanglingSpan(state.llmSpan);
+  state.llmSpan = undefined;
+  if (options.includeRoot) {
+    closeDanglingSpan(state.rootSpan);
+    state.rootSpan = undefined;
+  }
 }
 
 export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentationConfig): unknown {
@@ -128,11 +153,41 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   // never let a later prompt() call's text clobber an earlier one's.
   const pendingInput = new WeakMap<AgentSessionInstance, QueuedPrompt[]>();
   const subscribedSessions = new WeakSet<AgentSessionInstance>();
+  // Mirrors pendingInput: attachSpanListener() below creates one
+  // SessionSpanState per session and closes over it for its own subscribe()
+  // callback, but AgentSession.prototype.dispose (patched once, below) has
+  // no closure over any particular session — it needs this out-of-band map
+  // to reach whichever session's SessionSpanState (if any) it was called on.
+  const sessionSpanState = new WeakMap<AgentSessionInstance, SessionSpanState>();
 
   const originalPrompt = proto.prompt;
   proto.prompt = function (this: AgentSessionInstance, text, options) {
+    // A call that queues via steer()/followUp() instead of starting a fresh
+    // run must never be pushed onto the FIFO queue either — verified against
+    // the real, installed @earendil-works/pi-coding-agent@0.80.6
+    // (dist/core/agent-session.js:812-824): when `this.isStreaming` is true
+    // and `options.streamingBehavior` is set, prompt() calls
+    // `_queueSteer`/`_queueFollowUp` (which inject the message into the
+    // CURRENTLY-running Agent loop, not a new run) and returns —
+    // `_runAgentPrompt`, the only call site that leads to a fresh
+    // agent_start, is never reached. The promise RESOLVES, not rejects, so
+    // the throw/reject cleanup below (removeIfStillQueued) never runs for
+    // this call either. If this call's text were still queued, it would sit
+    // in the FIFO forever with no matching agent_start to shift() it back
+    // out — and the NEXT genuinely new run's agent_start would incorrectly
+    // claim this stale text instead of its own, permanently shifting every
+    // later run's attribution by one, exactly the corruption class
+    // removeIfStillQueued already exists to prevent for the throw/reject
+    // case.
+    //
+    // `this.isStreaming` is read synchronously here, before `originalPrompt`
+    // is invoked — matching the real prompt()'s own synchronous read of the
+    // same getter at the top of its call in the common (non-extension,
+    // non-input-handler) path, so it observes the same session state the SDK
+    // itself is about to act on.
+    const willQueueWithoutAgentStart = this.isStreaming === true && !!options?.streamingBehavior;
     let entry: QueuedPrompt | undefined;
-    if (typeof text === 'string') {
+    if (typeof text === 'string' && !willQueueWithoutAgentStart) {
       entry = { text };
       const queue = pendingInput.get(this);
       if (queue) queue.push(entry);
@@ -140,7 +195,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     }
     if (!subscribedSessions.has(this)) {
       subscribedSessions.add(this);
-      attachSpanListener(this, tracer, resolved, pendingInput);
+      attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
     }
     // A prompt() call that never reaches agent_start (a synchronous throw,
     // or its returned Promise rejecting — e.g. a validation failure inside
@@ -170,6 +225,106 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     return result;
   };
 
+  // steer() and followUp() are standalone public SDK entry points, not
+  // aliases or wrappers of prompt() — a host embedding an interactive Pi
+  // session (this package's own README target) can call
+  // session.steer(text)/session.followUp(text) directly, without ever
+  // calling session.prompt() on that session first. Before this patch,
+  // attachSpanListener() was only ever reached from inside proto.prompt
+  // above, so a session whose first (or only) interaction was steer()/
+  // followUp() never got session.subscribe() called on it at all — every
+  // subsequent AgentEvent (agent_start through agent_end) silently produced
+  // zero spans for the entire lifetime of that session.
+  //
+  // Deliberately NOT enqueuing steer()/followUp() text into pendingInput the
+  // way prompt() does above: verified against the real, installed
+  // @earendil-works/pi-agent-core@0.80.6 (dist/agent.js:169-176),
+  // Agent.steer()/Agent.followUp() only ever push onto an internal queue —
+  // neither one ever itself triggers a fresh run (only Agent.prompt()/
+  // continue() do, via runPromptMessages()). Because pendingInput is a FIFO
+  // consumed exclusively by agent_start, queuing steer()/followUp() text
+  // into it would misattribute that text to whatever LATER, unrelated run's
+  // agent_start happens to fire next — a worse bug than the "no tracing at
+  // all" defect this patch fixes. Only patched when present as a function —
+  // defensive, like the dispose() patch below, so a minimal/partial double
+  // never disables prompt instrumentation over a missing, unrelated method.
+  if (typeof proto.steer === 'function') {
+    const originalSteer = proto.steer;
+    proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
+      if (!subscribedSessions.has(this)) {
+        subscribedSessions.add(this);
+        attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
+      }
+      return originalSteer.call(this, text, images);
+    };
+  }
+  if (typeof proto.followUp === 'function') {
+    const originalFollowUp = proto.followUp;
+    proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
+      if (!subscribedSessions.has(this)) {
+        subscribedSessions.add(this);
+        attachSpanListener(this, tracer, resolved, pendingInput, sessionSpanState);
+      }
+      return originalFollowUp.call(this, text, images);
+    };
+  }
+
+  // Patched once here (guarded by the same WRAPPED check/stamp above that
+  // guards proto.prompt — this whole function body only runs once per sdk),
+  // never per-session: dispose() is a single shared prototype method, same
+  // as prompt(). Only patched when dispose actually exists as a function —
+  // AgentSessionInstance's type declares it as required, but this stays
+  // defensive so a minimal/partial double never disables prompt
+  // instrumentation over a missing, unrelated method.
+  if (typeof proto.dispose === 'function') {
+    const originalDispose = proto.dispose;
+    proto.dispose = function (this: AgentSessionInstance): void {
+      // See this file's module header and types.ts's AgentSessionInstance
+      // doc comment: the real dispose() only reassigns the SDK's private
+      // _eventListeners array, which stops our subscribe() callback from
+      // ever firing again but does nothing to whatever spans that callback
+      // had already opened. If a host calls dispose() mid-run — after
+      // agent_start but before agent_end — this session's SessionSpanState
+      // (if it was ever subscribed) can still have an open rootSpan/llmSpan/
+      // toolSpans that will now never see their normal close event. Force-
+      // close them here first, exactly like agent_start's own dangling-span
+      // sweep, so they still export instead of leaking silently (a span
+      // that never has .end() called on it is never recorded/exported at
+      // all) — then delegate to the real dispose().
+      const state = sessionSpanState.get(this);
+      if (state) {
+        try {
+          sweepDanglingSpans(state, { includeRoot: true });
+        } catch (err) {
+          // A misbehaving span/exporter must never make dispose() throw —
+          // the host still needs its session torn down even if this
+          // best-effort tracing cleanup failed.
+          console.warn(
+            '[traceroot-pi] failed to force-close in-flight spans during dispose() (a span may leak):',
+            err,
+          );
+        } finally {
+          state.rootSpan = undefined;
+          state.rootCtx = undefined;
+          state.llmSpan = undefined;
+          state.llmCtx = undefined;
+          // Avoids re-sweeping already-ended spans if dispose() is ever
+          // called twice on the same session; a second call now takes the
+          // same no-op path as a session with no SessionSpanState at all.
+          sessionSpanState.delete(this);
+        }
+      }
+      // A session that was never subscribed (no prompt() call ever reached
+      // the attachSpanListener() branch above) or that has no open spans
+      // left (the common, already-idle case — e.g. dispose() called after
+      // agent_end already closed everything normally) hits nothing but the
+      // `if (state)` check above, so this call into the real dispose() is
+      // unchanged: same arguments, same return value, same timing as before
+      // this patch existed.
+      return originalDispose.call(this);
+    };
+  }
+
   return sdk;
 }
 
@@ -178,6 +333,7 @@ function attachSpanListener(
   tracer: Tracer,
   config: ResolvedPiInstrumentationConfig,
   pendingInput: WeakMap<AgentSessionInstance, QueuedPrompt[]>,
+  sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
 ): void {
   const state: SessionSpanState = {
     rootSpan: undefined,
@@ -187,6 +343,10 @@ function attachSpanListener(
     toolSpans: new Map(),
     pendingInputText: undefined,
   };
+  // Reachable from AgentSession.prototype.dispose (patched once, in
+  // instrumentPiCodingAgent() above) so a mid-run dispose() can force-close
+  // whatever this session's listener callback below left open.
+  sessionSpanState.set(session, state);
 
   session.subscribe((event: AgentEvent) => {
     try {
@@ -219,32 +379,41 @@ function handleEvent(
       // instead of leaving their now-stale context around to be picked up
       // as the parent of this new run's spans.
       //
-      // The tool-span and LLM-span sweeps are each gated on their own state
-      // independently of state.rootSpan: a stray tool_execution_start OR a
-      // stray message_start (with no matching message_end) can arrive AFTER
-      // a prior run's agent_end already cleared rootSpan (e.g. an async tool
-      // callback resolving late, or a straggler stream event) — leaving an
-      // orphaned entry with no rootSpan to gate on. Without gating each one
-      // independently, that orphan would never be swept here and would
-      // either stay open forever (tool span) or have its reference silently
-      // overwritten below without ever calling .end() on it (LLM span) —
-      // and a span that never has .end() called on it is never
-      // recorded/exported at all, not merely "left open".
-      if (state.toolSpans.size > 0) {
-        for (const span of state.toolSpans.values()) closeDanglingSpan(span);
-        state.toolSpans.clear();
-      }
-      if (state.llmSpan) {
-        closeDanglingSpan(state.llmSpan);
-      }
-      if (state.rootSpan) {
-        closeDanglingSpan(state.rootSpan);
-      }
+      // sweepDanglingSpans() force-closes the tool spans, the LLM span, and
+      // (with includeRoot: true here) the root span unconditionally — it
+      // never needs to gate on state.rootSpan first. That matters because a
+      // stray tool_execution_start OR a stray message_start (with no
+      // matching message_end) can arrive AFTER a prior run's agent_end
+      // already cleared rootSpan (e.g. an async tool callback resolving
+      // late, or a straggler stream event), leaving an orphaned entry with
+      // no rootSpan to gate on. Without sweeping each one unconditionally,
+      // that orphan would never be swept here and would either stay open
+      // forever (tool span) or have its reference silently overwritten below
+      // without ever calling .end() on it (LLM span) — and a span that never
+      // has .end() called on it is never recorded/exported at all, not
+      // merely "left open".
+      sweepDanglingSpans(state, { includeRoot: true });
       const parentCtx = context.active();
       // pendingInput is a per-session FIFO queue (see instrumentPiCodingAgent's
       // own comment) — dequeue the oldest queued text so overlapping prompt()
       // calls each hand their text to the correct run's agent_start, in order.
-      const inputText = pendingInput.get(session)?.shift()?.text;
+      //
+      // If nothing is queued, this agent_start has NO corresponding new
+      // prompt() call at all. Verified against the real, installed
+      // @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.js):
+      // AgentSession._runAgentPrompt() runs `while (await
+      // this._handlePostAgentRun()) { await this.agent.continue(); }`, and
+      // _handlePostAgentRun() returns true for THREE independent reasons — a
+      // retryable error, an ordinary auto-compaction continuation
+      // (_checkCompaction), or an extension-queued follow-up from its own
+      // agent_end handler (agent.hasQueuedMessages()) — and agent.continue()
+      // unconditionally emits a fresh agent_start in every case. None of
+      // those three push anything onto pendingInput, so an empty queue here
+      // means this run is a continuation of whichever run just used
+      // state.pendingInputText (deliberately left untouched by agent_end —
+      // see its comment) rather than a genuinely new call.
+      const queuedEntry = pendingInput.get(session)?.shift();
+      const inputText = queuedEntry ? queuedEntry.text : state.pendingInputText;
       state.pendingInputText = inputText;
       state.rootSpan = openRootSpan(tracer, parentCtx, {
         text: inputText,
@@ -291,16 +460,13 @@ function handleEvent(
       // turn_end fires. If it didn't (e.g. a stream error cut the turn short
       // so message_end never arrived), the LLM span would otherwise stay
       // open indefinitely until something else happens to overwrite the
-      // state reference — force-close it here instead of leaking it.
-      if (state.llmSpan) closeDanglingSpan(state.llmSpan);
-      state.llmSpan = undefined;
-      state.llmCtx = undefined;
-      // Tool calls are turn-scoped: any tool span still open when the turn
+      // state reference — force-close it here instead of leaking it. Tool
+      // calls are turn-scoped too: any tool span still open when the turn
       // ends (its tool_execution_end never arrived) must be force-closed
-      // here too, instead of staying open until agent_end — mirroring
-      // agent_end's own identical toolSpans sweep.
-      for (const span of state.toolSpans.values()) closeDanglingSpan(span);
-      state.toolSpans.clear();
+      // here as well, instead of staying open until agent_end. Root span is
+      // deliberately left untouched — turn_end isn't session end.
+      sweepDanglingSpans(state);
+      state.llmCtx = undefined;
       break;
     }
     case 'tool_execution_start': {
@@ -335,31 +501,39 @@ function handleEvent(
       break;
     }
     case 'agent_end': {
-      for (const span of state.toolSpans.values()) closeDanglingSpan(span);
-      state.toolSpans.clear();
-      closeDanglingSpan(state.llmSpan);
-      state.llmSpan = undefined;
+      // Defensive cleanup for any tool/LLM span this run left dangling,
+      // mirroring turn_end's identical sweep — normally both are already
+      // empty by the time agent_end fires. The root span is NOT part of this
+      // sweep: it gets its own proper closeRootSpan() below rather than a
+      // force-close, since agent_end is the real, expected end of a run.
+      sweepDanglingSpans(state);
       state.llmCtx = undefined;
       if (state.rootSpan)
         closeRootSpan(state.rootSpan, event.messages, event.willRetry, config.captureContent);
       state.rootSpan = undefined;
       state.rootCtx = undefined;
-      // A retry re-enters the agent loop with a fresh agent_start but no new
-      // prompt() call, so it must be able to read the SAME input text this
-      // attempt used. agent_start already dequeued (shifted) that text out
-      // of pendingInput, so hand it back to the front of the queue here
-      // instead of discarding it — the opposite of an unconditional delete,
-      // which would lose it forever on a retry. On a non-retry, do nothing:
-      // the text was already correctly consumed by agent_start's shift(),
-      // and anything still queued behind it belongs to separate,
-      // not-yet-started prompt() calls that must be left untouched.
-      if (event.willRetry && state.pendingInputText !== undefined) {
-        const queue = pendingInput.get(session);
-        const retryEntry: QueuedPrompt = { text: state.pendingInputText };
-        if (queue) queue.unshift(retryEntry);
-        else pendingInput.set(session, [retryEntry]);
-      }
-      state.pendingInputText = undefined;
+      // Deliberately do NOT clear state.pendingInputText here, and do NOT
+      // gate reuse on event.willRetry. `willRetry` reflects ONLY Pi's
+      // auto-retry heuristic (computed purely from _isRetryableError on the
+      // last assistant message — verified against the real, installed
+      // @earendil-works/pi-coding-agent@0.80.6's
+      // AgentSession._willRetryAfterAgentEnd). But
+      // AgentSession._runAgentPrompt()'s own loop (`while (await
+      // this._handlePostAgentRun()) { await this.agent.continue(); }`)
+      // re-enters — firing a fresh agent_start with no corresponding new
+      // prompt() call — for two other, completely unrelated reasons too: an
+      // ordinary auto-compaction continuation (_checkCompaction returning
+      // true on a routine successful turn) and an extension queueing a
+      // follow-up message from its own agent_end handler
+      // (agent.hasQueuedMessages()). Both leave willRetry false, so gating
+      // the reuse on willRetry alone silently discarded the input text (or
+      // let the next agent_start mis-dequeue an unrelated queued call's
+      // text) on those two paths. Rather than special-case each mechanism
+      // here — this event carries no signal that distinguishes them —
+      // simply leave state.pendingInputText as whatever this run used.
+      // agent_start's own handler (see its comment) decides whether to reuse
+      // it (nothing new queued — a continuation of any kind) or overwrite it
+      // with a genuinely new prompt() call's text (queue non-empty).
       break;
     }
     default:

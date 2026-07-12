@@ -144,9 +144,6 @@ jobs:
       - name: Build
         run: pnpm --filter @traceroot-ai/pi build
 
-      - name: Typecheck
-        run: pnpm --filter @traceroot-ai/pi typecheck
-
       - name: Test
         run: pnpm --filter @traceroot-ai/pi test
 

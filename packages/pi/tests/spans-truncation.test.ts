@@ -256,3 +256,127 @@ test('captureToolIo: false still bypasses truncateJsonSafe entirely (no marker, 
   assert.equal(attrs(toolSpan)['input.value'], undefined);
   assert.equal(attrs(toolSpan)['output.value'], undefined);
 });
+
+// A single huge string field (e.g. a big file read, or long command stdout —
+// the dominant real-world shape of oversized tool I/O) must never be fully
+// materialized by JSON.stringify before truncateJsonSafe's post-hoc cap runs.
+// truncateJsonSafe alone already bounds the *final* attribute either way — a
+// naive JSON.stringify(args) then slice(0, MAX) produces byte-identical
+// output to a properly-capped serialization for this single-field shape, so
+// asserting only on the final attribute's length can't tell a fixed
+// implementation apart from a broken one here. Instead this spies on the
+// global JSON.stringify to observe *how* serialization happened: a bare
+// JSON.stringify(args) call (no replacer) covering the huge value is exactly
+// the bug — it means the full string was embedded in the output before any
+// cap applied. A fixed implementation must instead pass a replacer that caps
+// the oversized string as JSON.stringify visits it, before it's embedded.
+test('a single huge string tool argument is capped during serialization, not only after the fact', async () => {
+  const HUGE_LEN = 500 * 1024; // 500 KB — far past MAX_TOOL_IO_JSON_CHARS.
+  const hugeValue = 'A'.repeat(HUGE_LEN);
+  const args = { fileContent: hugeValue };
+
+  const originalStringify = JSON.stringify;
+  let sawBareStringifyOfHugeValue = false;
+  let sawReplacerCapTheHugeValue = false;
+
+  type Replacer = (this: unknown, key: string, value: unknown) => unknown;
+  JSON.stringify = ((
+    value: unknown,
+    replacer?: Replacer | (string | number)[] | null,
+    space?: string | number,
+  ) => {
+    const containsHugeValue =
+      typeof value === 'object' &&
+      value !== null &&
+      Object.values(value as Record<string, unknown>).includes(hugeValue);
+
+    if (containsHugeValue && typeof replacer !== 'function') {
+      // The bug: an object containing the huge string was handed to
+      // JSON.stringify with no replacer, so the full 500KB string gets
+      // embedded in the serialized output before truncateJsonSafe ever runs.
+      sawBareStringifyOfHugeValue = true;
+    }
+
+    if (typeof replacer === 'function') {
+      const wrapped: Replacer = function wrapped(key, val) {
+        const capped = replacer.call(this, key, val);
+        if (val === hugeValue && typeof capped === 'string' && capped.length < hugeValue.length) {
+          sawReplacerCapTheHugeValue = true;
+        }
+        return capped;
+      };
+      return originalStringify(value, wrapped, space);
+    }
+    return originalStringify(value, replacer as (string | number)[] | null | undefined, space);
+  }) as typeof JSON.stringify;
+
+  try {
+    const toolSpan = await runToolCall(args, {});
+    const inputValue = attrs(toolSpan)['input.value'] as string;
+
+    assert.ok(
+      !sawBareStringifyOfHugeValue,
+      'the huge string argument must never be handed to a bare JSON.stringify(args) call with no replacer — that fully materializes it before truncation can cap it',
+    );
+    assert.ok(
+      sawReplacerCapTheHugeValue,
+      "openToolSpan's serialization must cap an oversized string value via JSON.stringify's replacer as it is visited, before it is embedded in the growing output",
+    );
+    assert.ok(
+      inputValue.length <= MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length,
+      'exported input.value must stay bounded even for a 500KB argument',
+    );
+    assert.ok(inputValue.endsWith(TRUNCATION_MARKER));
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+});
+
+// A parameterless tool call (event.args === undefined) or a void-returning
+// tool (event.result === undefined) are both plausible at runtime — AgentEvent
+// types args/result as `unknown`, and captureToolIo defaults to true. Per
+// spec, JSON.stringify(undefined, replacer) returns the *value* undefined,
+// not the string "undefined" — a gap TypeScript's lib.es5.d.ts papers over by
+// always typing JSON.stringify's return as `string`. Handing that straight to
+// truncateJsonSafe(...) throws a TypeError on `.length`, silently swallowed
+// by openToolSpan/closeToolSpan's catch — whose comment claims it exists only
+// for "circular refs or BigInt", which this isn't. This spies on the global
+// JSON.stringify the same way the huge-string test above does, but asserts
+// the opposite: a correct implementation must recognize a literal `undefined`
+// itself and never hand it to JSON.stringify in the first place, exactly like
+// packages/traceroot/src/claude-agent-sdk.ts's tryStringify already does.
+test('undefined args/result (parameterless tool call / void-returning tool) never reach a bare JSON.stringify(undefined) call, and produce no input.value/output.value attribute', async () => {
+  const originalStringify = JSON.stringify;
+  let stringifyCalledWithUndefined = false;
+
+  type Replacer = (this: unknown, key: string, value: unknown) => unknown;
+  JSON.stringify = ((
+    value: unknown,
+    replacer?: Replacer | (string | number)[] | null,
+    space?: string | number,
+  ) => {
+    if (value === undefined) stringifyCalledWithUndefined = true;
+    return originalStringify(value, replacer as (string | number)[] | null | undefined, space);
+  }) as typeof JSON.stringify;
+
+  try {
+    const toolSpan = await runToolCall(undefined, undefined);
+
+    assert.ok(
+      !stringifyCalledWithUndefined,
+      'stringifyToolIo must recognize a literal undefined value itself and short-circuit before ever calling JSON.stringify(undefined, ...) — JSON.stringify(undefined, replacer) returns the value undefined (not a string), and handing that to truncateJsonSafe throws a TypeError that gets silently swallowed under a misleading "circular refs or BigInt" comment',
+    );
+    assert.equal(
+      attrs(toolSpan)['input.value'],
+      undefined,
+      'a parameterless tool call has nothing meaningful to capture as input.value',
+    );
+    assert.equal(
+      attrs(toolSpan)['output.value'],
+      undefined,
+      'a void-returning tool has nothing meaningful to capture as output.value',
+    );
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+});

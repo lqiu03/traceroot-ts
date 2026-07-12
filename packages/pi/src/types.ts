@@ -63,7 +63,28 @@ export interface ToolResultMessage {
   timestamp: number;
 }
 
-export type AgentMessage = AssistantMessage | UserMessage | ToolResultMessage;
+/**
+ * `@earendil-works/pi-agent-core`'s real `AgentMessage` is
+ * `Message | CustomAgentMessages[keyof CustomAgentMessages]`, and
+ * `@earendil-works/pi-coding-agent`'s `dist/core/messages.d.ts` augments
+ * `CustomAgentMessages` with four additional roles this package doesn't
+ * otherwise model: `bashExecution`, `custom`, `branchSummary`,
+ * `compactionSummary` (npm pack + inspection of both packages@0.80.6).
+ * `sendCustomMessage()` emits a live `message_start`/`message_end` pair with
+ * `role: 'custom'` while idle (dist/core/agent-session.js:~1074), so these
+ * are reachable at runtime, not merely declared.
+ *
+ * Every consumer in this package narrows by `.role` before touching any
+ * other field (`message.role === 'assistant'` / `!== 'assistant'`), so
+ * these four are never dereferenced beyond `.role` here — kept minimal
+ * rather than fabricating field shapes this package doesn't act on.
+ */
+export interface OtherAgentMessage {
+  role: 'bashExecution' | 'custom' | 'branchSummary' | 'compactionSummary';
+  timestamp?: number;
+}
+
+export type AgentMessage = AssistantMessage | UserMessage | ToolResultMessage | OtherAgentMessage;
 
 /**
  * The event union emitted by `AgentSession.subscribe()` and the lower-level
@@ -105,7 +126,35 @@ export interface PromptOptions {
 
 export interface AgentSessionInstance {
   readonly sessionId?: string;
+  /**
+   * True while a run is actively executing. Confirmed against the real,
+   * installed @earendil-works/pi-coding-agent@0.80.6
+   * (dist/core/agent-session.js:572, `get isStreaming()`) and used by
+   * prompt() itself (agent-session.js:812) to decide whether to queue via
+   * steer()/followUp() (see PromptOptions.streamingBehavior) instead of
+   * starting a fresh run. instrumentation.ts's proto.prompt wrapper reads
+   * this same getter to avoid queuing a pendingInput FIFO entry for a call
+   * that will never reach agent_start.
+   */
+  readonly isStreaming?: boolean;
   prompt(text: string, options?: PromptOptions): Promise<void>;
+  /**
+   * Queue a steering message while the agent is running — delivered after
+   * the current assistant turn finishes its tool calls, before the next LLM
+   * call. A standalone public entry point distinct from prompt(text, {
+   * streamingBehavior: 'steer' }): a host can call this directly without
+   * ever having called prompt() on the session first. Optional here (rather
+   * than required, like prompt/subscribe) so a minimal/partial double never
+   * disables prompt instrumentation over a missing, unrelated method —
+   * mirrors dispose()'s own optionality in this interface.
+   */
+  steer?(text: string, images?: unknown[]): Promise<void>;
+  /**
+   * Queue a follow-up message to be processed once the agent has no more
+   * tool calls or steering messages left. Same standalone-entry-point
+   * caveat as steer() above.
+   */
+  followUp?(text: string, images?: unknown[]): Promise<void>;
   subscribe(listener: (event: AgentEvent) => void): () => void;
   /**
    * Removes every listener registered via subscribe() and disconnects from

@@ -14,6 +14,7 @@ import type { Context, Span, Tracer } from '@opentelemetry/api';
 import { SDK_NAME } from './config';
 import { SDK_VERSION } from './package-version';
 import { describeToolCallSpan } from './span-name';
+import { sliceSurrogateSafe } from './surrogate-safe';
 import type { AgentMessage, AssistantMessage } from './types';
 
 // Span path keys intentionally omitted — see file header. Everything else
@@ -67,22 +68,51 @@ function endSpanSafe(span: Span | undefined): void {
 
 // Tool args/results can be arbitrarily large (a big file read, a long shell
 // command's stdout) — cap the exported JSON so one tool call can't inflate a
-// span's attribute payload without bound. Mirrors span-name.ts's
-// MAX_BASH_NAME/truncateSurrogateSafe pattern: cut on a UTF-16 code-unit
-// boundary that never splits a surrogate pair, which would corrupt the UTF-8
-// an OTLP/proto collector requires.
+// span's attribute payload without bound. Shares span-name.ts's
+// MAX_BASH_NAME cap pattern and the ./surrogate-safe sliceSurrogateSafe
+// helper: cut on a UTF-16 code-unit boundary that never splits a surrogate
+// pair, which would corrupt the UTF-8 an OTLP/proto collector requires.
 const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 
+// sliceSurrogateSafe (./surrogate-safe) is the shared boundary-detection cut,
+// no marker appended — callers that need a "…[truncated]" suffix
+// (truncateJsonSafe) or a bare cap (capOversizedStringValue, used
+// mid-serialization) each append what they need on top of it.
 function truncateJsonSafe(json: string): string {
   if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
-  let cut = MAX_TOOL_IO_JSON_CHARS;
-  const code = json.charCodeAt(cut - 1);
-  if (code >= 0xd800 && code <= 0xdbff) {
-    // High surrogate sitting right at the cut boundary — back off one so we
-    // never emit a lone surrogate.
-    cut -= 1;
+  return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}…[truncated]`;
+}
+
+// Caps any individual string value to MAX_TOOL_IO_JSON_CHARS as JSON.stringify
+// visits it via the replacer parameter — i.e. *during* the tree walk, before
+// it is embedded into the growing output string. truncateJsonSafe alone is
+// not enough: JSON.stringify(args) fully materializes the serialized payload
+// first and only then gets truncated, so a single huge field (the dominant
+// real-world case — full file content, long command stdout) is built out to
+// its full size in memory before the cap ever applies. Capping per-string
+// here means no single field can inflate the intermediate JSON.stringify
+// output past this bound, regardless of how large the source value is.
+// truncateJsonSafe remains a backstop below for the many-small-fields case,
+// where no single field is oversized but the combined JSON still is.
+function capOversizedStringValue(_key: string, value: unknown): unknown {
+  if (typeof value === 'string' && value.length > MAX_TOOL_IO_JSON_CHARS) {
+    return sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS);
   }
-  return `${json.slice(0, cut)}…[truncated]`;
+  return value;
+}
+
+// JSON.stringify's real runtime return type is `string | undefined`, not the
+// `string` TypeScript's lib.es5.d.ts always claims: for a literal `undefined`
+// (or a bare function/symbol) at the top level it returns the *value*
+// undefined, not the string "undefined". args/result are typed `unknown` and
+// plausibly are `undefined` at runtime (a parameterless tool call, or a
+// void-returning tool) — short-circuit here so callers get an honest
+// `string | undefined` instead of quietly handing truncateJsonSafe something
+// whose `.length` access would throw. Mirrors
+// packages/traceroot/src/claude-agent-sdk.ts's tryStringify.
+function stringifyToolIo(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  return JSON.stringify(value, capOversizedStringValue);
 }
 
 function textOf(message: AgentMessage | undefined): string | undefined {
@@ -119,7 +149,13 @@ export function closeRootSpan(
 ): void {
   setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
   if (captureContent) {
-    const lastAssistant = [...finalMessages].reverse().find((m) => m.role === 'assistant');
+    let lastAssistant: AgentMessage | undefined;
+    for (let i = finalMessages.length - 1; i >= 0; i--) {
+      if (finalMessages[i].role === 'assistant') {
+        lastAssistant = finalMessages[i];
+        break;
+      }
+    }
     setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
   }
   endSpanSafe(span);
@@ -171,7 +207,10 @@ export function openToolSpan(
   setAttr(span, GEN_AI_ATTRIBUTES.TOOL_CALL_ID, toolCallId);
   if (captureToolIo) {
     try {
-      setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, truncateJsonSafe(JSON.stringify(args)));
+      const serializedArgs = stringifyToolIo(args);
+      if (serializedArgs !== undefined) {
+        setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, truncateJsonSafe(serializedArgs));
+      }
     } catch {
       // args may contain circular refs or BigInt — skip rather than crash.
     }
@@ -187,7 +226,10 @@ export function closeToolSpan(
 ): void {
   if (captureToolIo) {
     try {
-      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, truncateJsonSafe(JSON.stringify(result)));
+      const serializedResult = stringifyToolIo(result);
+      if (serializedResult !== undefined) {
+        setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, truncateJsonSafe(serializedResult));
+      }
     } catch {
       // result may contain circular refs or BigInt — skip rather than crash.
     }
