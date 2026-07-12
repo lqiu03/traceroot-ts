@@ -92,3 +92,71 @@ test('an agent_end continuation with willRetry: false (auto-compaction or an ext
       'the old reused text a third time',
   );
 });
+
+test('a retry (willRetry: true) phantom agent_start reuses ITS OWN pendingInputText even when a second, genuinely distinct prompt() call is already queued behind it', async () => {
+  // Regression coverage for the empty-queue-fallback heuristic above: that
+  // heuristic alone is not enough once a second prompt() call is already
+  // sitting in the FIFO when the retry's phantom agent_start fires, because
+  // the queue is then non-empty and the plain "dequeue front, else fall back
+  // to state.pendingInputText" logic incorrectly dequeues the OTHER call's
+  // text instead of reusing this run's own. Unlike compaction/follow-up
+  // continuations, a retry IS explicitly observable via event.willRetry, so
+  // it can (and must) get a stronger, positive-priority guarantee instead of
+  // relying on the queue happening to be empty.
+  const capture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  const sdk = { AgentSession: Session };
+  instrumentPiCodingAgent(sdk, { apiKey: 'test-key', _spanExporter: capture });
+  const session = new Session();
+
+  // Both prompt() calls queue before A's agent_start ever fires — e.g. the
+  // host app already queued a second, unrelated message while the first was
+  // still being dispatched into the agent loop.
+  await session.prompt('A');
+  await session.prompt('B');
+
+  // A's run starts and claims the front of the queue ('A'), leaving 'B'
+  // still queued behind it.
+  session.emit({ type: 'agent_start' });
+  // A's run ends with a retryable error.
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'transient error' }] })],
+    willRetry: true,
+  });
+  // The retry's phantom continuation: agent_start fires again with NO new
+  // prompt() call in between. 'B' is still sitting at the front of the
+  // queue at this point — the retry must not steal it.
+  session.emit({ type: 'agent_start' });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'A succeeded on retry' }] })],
+    willRetry: false,
+  });
+
+  // B's own run finally gets its turn.
+  session.emit({ type: 'agent_start' });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'B result' }] })],
+    willRetry: false,
+  });
+
+  const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+  assert.equal(rootSpans.length, 3, 'A, A-retry, and B each get their own root span');
+  assert.equal(attrs(rootSpans[0]!)['input.value'], 'A', "A's first attempt carries A's text");
+  assert.equal(
+    attrs(rootSpans[1]!)['input.value'],
+    'A',
+    "the retry's phantom agent_start must reuse A's OWN text, not wrongly dequeue B's text just " +
+      'because B was already queued in front of it',
+  );
+  assert.equal(attrs(rootSpans[1]!)['output.value'], 'A succeeded on retry');
+  assert.equal(
+    attrs(rootSpans[2]!)['input.value'],
+    'B',
+    "B's own run must still get attributed with B's text once it finally runs, proving the " +
+      "retry's reservation does not permanently swallow B's queued entry",
+  );
+  assert.equal(attrs(rootSpans[2]!)['output.value'], 'B result');
+});

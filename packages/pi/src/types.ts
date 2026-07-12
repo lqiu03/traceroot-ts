@@ -139,6 +139,36 @@ export interface AgentSessionInstance {
   readonly isStreaming?: boolean;
   prompt(text: string, options?: PromptOptions): Promise<void>;
   /**
+   * Whether any extension has registered a handler for the given event type
+   * (e.g. `'input'`). Confirmed public on the real, installed
+   * @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.d.ts:618,
+   * `hasExtensionHandlers(eventType: string): boolean`) — mirrors the exact
+   * `this._extensionRunner.hasHandlers("input")` check prompt() itself makes
+   * (dist/core/agent-session.js:794) before dispatching to an 'input' hook.
+   * Optional here, like steer()/followUp()/dispose(), so a minimal/partial
+   * double never disables prompt instrumentation over a missing method.
+   * instrumentation.ts's proto.prompt wrapper uses this as a best-effort
+   * signal (NOT a precise one — see its own comment) that a call might be
+   * fully intercepted by an 'input' hook and never reach agent_start.
+   */
+  hasExtensionHandlers?(eventType: string): boolean;
+  /**
+   * The session's extension runner, exposing (among other things)
+   * `getCommand(name)` — confirmed public on the real, installed
+   * @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.d.ts:622,
+   * `get extensionRunner(): ExtensionRunner`; dist/core/extensions/
+   * runner.d.ts:128, `getCommand(name: string): ResolvedCommand | undefined`
+   * on ExtensionRunner itself). Only the one method this package actually
+   * calls is declared here — see this package's own types.ts header comment
+   * on why the full real SDK type is deliberately not imported.
+   * instrumentation.ts's proto.prompt wrapper uses this to deterministically
+   * detect a leading "/" prompt that a registered extension command will
+   * fully handle, so it never reaches agent_start.
+   */
+  readonly extensionRunner?: {
+    getCommand?(name: string): unknown;
+  };
+  /**
    * Queue a steering message while the agent is running — delivered after
    * the current assistant turn finishes its tool calls, before the next LLM
    * call. A standalone public entry point distinct from prompt(text, {

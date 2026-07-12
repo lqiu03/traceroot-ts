@@ -66,6 +66,14 @@ interface SessionSpanState {
   // pendingInput at agent_start) — kept around so agent_end can hand it
   // back to the queue if this run turns out to be retried.
   pendingInputText: string | undefined;
+  // One-shot reservation set by agent_end when event.willRetry is true,
+  // consumed by exactly the next agent_start. See agent_end's and
+  // agent_start's own comments below for why only the explicitly-observable
+  // retry case gets this strong "reuse regardless of what's queued"
+  // guarantee, while compaction/follow-up continuations (which are NOT
+  // observable via any AgentEvent field) only get the weaker empty-queue
+  // fallback.
+  reserveInputForRetry: boolean;
 }
 
 // Force-closes every span left open by an abandoned run: every open tool
@@ -162,30 +170,97 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
 
   const originalPrompt = proto.prompt;
   proto.prompt = function (this: AgentSessionInstance, text, options) {
-    // A call that queues via steer()/followUp() instead of starting a fresh
-    // run must never be pushed onto the FIFO queue either — verified against
-    // the real, installed @earendil-works/pi-coding-agent@0.80.6
-    // (dist/core/agent-session.js:812-824): when `this.isStreaming` is true
-    // and `options.streamingBehavior` is set, prompt() calls
-    // `_queueSteer`/`_queueFollowUp` (which inject the message into the
-    // CURRENTLY-running Agent loop, not a new run) and returns —
-    // `_runAgentPrompt`, the only call site that leads to a fresh
-    // agent_start, is never reached. The promise RESOLVES, not rejects, so
-    // the throw/reject cleanup below (removeIfStillQueued) never runs for
-    // this call either. If this call's text were still queued, it would sit
-    // in the FIFO forever with no matching agent_start to shift() it back
-    // out — and the NEXT genuinely new run's agent_start would incorrectly
-    // claim this stale text instead of its own, permanently shifting every
-    // later run's attribution by one, exactly the corruption class
-    // removeIfStillQueued already exists to prevent for the throw/reject
-    // case.
+    // Before choosing a proactive (enumerate-the-early-returns) vs reactive
+    // (clean up by reference identity once THIS call's own promise settles)
+    // strategy here, the real question is: for the path that DOES reach
+    // _runAgentPrompt, is agent_start GUARANTEED to have already fired (and
+    // already shifted some queue entry) by the time prompt()'s own returned
+    // promise settles? Reading the real, installed
+    // @earendil-works/pi-coding-agent@0.80.6 source alone says yes:
+    // `_runAgentPrompt` is the last expression `prompt()` awaits, and inside
+    // it `await this.agent.prompt(messages)` cannot itself resolve before the
+    // underlying Agent has already emitted agent_start. That would make a
+    // purely reactive `result.finally(removeIfStillQueued)` sound in theory.
     //
-    // `this.isStreaming` is read synchronously here, before `originalPrompt`
-    // is invoked — matching the real prompt()'s own synchronous read of the
-    // same getter at the top of its call in the common (non-extension,
-    // non-input-handler) path, so it observes the same session state the SDK
-    // itself is about to act on.
-    const willQueueWithoutAgentStart = this.isStreaming === true && !!options?.streamingBehavior;
+    // It is NOT sound in practice for this specific FIFO design, though —
+    // verified empirically, not assumed: the very feature this queue exists
+    // for (two prompt() calls queuing before EITHER's agent_start has fired
+    // yet — see the "two overlapping prompt() calls" and retry/compaction
+    // continuation tests) means a still-genuinely-in-flight call's own
+    // promise can legitimately still be unsettled/settled independently of
+    // when ITS OWN agent_start arrives, from the perspective of anything
+    // that can only observe promise settlement, not the SDK's real internal
+    // ordering. Trying `result.finally(removeIfStillQueued)` here and running
+    // the full suite reproduced exactly that: 13 unrelated, previously-green
+    // tests started failing because their queued entries were reactively
+    // stripped before their own later-emitted agent_start could claim them.
+    // A reactive strategy is therefore the wrong choice here, regardless of
+    // what the raw promise-ordering guarantee alone would suggest — this
+    // package's own FIFO semantics don't preserve the "settle implies
+    // consumed" property a reactive check needs. Proactive enumeration,
+    // extended below to cover as many early-return paths as can be
+    // determined SYNCHRONOUSLY and precisely from public SDK surface, is the
+    // safe option.
+    //
+    // (a) isStreaming + streamingBehavior — verified against the real,
+    // installed SDK (dist/core/agent-session.js:812-824): when
+    // `this.isStreaming` is true and `options.streamingBehavior` is set,
+    // prompt() calls `_queueSteer`/`_queueFollowUp` (which inject the message
+    // into the CURRENTLY-running Agent loop, not a new run) and returns —
+    // `_runAgentPrompt` is never reached. `this.isStreaming` is read
+    // synchronously here, before `originalPrompt` is invoked — matching the
+    // real prompt()'s own synchronous read of the same getter.
+    const isStreamedQueueOnly = this.isStreaming === true && !!options?.streamingBehavior;
+    // (b) a leading "/" matched by a registered extension command — verified
+    // against the real, installed SDK (dist/core/agent-session.js:783-790):
+    // `if (expandPromptTemplates && text.startsWith("/")) { const handled =
+    // await this._tryExecuteExtensionCommand(text); if (handled) {
+    // preflightResult?.(true); return; } }`. This is decidable precisely
+    // (not just heuristically) from outside: _tryExecuteExtensionCommand's
+    // own command lookup (agent-session.js:903-908) parses the command name
+    // identically to below, and its try/catch (913-925) means ANY registered
+    // command — even one whose handler throws — still returns true. So a
+    // truthy `getCommand()` lookup via the SDK's own public
+    // `session.extensionRunner` getter (agent-session.js:2629-2630, and
+    // ExtensionRunner.getCommand is itself public — dist/core/extensions/
+    // runner.d.ts:128) deterministically means this call will never reach
+    // agent_start, with no false-positive case.
+    const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+    let matchesExtensionCommand = false;
+    if (expandPromptTemplates && typeof text === 'string' && text.startsWith('/')) {
+      const spaceIndex = text.indexOf(' ');
+      const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+      matchesExtensionCommand = !!this.extensionRunner?.getCommand?.(commandName);
+    }
+    // (c) any extension with an 'input' hook returning action: 'handled' —
+    // verified against the real, installed SDK (dist/core/agent-session.js:
+    // 794-799): `if (this._extensionRunner.hasHandlers("input")) { const
+    // inputResult = await this._extensionRunner.emitInput(...); if
+    // (inputResult.action === "handled") { preflightResult?.(true); return; }
+    // }`. Unlike (b), this is NOT precisely decidable from outside: whether a
+    // specific text ends up "handled" depends on the registered hook
+    // function's own logic, which this patch layer cannot inspect or
+    // pre-invoke (calling it ourselves to find out would double-invoke a
+    // potentially side-effecting extension). The best available signal is
+    // the SDK's own public `session.hasExtensionHandlers('input')`
+    // (agent-session.js:618, mirrors the exact same `hasHandlers("input")`
+    // check prompt() itself makes) — true whenever ANY 'input' hook is
+    // registered, whether or not it will actually intercept THIS text. This
+    // is a deliberate, documented best-effort heuristic, not a precise
+    // detection: a session with an 'input' hook that only intercepts SOME
+    // messages will, for every message it does NOT intercept, still take
+    // this proactive branch and skip queuing — losing that real run's
+    // input.value (falling back to agent_start's empty-queue heuristic)
+    // rather than corrupting a LATER call's attribution. That tradeoff —
+    // graceful degradation (a missing/stale input.value) over the
+    // cross-call corruption this queue exists to prevent — is preferred
+    // given the SDK exposes no way to precisely predict a specific hook's
+    // decision without invoking it. This (and the enumeration of early-return
+    // paths above) must be kept in sync with the SDK and may miss future
+    // early-return paths a later SDK version adds.
+    const mayBeHandledByInputHook = this.hasExtensionHandlers?.('input') === true;
+    const willQueueWithoutAgentStart =
+      isStreamedQueueOnly || matchesExtensionCommand || mayBeHandledByInputHook;
     let entry: QueuedPrompt | undefined;
     if (typeof text === 'string' && !willQueueWithoutAgentStart) {
       entry = { text };
@@ -207,6 +282,11 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     // after that would be off by one, permanently. Remove by reference
     // identity, not by string match, so a different still-pending queue
     // entry that happens to hold an equal string is never removed instead.
+    // Deliberately still gated on rejection only (.catch(), not .finally())
+    // — see this function's opening comment for why widening this to also
+    // run on resolve is unsafe for this FIFO's own overlapping-call
+    // semantics, even though it would be sound against the raw SDK guarantee
+    // alone.
     const removeIfStillQueued = (): void => {
       if (!entry) return;
       const queue = pendingInput.get(this);
@@ -342,6 +422,7 @@ function attachSpanListener(
     llmCtx: undefined,
     toolSpans: new Map(),
     pendingInputText: undefined,
+    reserveInputForRetry: false,
   };
   // Reachable from AgentSession.prototype.dispose (patched once, in
   // instrumentPiCodingAgent() above) so a mid-run dispose() can force-close
@@ -398,22 +479,49 @@ function handleEvent(
       // own comment) — dequeue the oldest queued text so overlapping prompt()
       // calls each hand their text to the correct run's agent_start, in order.
       //
-      // If nothing is queued, this agent_start has NO corresponding new
-      // prompt() call at all. Verified against the real, installed
-      // @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.js):
-      // AgentSession._runAgentPrompt() runs `while (await
-      // this._handlePostAgentRun()) { await this.agent.continue(); }`, and
-      // _handlePostAgentRun() returns true for THREE independent reasons — a
-      // retryable error, an ordinary auto-compaction continuation
-      // (_checkCompaction), or an extension-queued follow-up from its own
-      // agent_end handler (agent.hasQueuedMessages()) — and agent.continue()
-      // unconditionally emits a fresh agent_start in every case. None of
-      // those three push anything onto pendingInput, so an empty queue here
-      // means this run is a continuation of whichever run just used
-      // state.pendingInputText (deliberately left untouched by agent_end —
-      // see its comment) rather than a genuinely new call.
-      const queuedEntry = pendingInput.get(session)?.shift();
-      const inputText = queuedEntry ? queuedEntry.text : state.pendingInputText;
+      // EXCEPTION: if agent_end just reserved this exact next agent_start for
+      // a retry (state.reserveInputForRetry — set only when event.willRetry
+      // was true, see agent_end's comment below), that reservation wins even
+      // when the queue is non-empty. A retry's phantom continuation must
+      // reuse the retrying run's OWN text, never whatever a second, genuinely
+      // distinct prompt() call already queued behind it — see
+      // agent-end-continuation-input-requeue.test.ts's "reuses ITS OWN
+      // pendingInputText even when a second ... prompt() call is already
+      // queued behind it" test for the exact corruption this prevents. The
+      // flag is consumed here exactly once: it is set immediately before
+      // this specific agent_start (agent.continue() is called synchronously,
+      // with no other event able to interleave in between — see agent_end's
+      // comment), so it can never leak forward onto some LATER, unrelated
+      // agent_start.
+      //
+      // If the reservation is not set AND nothing is queued, this agent_start
+      // has NO corresponding new prompt() call at all. Verified against the
+      // real, installed @earendil-works/pi-coding-agent@0.80.6
+      // (dist/core/agent-session.js): AgentSession._runAgentPrompt() runs
+      // `while (await this._handlePostAgentRun()) { await
+      // this.agent.continue(); }`, and _handlePostAgentRun() returns true for
+      // THREE independent reasons — a retryable error, an ordinary
+      // auto-compaction continuation (_checkCompaction), or an
+      // extension-queued follow-up from its own agent_end handler
+      // (agent.hasQueuedMessages()) — and agent.continue() unconditionally
+      // emits a fresh agent_start in every case. None of those three push
+      // anything onto pendingInput, so an empty queue here (with no
+      // reservation active) means this run is a continuation of whichever
+      // run just used state.pendingInputText (deliberately left untouched by
+      // agent_end — see its comment) rather than a genuinely new call. This
+      // empty-queue heuristic is the best available fallback for compaction/
+      // follow-up specifically because — unlike a retry — the SDK gives no
+      // event field that distinguishes those two from a genuinely new call,
+      // so they cannot get the same positive-priority reservation a retry
+      // gets.
+      let inputText: string | undefined;
+      if (state.reserveInputForRetry) {
+        state.reserveInputForRetry = false;
+        inputText = state.pendingInputText;
+      } else {
+        const queuedEntry = pendingInput.get(session)?.shift();
+        inputText = queuedEntry ? queuedEntry.text : state.pendingInputText;
+      }
       state.pendingInputText = inputText;
       state.rootSpan = openRootSpan(tracer, parentCtx, {
         text: inputText,
@@ -534,6 +642,27 @@ function handleEvent(
       // agent_start's own handler (see its comment) decides whether to reuse
       // it (nothing new queued — a continuation of any kind) or overwrite it
       // with a genuinely new prompt() call's text (queue non-empty).
+      //
+      // willRetry DOES get one extra, stronger guarantee on top of that
+      // shared fallback: when it's true, reserve this run's pendingInputText
+      // for the very next agent_start via a one-shot flag (consumed in
+      // agent_start's handler above), so the retry's phantom continuation
+      // reuses its own text even if a second, genuinely distinct prompt()
+      // call is already sitting at the front of the queue (see that test's
+      // "even when a second ... prompt() call is already queued behind it"
+      // case). This asymmetry — positive priority for retry, but only the
+      // weaker empty-queue heuristic for compaction/follow-up — exists
+      // because retry is the ONE reason _handlePostAgentRun() can return true
+      // that IS explicitly observable on this event (event.willRetry).
+      // Compaction and extension-queued-follow-up are not: both leave
+      // willRetry false and this event's shape ({messages, willRetry?}) has
+      // no other field to tell them apart from a genuinely new prompt() call,
+      // so there is no SDK signal available to give them the same strong
+      // guarantee — the empty-queue fallback is the best available
+      // approximation for those two.
+      if (event.willRetry) {
+        state.reserveInputForRetry = true;
+      }
       break;
     }
     default:
