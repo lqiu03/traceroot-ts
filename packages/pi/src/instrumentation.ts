@@ -76,6 +76,30 @@ interface SessionSpanState {
   reserveInputForRetry: boolean;
 }
 
+// closeDanglingSpan() (spans.ts) calls setAttr() before endSpanSafe() —
+// setAttr()'s underlying span.setAttribute() is NOT wrapped in try/catch the
+// way endSpanSafe() explicitly is ("Never let a misbehaving OTel exporter/
+// processor crash the host app"), so a single misbehaving Span implementation
+// can still throw out of closeDanglingSpan() itself. Catching per-span here —
+// rather than only around the sweep as a whole, as dispose()'s own outer
+// try/catch does — means one bad span can never prevent the sweep from
+// reaching every OTHER span still queued up to close: without this, a throw
+// on (say) the 2nd of 5 open tool spans would abort the loop and leave the
+// remaining 3 tool spans, the LLM span, and (when includeRoot) the root span
+// never closed — and a span with no .end() call is never exported at all,
+// not merely "left open". `label` is logged so a real failure is traceable to
+// the specific span kind (and, for tool spans, call id) that misbehaved.
+function safeCloseDanglingSpan(span: Span | undefined, label: string): void {
+  try {
+    closeDanglingSpan(span);
+  } catch (err) {
+    console.warn(
+      `[traceroot-pi] failed to force-close a dangling ${label} span during sweep (it may leak):`,
+      err,
+    );
+  }
+}
+
 // Force-closes every span left open by an abandoned run: every open tool
 // span, then the LLM span, and — only when explicitly requested — the root
 // span. Shared by all 4 places that need this exact "abandon whatever state
@@ -86,17 +110,21 @@ interface SessionSpanState {
 // `undefined`, and iterating + .clear()-ing an already-empty Map is already
 // a no-op, so callers never need their own `if (span)` / `if (size > 0)`
 // guard before calling this — a future change to sweep order or a new span
-// type added to SessionSpanState only has to be made here, once.
+// type added to SessionSpanState only has to be made here, once. Each
+// individual close goes through safeCloseDanglingSpan() (above), so one
+// span's close throwing never aborts the rest of the sweep.
 function sweepDanglingSpans(
   state: SessionSpanState,
   options: { includeRoot?: boolean } = {},
 ): void {
-  for (const span of state.toolSpans.values()) closeDanglingSpan(span);
+  for (const [toolCallId, span] of state.toolSpans) {
+    safeCloseDanglingSpan(span, `tool (toolCallId=${toolCallId})`);
+  }
   state.toolSpans.clear();
-  closeDanglingSpan(state.llmSpan);
+  safeCloseDanglingSpan(state.llmSpan, 'LLM');
   state.llmSpan = undefined;
   if (options.includeRoot) {
-    closeDanglingSpan(state.rootSpan);
+    safeCloseDanglingSpan(state.rootSpan, 'root');
     state.rootSpan = undefined;
   }
 }
@@ -392,6 +420,21 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
           // called twice on the same session; a second call now takes the
           // same no-op path as a session with no SessionSpanState at all.
           sessionSpanState.delete(this);
+          // subscribedSessions gates every "already subscribed?" check at
+          // the top of proto.prompt/steer/followUp above. Nothing in the
+          // real SDK stops a host from calling prompt()/steer()/followUp()
+          // again on a session instance after dispose() — dispose() only
+          // clears the SDK's own _eventListeners array (see this file's
+          // module header), it does not make the session instance itself
+          // unusable. Without this delete, a session reused after dispose()
+          // would find subscribedSessions.has(this) still true forever and
+          // silently never call attachSpanListener()/session.subscribe()
+          // again — every span from every run after the first dispose()
+          // would be dropped with no warning. Deleting here, alongside
+          // sessionSpanState, means the next prompt()/steer()/followUp()
+          // call on this same instance re-subscribes and resumes tracing
+          // normally, exactly like a brand-new session would.
+          subscribedSessions.delete(this);
         }
       }
       // A session that was never subscribed (no prompt() call ever reached

@@ -52,14 +52,34 @@ test('the shared sweep helper is called from all 4 dangling-span call sites (age
 
 test('the raw tool-span-sweep loop no longer appears inline at each call site', () => {
   const inlineToolSweeps =
-    SOURCE.match(
-      /for \(const span of state\.toolSpans\.values\(\)\) closeDanglingSpan\(span\);/g,
-    ) ?? [];
+    SOURCE.match(/for \(const \[toolCallId, span\] of state\.toolSpans\)/g) ?? [];
   assert.equal(
     inlineToolSweeps.length,
     1,
-    'the `for (const span of state.toolSpans.values()) closeDanglingSpan(span);` loop must ' +
-      `appear exactly once (inside the shared helper) — found ${inlineToolSweeps.length} ` +
-      'copy-pasted occurrence(s) across the 4 call sites.',
+    'the `for (const [toolCallId, span] of state.toolSpans)` loop must appear exactly once ' +
+      `(inside the shared helper) — found ${inlineToolSweeps.length} copy-pasted occurrence(s) ` +
+      'across the 4 call sites.',
+  );
+});
+
+test('each dangling-span close in the sweep goes through the resilient per-span helper, not a bare closeDanglingSpan() call', () => {
+  // Regression guard for the companion resilience finding: sweepDanglingSpans()
+  // must route every individual close through safeCloseDanglingSpan() (which
+  // catches per-span) rather than calling closeDanglingSpan() directly, so one
+  // misbehaving span can never abort the rest of the sweep.
+  const helperDefinitions = SOURCE.match(/function safeCloseDanglingSpan\(/g) ?? [];
+  assert.equal(
+    helperDefinitions.length,
+    1,
+    'expected exactly one safeCloseDanglingSpan() helper definition — found ' +
+      `${helperDefinitions.length}.`,
+  );
+  const bareCloseInSweep =
+    SOURCE.match(/state\.toolSpans\.clear\(\);\s*closeDanglingSpan\(/g) ?? [];
+  assert.equal(
+    bareCloseInSweep.length,
+    0,
+    'sweepDanglingSpans() must not call closeDanglingSpan() directly on the LLM/root spans — ' +
+      'route through safeCloseDanglingSpan() so a throw on one span cannot abort the sweep.',
   );
 });
