@@ -15,73 +15,10 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
 import { Span } from '@opentelemetry/sdk-trace-base';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/types';
-
-// Copied locally per-file, matching every other tests/*.test.ts in this package.
-class CapturingExporter implements SpanExporter {
-  readonly spans: ReadableSpan[] = [];
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.spans.push(...spans);
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  async shutdown(): Promise<void> {}
-}
-
-// Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
-// patches AgentSession.prototype directly, so reusing one class across tests
-// would stack multiple wrap layers onto the same prototype method.
-//
-// dispose() below reassigns `this.listeners` to a brand-new array rather
-// than calling each stored unsubscribe closure — that is the actual,
-// verified real-SDK mechanism (this._eventListeners = []), not a
-// simplification.
-function makeFakeSessionClass() {
-  return class FakeAgentSession {
-    sessionId = 'sess-1';
-    disposed = false;
-    private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
-    subscribe(listener: (event: AgentEvent) => void): () => void {
-      this.listeners.push(listener);
-      return () => {
-        this.listeners = this.listeners.filter((l) => l !== listener);
-      };
-    }
-    emit(event: AgentEvent): void {
-      for (const listener of this.listeners) listener(event);
-    }
-    dispose(): void {
-      this.disposed = true;
-      this.listeners = [];
-    }
-  };
-}
-
-function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
-  return {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'done' }],
-    api: 'anthropic-messages',
-    provider: 'anthropic',
-    model: 'claude-sonnet-5',
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: 'stop',
-    timestamp: 0,
-    ...overrides,
-  } as AssistantMessage;
-}
+import { assistantMessage, CapturingExporter, makeFakeSessionClass } from './test-helpers';
 
 test('session.dispose() does not throw and requires no extra cleanup call from instrumentPiCodingAgent()', async () => {
   const capture = new CapturingExporter();

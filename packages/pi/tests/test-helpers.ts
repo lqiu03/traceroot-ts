@@ -43,6 +43,7 @@ export class CapturingExporter implements SpanExporter {
 export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
   return class FakeAgentSession {
     sessionId = 'sess-1';
+    disposed = false;
     private listeners: Array<(event: AgentEvent) => void> = [];
     async prompt(text: string, _options?: unknown): Promise<void> {
       if (shouldReject?.(text)) {
@@ -57,6 +58,17 @@ export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
     }
     emit(event: AgentEvent): void {
       for (const listener of this.listeners) listener(event);
+    }
+    // dispose() mirrors the real, verified SDK mechanism (see
+    // session-dispose.test.ts's module header): it reassigns the session's
+    // internal listener array to a fresh empty one rather than calling each
+    // stored unsubscribe() closure. Included unconditionally (not gated
+    // behind an options flag) because every other caller of this factory
+    // never invokes .dispose(), so its presence is inert for them — only
+    // session-dispose.test.ts exercises it.
+    dispose(): void {
+      this.disposed = true;
+      this.listeners = [];
     }
   };
 }
