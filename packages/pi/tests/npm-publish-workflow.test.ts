@@ -23,12 +23,20 @@ const workflowPath = path.join(
 );
 
 function extractJobBlock(workflowText: string, jobName: string): string {
+  // Normalize CRLF -> LF before any line-anchored matching. On a Windows
+  // checkout (core.autocrlf=true) the on-disk bytes after a job name are
+  // ":\r\n", so a `:\n` regex would never match and every assertion below
+  // would fail locally while still passing on the Linux CI runners — masking a
+  // real broken parse. Normalizing here (rather than only at the read site)
+  // keeps the helper correct for any caller and lets it be tested directly with
+  // CRLF input.
+  const normalized = workflowText.replace(/\r\n/g, '\n');
   const jobHeaderRegex = new RegExp(`^  ${jobName}:\\n`, 'm');
-  const jobHeaderMatch = jobHeaderRegex.exec(workflowText);
+  const jobHeaderMatch = jobHeaderRegex.exec(normalized);
   assert.ok(jobHeaderMatch, `job "${jobName}" not found in workflow`);
 
   const jobStart = jobHeaderMatch.index + jobHeaderMatch[0].length;
-  const remainder = workflowText.slice(jobStart);
+  const remainder = normalized.slice(jobStart);
 
   // The next top-level job key starts a line indented exactly two spaces.
   const nextJobRegex = /^ {2}[A-Za-z0-9_-]+:\n/m;
@@ -45,6 +53,36 @@ function extractStepNames(jobBlock: string): string[] {
   }
   return stepNames;
 }
+
+test('extractJobBlock/extractStepNames parse CRLF-terminated workflow text', () => {
+  // A synthetic CRLF workflow (what a Windows checkout hands to readFileSync):
+  // if the helpers were CRLF-unsafe this would fail to find the job at all, or
+  // capture a trailing \r on every step name. Guards against a future refactor
+  // dropping the normalization even when CI happens to run on an LF checkout.
+  const crlfWorkflow = [
+    'jobs:',
+    '  build:',
+    '    steps:',
+    '      - name: Build',
+    '      - name: Test',
+    '  publish:',
+    '    steps:',
+    '      - name: Publish',
+    '',
+  ].join('\r\n');
+
+  const buildBlock = extractJobBlock(crlfWorkflow, 'build');
+  const stepNames = extractStepNames(buildBlock);
+
+  assert.deepEqual(stepNames, ['Build', 'Test']);
+  // No trailing \r survived the parse.
+  assert.ok(
+    stepNames.every((name) => !name.includes('\r')),
+    'step names must not carry a trailing carriage return',
+  );
+  // The block stopped at the next job, not run to end of file.
+  assert.ok(!buildBlock.includes('Publish'), 'job block must end before the next job');
+});
 
 test('publish-pi-test job does not run a redundant separate Typecheck step after Build', () => {
   const workflowText = readFileSync(workflowPath, 'utf8');
