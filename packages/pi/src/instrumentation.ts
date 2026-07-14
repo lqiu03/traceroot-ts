@@ -186,12 +186,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   const mod = sdk as PiCodingAgentModule;
 
   const resolved = resolveConfig(config);
-  if (!resolved.apiKey) {
-    console.warn(
-      '[traceroot-pi] TRACEROOT_API_KEY (or config.apiKey) is not set — instrumentation disabled.',
-    );
-    return sdk;
-  }
 
   // The wrap-once guard is stamped on AgentSession.prototype, never on `mod`
   // itself. When `sdk` is obtained via `import * as pi from "..."` (the
@@ -218,9 +212,31 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     );
     return sdk;
   }
+
+  // Build the tracing pipeline BEFORE stamping the wrap-once guard, so the
+  // shared-vs-private decision can gate the apiKey requirement. Shared mode (a
+  // real global provider already registered — e.g. by TraceRoot.initialize()
+  // earlier in the same process) never constructs an OTLP exporter, so it
+  // needs no apiKey at all; only the private-provider fallback that builds its
+  // own OTLP exporter does. A _spanExporter override likewise builds a private
+  // provider but needs no apiKey (a test rig, or a caller supplying its own
+  // exporter). Requiring an apiKey up front — as this used to, before the
+  // shared pipeline existed — silently no-op'd the entire feature for every
+  // host that configured TraceRoot programmatically and never set
+  // TRACEROOT_API_KEY, even though a fully valid shared pipeline was available.
+  const tracing = createTracing(resolved);
+  if (tracing.ownsProvider && !resolved.apiKey && !resolved.spanExporterOverride) {
+    console.warn(
+      '[traceroot-pi] no global OTel TracerProvider is registered and no TRACEROOT_API_KEY ' +
+        '(or config.apiKey) is set — cannot build an export pipeline, so instrumentation is ' +
+        'disabled. Call this after TraceRoot.initialize() (shared mode), or provide an apiKey.',
+    );
+    return sdk;
+  }
+
   Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
 
-  const { tracer, forceFlush, ownsProvider } = createTracing(resolved);
+  const { tracer, forceFlush, ownsProvider } = tracing;
   // Only register our own flush hook when we built our own private
   // provider. In shared mode, a globally-registered provider elsewhere in
   // the process (e.g. TraceRoot.initialize()) already owns flush -- via its
