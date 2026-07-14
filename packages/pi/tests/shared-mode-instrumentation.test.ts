@@ -214,3 +214,120 @@ test('private mode registers exactly one beforeExit flush hook (it owns the prov
     for (const l of added) process.removeListener('beforeExit', l);
   }
 });
+
+// Extends the shared FakeAgentSession with a steer() entry point (which the
+// base fixture omits) so steer()-as-first-interaction can be exercised in
+// shared mode, matching the real SDK's standalone steer() method. Fresh per
+// call, like makeFakeSessionClass itself, so prototype patches never stack.
+function makeSteerableSessionClass() {
+  const Base = makeFakeSessionClass();
+  return class SteerableAgentSession extends Base {
+    async steer(_text: string, _images?: unknown[]): Promise<void> {}
+  };
+}
+
+// The private-mode equivalents (session-dispose.test.ts's "dispose() mid-run
+// ... force-closes ..." and steer-followup-instrumentation.test.ts's
+// "calling steer() as the FIRST interaction ...") only ever validate the
+// private-mode tracer. Shared mode re-resolves its tracer per span through the
+// global provider (see provider.ts's createReresolvingSharedTracer), a
+// materially different code path, so the same dispose-sweep and
+// steer-first-subscribe behaviors are re-asserted here end-to-end through a
+// real, pre-registered global provider.
+
+test('dispose() mid-run in shared mode force-closes the open AGENT/LLM/TOOL spans through the shared provider, identically to private mode', () => {
+  const exporter = new InMemorySpanExporter();
+  const provider = new NodeTracerProvider();
+  provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+  provider.register();
+  try {
+    const Session = makeFakeSessionClass();
+    const sdk = { AgentSession: Session };
+    instrumentPiCodingAgent(sdk, { apiKey: 'test-key' }); // no _spanExporter -> shared mode
+    const session = new Session();
+
+    // Open a run and leave it mid-flight (root + LLM + tool all open), then
+    // dispose() before agent_end -- the exact private-mode scenario, now in
+    // shared mode.
+    void session.prompt('long-running task in shared mode');
+    session.emit({ type: 'agent_start' });
+    session.emit({ type: 'message_start', message: assistantMessage({ model: 'mid-run-model' }) });
+    session.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'call-1',
+      toolName: 'read_file',
+      args: { path: '/tmp/x' },
+    });
+    assert.equal(
+      exporter.getFinishedSpans().length,
+      0,
+      'no span should export before dispose() while still open',
+    );
+
+    assert.doesNotThrow(() => session.dispose());
+    assert.equal(session.disposed, true, 'the real dispose() must still run and mark the session');
+
+    const spans = exporter.getFinishedSpans();
+    const kind = (s: (typeof spans)[number]) => attrs(s)['openinference.span.kind'];
+    const rootSpan = spans.find((s) => kind(s) === 'AGENT');
+    const llmSpan = spans.find((s) => attrs(s)['gen_ai.request.model'] === 'mid-run-model');
+    const toolSpan = spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'call-1');
+
+    assert.equal(
+      spans.length,
+      3,
+      'the open AGENT/LLM/TOOL spans must all be force-closed and exported through the shared provider',
+    );
+    assert.ok(rootSpan, 'the AGENT root span must export through the shared provider');
+    assert.ok(llmSpan, 'the LLM span must export through the shared provider');
+    assert.ok(toolSpan, 'the TOOL span must export through the shared provider');
+    assert.equal(
+      attrs(rootSpan!)['traceroot.pi.force_closed'],
+      true,
+      'the root span must be marked force_closed in shared mode, exactly as in private mode',
+    );
+    assert.equal(attrs(llmSpan!)['traceroot.pi.force_closed'], true);
+    assert.equal(attrs(toolSpan!)['traceroot.pi.force_closed'], true);
+  } finally {
+    trace.disable();
+  }
+});
+
+test('calling steer() as the FIRST interaction in shared mode still attaches tracing through the shared provider', async () => {
+  const exporter = new InMemorySpanExporter();
+  const provider = new NodeTracerProvider();
+  provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+  provider.register();
+  try {
+    const Session = makeSteerableSessionClass();
+    const sdk = { AgentSession: Session };
+    instrumentPiCodingAgent(sdk, { apiKey: 'test-key' }); // no _spanExporter -> shared mode
+    const session = new Session();
+
+    // No prompt() anywhere -- steer() is the only entry point this host uses,
+    // and it must attach the span listener itself even in shared mode.
+    await session.steer('do X instead');
+    session.emit({ type: 'agent_start' });
+    session.emit({
+      type: 'agent_end',
+      messages: [assistantMessage({ content: [{ type: 'text', text: 'steered reply' }] })],
+      willRetry: false,
+    });
+
+    const spans = exporter.getFinishedSpans();
+    const rootSpan = spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+    assert.ok(
+      rootSpan,
+      'steer() as the first interaction must attach the listener and export its AGENT span through ' +
+        'the shared provider, not rely on prompt() having been called first',
+    );
+    assert.equal(attrs(rootSpan!)['session.id'], 'sess-1');
+    assert.equal(
+      attrs(rootSpan!)['output.value'],
+      'steered reply',
+      'the shared-mode run driven by a steer()-first session must still capture its output',
+    );
+  } finally {
+    trace.disable();
+  }
+});
