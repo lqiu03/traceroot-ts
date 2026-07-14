@@ -83,7 +83,7 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
     assert.ok(warnings.some((w) => w.includes('@traceroot-ai/pi is not installed')));
   });
 
-  it('calls instrumentPiCodingAgent with a single argument', () => {
+  it('passes the bare module ref as arg 0 and a plumbed config object as arg 1', () => {
     const result = runScript(`
       const Module = require('node:module');
       const orig = Module._load;
@@ -103,15 +103,106 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
       console.log(JSON.stringify({
         length: global.__callArgs.length,
         sameRef: global.__callArgs[0] === fakeMod,
+        configIsObject: typeof global.__callArgs[1] === 'object' && global.__callArgs[1] !== null,
       }));
     `);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const parsed = JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as {
       length: number;
       sameRef: boolean;
+      configIsObject: boolean;
     };
-    assert.equal(parsed.length, 1);
+    // The bare module is forwarded by reference as the first argument, and a
+    // config object is ALWAYS threaded as the second argument (empty of
+    // apiKey/baseUrl here, since wireInstrumentations() was called with no
+    // initialize()-resolved defaults) so pi is never left to fall back to
+    // TRACEROOT_API_KEY alone.
+    assert.equal(parsed.length, 2);
     assert.equal(parsed.sameRef, true);
+    assert.equal(parsed.configIsObject, true);
+  });
+
+  it('threads initialize()-resolved apiKey/baseUrl through to instrumentPiCodingAgent()', () => {
+    const result = runScript(`
+      const Module = require('node:module');
+      const orig = Module._load;
+      Module._load = function(request, ...rest) {
+        if (request === '@traceroot-ai/pi') {
+          return { instrumentPiCodingAgent: (...args) => { global.__piArgs = args; } };
+        }
+        return orig.apply(this, [request, ...rest]);
+      };
+      delete process.env.TRACEROOT_API_KEY;
+      const { TraceRoot } = require('./src/traceroot.ts');
+      const fakeMod = { AgentSession: class {} };
+      TraceRoot.initialize({
+        apiKey: 'trk_real_key',
+        baseUrl: 'https://custom.example.com',
+        disableBatch: true,
+        instrumentModules: { piCodingAgent: fakeMod },
+      });
+      console.log(JSON.stringify({
+        moduleIsFirst: global.__piArgs[0] === fakeMod,
+        apiKey: global.__piArgs[1] && global.__piArgs[1].apiKey,
+        baseUrl: global.__piArgs[1] && global.__piArgs[1].baseUrl,
+      }));
+      process.exit(0);
+    `);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const parsed = JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as {
+      moduleIsFirst: boolean;
+      apiKey: string;
+      baseUrl: string;
+    };
+    // Reproduces the exact plumbing bug: initialize({ apiKey }) with
+    // TRACEROOT_API_KEY unset must reach pi as config.apiKey, not vanish.
+    assert.equal(parsed.moduleIsFirst, true);
+    assert.equal(parsed.apiKey, 'trk_real_key');
+    assert.equal(parsed.baseUrl, 'https://custom.example.com');
+  });
+
+  it('threads an explicit { module, config } wrapper (captureContent/captureToolIo) through to pi', () => {
+    const result = runScript(`
+      const Module = require('node:module');
+      const orig = Module._load;
+      Module._load = function(request, ...rest) {
+        if (request === '@traceroot-ai/pi') {
+          return { instrumentPiCodingAgent: (...args) => { global.__piArgs = args; } };
+        }
+        return orig.apply(this, [request, ...rest]);
+      };
+      delete process.env.TRACEROOT_API_KEY;
+      const { TraceRoot } = require('./src/traceroot.ts');
+      const fakeMod = { AgentSession: class {} };
+      TraceRoot.initialize({
+        apiKey: 'trk_real_key',
+        disableBatch: true,
+        instrumentModules: {
+          piCodingAgent: { module: fakeMod, config: { captureContent: false, captureToolIo: false } },
+        },
+      });
+      console.log(JSON.stringify({
+        moduleUnwrapped: global.__piArgs[0] === fakeMod,
+        captureContent: global.__piArgs[1] && global.__piArgs[1].captureContent,
+        captureToolIo: global.__piArgs[1] && global.__piArgs[1].captureToolIo,
+        apiKey: global.__piArgs[1] && global.__piArgs[1].apiKey,
+      }));
+      process.exit(0);
+    `);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const parsed = JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as {
+      moduleUnwrapped: boolean;
+      captureContent: boolean;
+      captureToolIo: boolean;
+      apiKey: string;
+    };
+    // The wrapper's inner module is unwrapped to arg 0; its PII-control flags
+    // reach pi verbatim; and initialize()'s own apiKey is still merged in as a
+    // default the wrapper didn't override.
+    assert.equal(parsed.moduleUnwrapped, true);
+    assert.equal(parsed.captureContent, false);
+    assert.equal(parsed.captureToolIo, false);
+    assert.equal(parsed.apiKey, 'trk_real_key');
   });
 
   it('warns when @traceroot-ai/pi does not export instrumentPiCodingAgent', () => {
@@ -233,7 +324,7 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
       piSameRef: boolean;
     };
     assert.equal(parsed.anthCalled, true);
-    assert.equal(parsed.piArgsLength, 1);
+    assert.equal(parsed.piArgsLength, 2);
     assert.equal(parsed.piSameRef, true);
   });
 

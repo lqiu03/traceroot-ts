@@ -159,7 +159,10 @@ export class TraceRoot {
     );
     _provider.register();
 
-    wireInstrumentations(options.instrumentModules);
+    // Thread the resolved apiKey/baseUrl so a lazily-wired pi pipeline gets
+    // them even when the host configured TraceRoot programmatically and never
+    // set TRACEROOT_API_KEY (see wirePiCodingAgentInstrumentation()).
+    wireInstrumentations(options.instrumentModules, { apiKey, baseUrl });
 
     _isInitialized = true;
     process.once('beforeExit', () => {

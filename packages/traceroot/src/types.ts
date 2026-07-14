@@ -1,6 +1,23 @@
 // src/types.ts
+import type { PiInstrumentationConfig } from '@traceroot-ai/pi';
 
 export type SpanType = 'span' | 'agent' | 'tool' | 'llm';
+
+/**
+ * The object form of `instrumentModules.piCodingAgent`: the
+ * `@earendil-works/pi-coding-agent` module ref bundled with an explicit
+ * {@link PiInstrumentationConfig}. Use this instead of the bare module ref
+ * when you need to override capture behavior (e.g. `captureContent: false`
+ * for PII control) or point pi at a different apiKey/baseUrl than the one
+ * `initialize()` was given. Any field left unset falls back to
+ * `initialize()`'s own resolved `apiKey`/`baseUrl`.
+ */
+export interface PiCodingAgentInstrumentation {
+  /** `import * as pi from '@earendil-works/pi-coding-agent'`. */
+  module: unknown;
+  /** Explicit pi instrumentation config; merged over initialize()'s defaults. */
+  config?: PiInstrumentationConfig;
+}
 
 export interface ObserveOptions {
   /** Span name. Defaults to fn.name, then 'anonymous'. */
@@ -64,15 +81,23 @@ export interface InitializeOptions {
      */
     openaiAgents?: unknown;
     /**
-     * @earendil-works/pi-coding-agent module ref. Pass
-     * `import * as pi from '@earendil-works/pi-coding-agent'`.
+     * @earendil-works/pi-coding-agent instrumentation. Accepts either:
+     *  - the bare module ref: `import * as pi from '@earendil-works/pi-coding-agent'`; or
+     *  - a {@link PiCodingAgentInstrumentation} wrapper: `{ module: pi, config: {...} }`,
+     *    to override capture behavior (captureContent/captureToolIo) or the
+     *    apiKey/baseUrl for the pi pipeline specifically.
+     *
+     * Either way, initialize()'s own resolved `apiKey`/`baseUrl` are threaded
+     * through to the pi package as defaults, so a host that configured
+     * TraceRoot programmatically (never via TRACEROOT_API_KEY) still gets pi
+     * traced — see wirePiCodingAgentInstrumentation() in instrumentation.ts.
      *
      * Requires the optional `@traceroot-ai/pi` package to be installed
      * separately (lazy-loaded; a missing install warns and no-ops rather
      * than crashing initialize()). Delegates to that package's own
      * instrumentPiCodingAgent(), which auto-discovers this already-registered
-     * provider — no tracer is passed explicitly, matching how
-     * claude-agent-sdk itself resolves its tracer.
+     * provider so spans land in the same shared pipeline as the rest of
+     * TraceRoot's traces.
      */
     piCodingAgent?: unknown;
   };
