@@ -1,85 +1,178 @@
 /**
- * Regression guard for a P2 code-review finding on
- * packages/pi/src/instrumentation.ts: the "force-close every open tool
- * span, then the LLM span, then (sometimes) the root span" dangling-span
- * sweep was copy-pasted independently at 4 call sites — agent_start,
- * turn_end, agent_end, and dispose() — each with its own slightly
- * inconsistent `if (span)` / `if (size > 0)` guard, even though
- * closeDanglingSpan() and an empty Map's for/.clear() are already no-ops.
+ * Behavioral guard that the "force-close every open tool span, then the LLM
+ * span, then (sometimes) the root span" dangling-span sweep actually runs at
+ * all 4 call sites in packages/pi/src/instrumentation.ts — agent_start,
+ * turn_end, agent_end, and dispose().
  *
- * This is a structural duplication finding, not a behavioral one: every
- * call site already produces identical spans today no matter how many times
- * the sweep is copy-pasted, so no black-box test driven through
- * instrumentPiCodingAgent() can fail against the current code. The actual
- * risk is a *future* edit (e.g. a new span type added to SessionSpanState)
- * landing at 3 of the 4 near-identical blocks and silently missing the
- * 4th. The only test that can catch that ahead of time is a structural one:
- * assert the sweep is implemented exactly once and reused everywhere, so
- * any future change to sweep order/span types can only be made in one
- * place — matching every other tests/*.test.ts file's black-box convention
- * would not exercise this finding at all, since it has no observable
- * runtime effect.
+ * This finding was originally guarded by a source-text regex (assert the sweep
+ * helper is defined once and called 4 times). That caught the structural
+ * duplication risk but broke on harmless refactors and never exercised the
+ * actual behavior. These tests instead drive each of the 4 call sites into a
+ * real dangling-span scenario through the public API and assert the observable
+ * force-close result, mirroring session-dispose.test.ts's own dispose()
+ * pattern — so a real future regression (a site quietly dropping its sweep) is
+ * caught by behavior, and a benign rename/extraction of the helper is not.
+ *
+ * Sweep scope differs by site, and each test pins that down:
+ *   - agent_start & dispose(): sweep the root span too (includeRoot) — a new
+ *     run starting, or the session being torn down, ends the old root.
+ *   - turn_end & agent_end: sweep only the dangling LLM/TOOL spans; the root
+ *     span is NOT force-closed (turn_end isn't session end; agent_end closes
+ *     the root normally, not as a force-close).
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { test } from 'node:test';
+import { assistantMessage, attrs, makeRig } from './test-helpers';
 
-const SOURCE = readFileSync(join(__dirname, '..', 'src', 'instrumentation.ts'), 'utf8');
+test('agent_start force-closes a previous abandoned run (root + LLM + TOOL) when a fresh run starts', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
 
-test('the tool+LLM dangling-span sweep is defined exactly once, not copy-pasted per call site', () => {
-  const sweepDefinitions = SOURCE.match(/function sweepDanglingSpans\(/g) ?? [];
+  // Run one, left mid-flight: root + LLM + TOOL all open, and agent_end never
+  // fires for it.
+  await session.prompt('run one');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'run1-llm' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'run1-tool',
+    toolName: 'read_file',
+    args: { path: '/tmp/one' },
+  });
+  assert.equal(capture.spans.length, 0, 'nothing exports while run one is still open');
+
+  // A fresh agent_start (run two, no new prompt() needed — e.g. the loop
+  // crashed and restarted) must sweep run one's dangling spans.
+  session.emit({ type: 'agent_start' });
+
   assert.equal(
-    sweepDefinitions.length,
-    1,
-    'expected exactly one sweepDanglingSpans() helper definition — found ' +
-      `${sweepDefinitions.length}. The tool-span-sweep-then-llm-span-close block must live in ` +
-      'a single shared function, not be copy-pasted at each call site.',
+    capture.spans.length,
+    3,
+    'agent_start must force-close run one’s root, LLM, and TOOL spans (found ' +
+      `${capture.spans.length})`,
+  );
+  const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
+  const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'run1-llm');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'run1-tool');
+  assert.ok(rootSpan && llmSpan && toolSpan, 'all three of run one’s spans must be exported');
+  for (const span of [rootSpan!, llmSpan!, toolSpan!]) {
+    assert.equal(
+      attrs(span)['traceroot.pi.force_closed'],
+      true,
+      `${span.name} must be marked force_closed by agent_start’s sweep`,
+    );
+  }
+});
+
+test('turn_end force-closes a dangling LLM + TOOL span but leaves the root span open', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  await session.prompt('run with a stream error mid-turn');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-llm' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'turn-tool',
+    toolName: 'read_file',
+    args: { path: '/tmp/turn' },
+  });
+
+  // turn_end with neither message_end nor tool_execution_end having arrived:
+  // the LLM and TOOL spans are dangling. The root span is NOT swept here.
+  session.emit({ type: 'turn_end' });
+
+  assert.equal(
+    capture.spans.length,
+    2,
+    'turn_end must force-close exactly the dangling LLM + TOOL spans, not the root span (found ' +
+      `${capture.spans.length})`,
+  );
+  const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'turn-llm');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'turn-tool');
+  assert.ok(llmSpan && toolSpan, 'the LLM and TOOL spans must be force-closed and exported');
+  assert.equal(attrs(llmSpan!)['traceroot.pi.force_closed'], true);
+  assert.equal(attrs(toolSpan!)['traceroot.pi.force_closed'], true);
+  assert.equal(
+    capture.spans.find((s) => s.name === 'AgentSession.prompt'),
+    undefined,
+    'the root span must still be open (turn_end is not session end), so it must not export yet',
   );
 });
 
-test('the shared sweep helper is called from all 4 dangling-span call sites (agent_start, turn_end, agent_end, dispose())', () => {
-  const sweepCalls = SOURCE.match(/sweepDanglingSpans\(state/g) ?? [];
+test('agent_end sweeps a dangling LLM + TOOL span while closing the root span normally (not force-closed)', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  await session.prompt('run that ends with tool/LLM spans still dangling');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'end-llm' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'end-tool',
+    toolName: 'read_file',
+    args: { path: '/tmp/end' },
+  });
+
+  // agent_end with the LLM + TOOL spans never having seen their own close:
+  // agent_end's defensive sweep force-closes those two, then closes the root
+  // span through its normal closeRootSpan() path.
+  session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+
+  assert.equal(capture.spans.length, 3, 'the root, LLM, and TOOL spans must all export');
+  const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
+  const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'end-llm');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'end-tool');
+  assert.ok(rootSpan && llmSpan && toolSpan);
   assert.equal(
-    sweepCalls.length,
-    4,
-    'expected sweepDanglingSpans(state, ...) to be called from all 4 sweep sites (agent_start, ' +
-      `turn_end, agent_end, dispose()) — found ${sweepCalls.length} call(s). A future change to ` +
-      'sweep order or a new span type only needs to touch the shared helper, not be hand-edited ' +
-      'at every call site.',
+    attrs(llmSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the dangling LLM span must be force-closed by agent_end’s sweep',
+  );
+  assert.equal(
+    attrs(toolSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the dangling TOOL span must be force-closed by agent_end’s sweep',
+  );
+  assert.notEqual(
+    attrs(rootSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the root span must be closed normally by agent_end, not force-closed by the sweep',
   );
 });
 
-test('the raw tool-span-sweep loop no longer appears inline at each call site', () => {
-  const inlineToolSweeps =
-    SOURCE.match(/for \(const \[toolCallId, span\] of state\.toolSpans\)/g) ?? [];
-  assert.equal(
-    inlineToolSweeps.length,
-    1,
-    'the `for (const [toolCallId, span] of state.toolSpans)` loop must appear exactly once ' +
-      `(inside the shared helper) — found ${inlineToolSweeps.length} copy-pasted occurrence(s) ` +
-      'across the 4 call sites.',
-  );
-});
+test('dispose() mid-run force-closes the root + LLM + TOOL spans', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
 
-test('each dangling-span close in the sweep goes through the resilient per-span helper, not a bare closeDanglingSpan() call', () => {
-  // Regression guard for the companion resilience finding: sweepDanglingSpans()
-  // must route every individual close through safeCloseDanglingSpan() (which
-  // catches per-span) rather than calling closeDanglingSpan() directly, so one
-  // misbehaving span can never abort the rest of the sweep.
-  const helperDefinitions = SOURCE.match(/function safeCloseDanglingSpan\(/g) ?? [];
+  await session.prompt('run torn down mid-flight');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'dispose-llm' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'dispose-tool',
+    toolName: 'read_file',
+    args: { path: '/tmp/dispose' },
+  });
+  assert.equal(capture.spans.length, 0, 'nothing exports while the run is still open');
+
+  // dispose() before agent_end sweeps everything still open, root included.
+  session.dispose();
+
   assert.equal(
-    helperDefinitions.length,
-    1,
-    'expected exactly one safeCloseDanglingSpan() helper definition — found ' +
-      `${helperDefinitions.length}.`,
+    capture.spans.length,
+    3,
+    'dispose() must force-close the root, LLM, and TOOL spans (found ' + `${capture.spans.length})`,
   );
-  const bareCloseInSweep =
-    SOURCE.match(/state\.toolSpans\.clear\(\);\s*closeDanglingSpan\(/g) ?? [];
-  assert.equal(
-    bareCloseInSweep.length,
-    0,
-    'sweepDanglingSpans() must not call closeDanglingSpan() directly on the LLM/root spans — ' +
-      'route through safeCloseDanglingSpan() so a throw on one span cannot abort the sweep.',
-  );
+  const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
+  const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'dispose-llm');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'dispose-tool');
+  assert.ok(rootSpan && llmSpan && toolSpan);
+  for (const span of [rootSpan!, llmSpan!, toolSpan!]) {
+    assert.equal(
+      attrs(span)['traceroot.pi.force_closed'],
+      true,
+      `${span.name} must be marked force_closed by dispose()’s sweep`,
+    );
+  }
 });
