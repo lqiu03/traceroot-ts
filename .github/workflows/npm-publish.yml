@@ -38,6 +38,23 @@ jobs:
           fi
           echo "✅ Version $PKG_VERSION matches tag $TAG"
 
+      # traceroot references @traceroot-ai/pi via `workspace:^`, which pnpm
+      # rewrites to a concrete `^<version>` at publish time. That version must
+      # already exist on npm, or a consumer who opts into the pi integration
+      # gets an unresolvable peer. Fail fast here (before build/test/publish) if
+      # the pi version this release would reference has not been published yet —
+      # publish the matching pi-* release first, then re-run this one.
+      - name: Verify pinned @traceroot-ai/pi version is published to npm
+        run: |
+          PI_VERSION=$(node -p "require('./packages/pi/package.json').version")
+          if ! npm view "@traceroot-ai/pi@${PI_VERSION}" version > /dev/null 2>&1; then
+            echo "❌ @traceroot-ai/pi@${PI_VERSION} is not published to npm yet."
+            echo "   traceroot's published peer dependency would reference a version that does not"
+            echo "   exist. Publish the pi-v${PI_VERSION} release first, then re-run this workflow."
+            exit 1
+          fi
+          echo "✅ @traceroot-ai/pi@${PI_VERSION} is published — traceroot's peer reference will resolve"
+
       - name: Lint
         run: pnpm lint
 
