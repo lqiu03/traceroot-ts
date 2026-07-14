@@ -136,6 +136,46 @@ interface SessionSpanState {
   closedBy: 'sweep' | 'normal' | undefined;
 }
 
+// Rate-limit for the dangling-span close-failure warning below. A Span
+// implementation whose force-close throws on EVERY attempt (a broken exporter/
+// processor, or a Span whose setAttribute always throws) would otherwise emit
+// one console.warn for every dangling span, on every sweep, indefinitely —
+// flooding the host's logs and burying the very first, genuinely-useful
+// warning. After MAX_DANGLING_SPAN_WARNINGS failures inside a rolling
+// DANGLING_SPAN_WARNING_WINDOW_MS window, one "further warnings suppressed"
+// notice is emitted and the rest go quiet until the window rolls over — so an
+// isolated, genuine failure is still surfaced, while a pathological one can no
+// longer drown out the logs. Deliberately a small per-process counter, not a
+// redesign: this is a defensive nicety on an already best-effort cleanup path.
+const MAX_DANGLING_SPAN_WARNINGS = 10;
+const DANGLING_SPAN_WARNING_WINDOW_MS = 60 * 1000;
+let danglingSpanWarningCount = 0;
+let danglingSpanWarningWindowStart = 0;
+
+function warnDanglingSpanCloseFailure(label: string, err: unknown): void {
+  const now = Date.now();
+  if (now - danglingSpanWarningWindowStart > DANGLING_SPAN_WARNING_WINDOW_MS) {
+    // First failure ever, or the previous burst's window has fully elapsed —
+    // open a fresh window so a later, unrelated failure is never permanently
+    // muted by an earlier burst that already hit the cap.
+    danglingSpanWarningCount = 0;
+    danglingSpanWarningWindowStart = now;
+  }
+  danglingSpanWarningCount += 1;
+  if (danglingSpanWarningCount <= MAX_DANGLING_SPAN_WARNINGS) {
+    console.warn(
+      `[traceroot-pi] failed to force-close a dangling ${label} span during sweep (it may leak):`,
+      err,
+    );
+  } else if (danglingSpanWarningCount === MAX_DANGLING_SPAN_WARNINGS + 1) {
+    console.warn(
+      `[traceroot-pi] more than ${MAX_DANGLING_SPAN_WARNINGS} dangling-span close failures in ` +
+        `${DANGLING_SPAN_WARNING_WINDOW_MS / 1000}s — further such warnings suppressed until the ` +
+        'failures stop.',
+    );
+  }
+}
+
 // closeDanglingSpan() (spans.ts) calls setAttr() before endSpanSafe() —
 // setAttr()'s underlying span.setAttribute() is NOT wrapped in try/catch the
 // way endSpanSafe() explicitly is ("Never let a misbehaving OTel exporter/
@@ -148,15 +188,14 @@ interface SessionSpanState {
 // remaining 3 tool spans, the LLM span, and (when includeRoot) the root span
 // never closed — and a span with no .end() call is never exported at all,
 // not merely "left open". `label` is logged so a real failure is traceable to
-// the specific span kind (and, for tool spans, call id) that misbehaved.
+// the specific span kind (and, for tool spans, call id) that misbehaved; the
+// warning itself is rate-limited (see warnDanglingSpanCloseFailure) so a
+// systematically-failing span can't turn this into unbounded log spam.
 function safeCloseDanglingSpan(span: Span | undefined, label: string): void {
   try {
     closeDanglingSpan(span);
   } catch (err) {
-    console.warn(
-      `[traceroot-pi] failed to force-close a dangling ${label} span during sweep (it may leak):`,
-      err,
-    );
+    warnDanglingSpanCloseFailure(label, err);
   }
 }
 
