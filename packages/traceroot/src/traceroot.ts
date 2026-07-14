@@ -176,6 +176,14 @@ export class TraceRoot {
     _isInitialized = false;
     _provider = undefined;
     _resetObserveState();
+    // Without these three calls, OTel's global registration stays pinned to the
+    // now-shut-down provider: a subsequent initialize()'s register() is silently
+    // rejected (global registration is first-write-wins), so every tracer -- new
+    // and old -- resolves to the dead provider and its spans are never exported
+    // for the rest of the process. Mirrors _resetForTesting()'s cleanup below.
+    trace.disable();
+    context.disable();
+    propagation.disable();
   }
 }
 
