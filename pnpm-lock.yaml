@@ -159,9 +159,6 @@ importers:
       '@opentelemetry/semantic-conventions':
         specifier: ^1.40.0
         version: 1.40.0
-      '@traceroot-ai/pi':
-        specifier: workspace:^
-        version: link:../pi
     devDependencies:
       '@eslint/js':
         specifier: ^9.0.0
@@ -172,6 +169,9 @@ importers:
       '@openai/agents':
         specifier: '>=0.0.1'
         version: 0.8.5(@cfworker/json-schema@4.1.1)(ws@8.20.0)(zod@4.3.6)
+      '@traceroot-ai/pi':
+        specifier: workspace:^
+        version: link:../pi
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.37
