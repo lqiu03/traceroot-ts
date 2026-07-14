@@ -159,6 +159,9 @@ importers:
       '@opentelemetry/semantic-conventions':
         specifier: ^1.40.0
         version: 1.40.0
+      '@traceroot-ai/pi':
+        specifier: workspace:^
+        version: link:../pi
     devDependencies:
       '@eslint/js':
         specifier: ^9.0.0

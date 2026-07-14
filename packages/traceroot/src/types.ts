@@ -63,6 +63,18 @@ export interface InitializeOptions {
      * after `initialize()`.
      */
     openaiAgents?: unknown;
+    /**
+     * @earendil-works/pi-coding-agent module ref. Pass
+     * `import * as pi from '@earendil-works/pi-coding-agent'`.
+     *
+     * Requires the optional `@traceroot-ai/pi` package to be installed
+     * separately (lazy-loaded; a missing install warns and no-ops rather
+     * than crashing initialize()). Delegates to that package's own
+     * instrumentPiCodingAgent(), which auto-discovers this already-registered
+     * provider — no tracer is passed explicitly, matching how
+     * claude-agent-sdk itself resolves its tracer.
+     */
+    piCodingAgent?: unknown;
   };
   /** Use SimpleSpanProcessor instead of BatchSpanProcessor. Useful for scripts/tests. */
   disableBatch?: boolean;
