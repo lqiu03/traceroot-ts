@@ -440,8 +440,19 @@ test('agent_start force-closes an orphaned tool span left over from a stray even
   );
   const orphanClosedBeforeGapMs =
     hrTimeToMilliseconds(preGapTimestamp) - hrTimeToMilliseconds(orphanSpan!.endTime);
+  // preGapTimestamp and orphanSpan.endTime are two independent hrTime() reads
+  // taken microseconds apart (endTime is stamped inside the sweep during run
+  // 2's agent_start; preGapTimestamp right after that emit returns). Under
+  // full-suite parallel load their sub-millisecond rounding/jitter can make the
+  // later-read value round marginally below the earlier one, so a zero-tolerance
+  // `>= 0` compare flakes (observed once: "closed 0.051ms after the gap
+  // started"). Allow a small tolerance far below the 30ms gap this
+  // discriminates against, so the assertion still fails hard for the real bug
+  // (orphan swept only at run 2's agent_end, ~30ms+ later) while never flaking
+  // on clock-read jitter.
+  const CLOCK_JITTER_TOLERANCE_MS = 5;
   assert.ok(
-    orphanClosedBeforeGapMs >= 0,
+    orphanClosedBeforeGapMs >= -CLOCK_JITTER_TOLERANCE_MS,
     'the orphaned tool span must be force-closed at run 2s agent_start (before the 30ms gap), ' +
       `not left dangling open through the entirety of run 2 (closed ${-orphanClosedBeforeGapMs}ms ` +
       'after the gap started, which only happens if it waited for run 2s agent_end instead)',
