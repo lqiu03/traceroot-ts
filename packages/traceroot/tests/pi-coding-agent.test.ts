@@ -69,7 +69,73 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
       const Module = require('node:module');
       const orig = Module._load;
       Module._load = function(request, ...rest) {
-        if (request === '@traceroot-ai/pi') throw new Error('Cannot find module');
+        if (request === '@traceroot-ai/pi') {
+          // A genuinely-absent module: Node's CJS loader throws an Error whose
+          // code is MODULE_NOT_FOUND, which is how "not installed" is told apart
+          // from "installed but broken" (see the broken-install test below).
+          const err = new Error("Cannot find module '@traceroot-ai/pi'");
+          err.code = 'MODULE_NOT_FOUND';
+          throw err;
+        }
+        return orig.apply(this, [request, ...rest]);
+      };
+      const warnings = [];
+      console.warn = (...args) => { warnings.push(args.join(' ')); };
+      const { wireInstrumentations } = require('./src/instrumentation.ts');
+      wireInstrumentations({ piCodingAgent: { AgentSession: class {} } });
+      console.log(JSON.stringify(warnings));
+    `);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const warnings = JSON.parse(result.stdout.trim().split('\n').pop() ?? '[]') as string[];
+    assert.ok(warnings.some((w) => w.includes('@traceroot-ai/pi is not installed')));
+  });
+
+  it('surfaces the real error (not "not installed") when @traceroot-ai/pi is present but fails to load', () => {
+    const result = runScript(`
+      const Module = require('node:module');
+      const orig = Module._load;
+      Module._load = function(request, ...rest) {
+        if (request === '@traceroot-ai/pi') {
+          // A package that IS installed but throws on load (bad build, syntax
+          // error, or a failing top-level side effect) — NOT a MODULE_NOT_FOUND.
+          throw new Error('boom: pi package is broken');
+        }
+        return orig.apply(this, [request, ...rest]);
+      };
+      const warnings = [];
+      console.warn = (...args) => { warnings.push(args.join(' ')); };
+      const { wireInstrumentations } = require('./src/instrumentation.ts');
+      wireInstrumentations({ piCodingAgent: { AgentSession: class {} } });
+      console.log(JSON.stringify(warnings));
+    `);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const warnings = JSON.parse(result.stdout.trim().split('\n').pop() ?? '[]') as string[];
+    // A broken-but-present install must NOT be mislabeled "not installed"...
+    assert.ok(
+      !warnings.some((w) => w.includes('is not installed')),
+      'a broken install should not be reported as "not installed"',
+    );
+    // ...and the real diagnostic must be surfaced, not silently discarded.
+    assert.ok(
+      warnings.some((w) => w.includes('failed to load')),
+      'expected a "failed to load" diagnostic for a broken install',
+    );
+    assert.ok(
+      warnings.some((w) => w.includes('boom: pi package is broken')),
+      'expected the original load error to be surfaced',
+    );
+  });
+
+  it('still reports "not installed" for a genuine MODULE_NOT_FOUND', () => {
+    const result = runScript(`
+      const Module = require('node:module');
+      const orig = Module._load;
+      Module._load = function(request, ...rest) {
+        if (request === '@traceroot-ai/pi') {
+          const err = new Error("Cannot find module '@traceroot-ai/pi'");
+          err.code = 'MODULE_NOT_FOUND';
+          throw err;
+        }
         return orig.apply(this, [request, ...rest]);
       };
       const warnings = [];
@@ -257,12 +323,12 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
       wireInstrumentations({ piCodingAgent: { AgentSession: class {} } });
       console.log(JSON.stringify(warnings));
     `);
-    // With current code, accessing a property on the null returned from require()
-    // throws a TypeError inside the try block, which is caught by the same
-    // catch that handles a missing-module require() failure. The resulting
-    // message is the "not installed" one, which is slightly imprecise for this
-    // case (the module DID resolve, it's just malformed) but still harmless:
-    // no crash, and the operator gets a clear, actionable warning either way.
+    // Accessing a property on the null returned from require() throws a
+    // TypeError inside the try block. That TypeError carries no
+    // code === 'MODULE_NOT_FOUND', so it is correctly classified as an
+    // "installed but broken" load failure (the module DID resolve, it's just
+    // malformed) rather than "not installed" — and the real error is surfaced.
+    // Either way: no crash, and the operator gets a clear, actionable warning.
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const warnings = JSON.parse(result.stdout.trim().split('\n').pop() ?? '[]') as string[];
     assert.ok(warnings.length > 0);
@@ -358,7 +424,11 @@ describe('wireInstrumentations() piCodingAgent lazy loading', () => {
       const Module = require('node:module');
       const orig = Module._load;
       Module._load = function(request, ...rest) {
-        if (request === '@traceroot-ai/pi') throw new Error('Cannot find module');
+        if (request === '@traceroot-ai/pi') {
+          const err = new Error("Cannot find module '@traceroot-ai/pi'");
+          err.code = 'MODULE_NOT_FOUND';
+          throw err;
+        }
         return orig.apply(this, [request, ...rest]);
       };
       const warnings = [];

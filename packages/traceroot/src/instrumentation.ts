@@ -93,11 +93,26 @@ function wirePiCodingAgentInstrumentation(
     if (typeof pkg.instrumentPiCodingAgent === 'function') {
       instrumentPiCodingAgent = pkg.instrumentPiCodingAgent as typeof instrumentPiCodingAgent;
     }
-  } catch {
-    console.warn(
-      '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi is not ' +
-        'installed. Install it: npm install @traceroot-ai/pi',
-    );
+  } catch (err) {
+    // Distinguish a genuinely-absent optional peer package (require() throws
+    // with code MODULE_NOT_FOUND) from one that IS installed but fails to load
+    // (a syntax error, a throwing top-level side effect, a broken transitive
+    // dependency). The former is the expected, benign "you didn't install the
+    // optional peer" case; the latter is a real defect whose diagnostic must
+    // NOT be discarded behind a misleading "not installed" message.
+    if ((err as { code?: unknown } | null)?.code === 'MODULE_NOT_FOUND') {
+      console.warn(
+        '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi is not ' +
+          'installed. Install it: npm install @traceroot-ai/pi',
+      );
+    } else {
+      console.warn(
+        '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi failed to ' +
+          'load — it appears installed but broken (bad build, syntax error, or a failing ' +
+          'dependency). The original error follows:',
+        err,
+      );
+    }
     return;
   }
   if (!instrumentPiCodingAgent) {
