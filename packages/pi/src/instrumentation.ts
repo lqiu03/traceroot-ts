@@ -220,20 +220,28 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   }
   Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
 
-  const { tracer, forceFlush } = createTracing(resolved);
-  // The BatchSpanProcessor holds spans for up to a couple seconds before
-  // exporting — without this, a short-lived script (the common case for a
-  // one-shot Pi prompt) would exit before anything is ever sent, matching
-  // packages/traceroot/src/traceroot.ts's own process.once('beforeExit', ...)
-  // auto-flush convention. Deliberately forceFlush(), not shutdown(): this
-  // handler only fires once (the first time the event loop drains), but a
-  // long-lived host process can keep running new Pi sessions afterward —
-  // shutdown() would permanently disable all further export from that point
-  // on, while forceFlush() only flushes what's pending and leaves the
-  // pipeline usable for every subsequent session in the same process.
-  process.once('beforeExit', () => {
-    void forceFlush();
-  });
+  const { tracer, forceFlush, ownsProvider } = createTracing(resolved);
+  // Only register our own flush hook when we built our own private
+  // provider. In shared mode, a globally-registered provider elsewhere in
+  // the process (e.g. TraceRoot.initialize()) already owns flush -- via its
+  // own 'beforeExit' hook -- so registering a second one here would be
+  // redundant at best, and calling forceFlush() on a provider we don't own
+  // is not this package's responsibility to manage.
+  if (ownsProvider) {
+    // The BatchSpanProcessor holds spans for up to a couple seconds before
+    // exporting — without this, a short-lived script (the common case for a
+    // one-shot Pi prompt) would exit before anything is ever sent, matching
+    // packages/traceroot/src/traceroot.ts's own process.once('beforeExit', ...)
+    // auto-flush convention. Deliberately forceFlush(), not shutdown(): this
+    // handler only fires once (the first time the event loop drains), but a
+    // long-lived host process can keep running new Pi sessions afterward —
+    // shutdown() would permanently disable all further export from that point
+    // on, while forceFlush() only flushes what's pending and leaves the
+    // pipeline usable for every subsequent session in the same process.
+    process.once('beforeExit', () => {
+      void forceFlush();
+    });
+  }
 
   // Per-session FIFO queue, not a single slot: a second prompt() call can
   // fire before the first run's agent_start event has arrived (overlapping
