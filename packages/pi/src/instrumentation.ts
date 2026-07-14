@@ -104,6 +104,17 @@ interface SessionSpanState {
   // observable via any AgentEvent field) only get the weaker empty-queue
   // fallback.
   reserveInputForRetry: boolean;
+  // How this run's root span was closed, so agent_end can tell "I closed it
+  // normally" from "a reentrant dispose() force-closed it out from under me".
+  // 'sweep' is set by dispose()'s force-close of a still-open root; 'normal'
+  // by agent_end's own closeRootSpan(). A host listener that calls
+  // session.dispose() synchronously while handling agent_end (dispose()
+  // reassigns the listener array rather than mutating it, so pi's own
+  // agent_end handler still runs afterward in the same dispatch) would
+  // otherwise leave pi silently skipping the real close purely because
+  // state.rootSpan is already undefined — producing an incomplete trace with
+  // no signal. This flag lets agent_end detect and surface that instead.
+  closedBy: 'sweep' | 'normal' | undefined;
 }
 
 // closeDanglingSpan() (spans.ts) calls setAttr() before endSpanSafe() —
@@ -505,6 +516,12 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // all) — then delegate to the real dispose().
         const state = sessionSpanState.get(this);
         if (state) {
+          // Whether this dispose() force-closed a still-open root span. If a
+          // host's own agent_end listener triggered this dispose() reentrantly,
+          // pi's own agent_end handler will still run afterward and must be
+          // able to tell its root span was force-closed out from under it (see
+          // agent_end's handler and SessionSpanState.closedBy).
+          const hadOpenRootSpan = state.rootSpan !== undefined;
           try {
             sweepDanglingSpans(state, { includeRoot: true });
           } catch (err) {
@@ -516,6 +533,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
               err,
             );
           } finally {
+            if (hadOpenRootSpan) state.closedBy = 'sweep';
             state.rootSpan = undefined;
             state.rootCtx = undefined;
             state.llmSpan = undefined;
@@ -591,6 +609,7 @@ function attachSpanListener(
     toolSpans: new Map(),
     pendingInputText: undefined,
     reserveInputForRetry: false,
+    closedBy: undefined,
   };
   // Reachable from AgentSession.prototype.dispose (patched once, in
   // instrumentPiCodingAgent() above) so a mid-run dispose() can force-close
@@ -699,6 +718,10 @@ function handleEvent(
       state.rootCtx = trace.setSpan(parentCtx, state.rootSpan);
       state.llmSpan = undefined;
       state.llmCtx = undefined;
+      // Fresh run: clear any close-disposition left over from a prior run on
+      // this reused state object, so agent_end's reentrant-dispose detection
+      // can never fire on a stale flag.
+      state.closedBy = undefined;
       break;
     }
     case 'message_start': {
@@ -784,8 +807,24 @@ function handleEvent(
       // force-close, since agent_end is the real, expected end of a run.
       sweepDanglingSpans(state);
       state.llmCtx = undefined;
-      if (state.rootSpan)
+      if (state.rootSpan) {
         closeRootSpan(state.rootSpan, event.messages, event.willRetry, config.captureContent);
+        state.closedBy = 'normal';
+      } else if (state.closedBy === 'sweep') {
+        // This run's root span is gone not because agent_end already ran, but
+        // because a reentrant dispose() (a host's own earlier-registered
+        // agent_end listener disposing the session synchronously) force-closed
+        // it before this handler got to run for the same event. The real close
+        // — which stamps output.value and the retry flag — can no longer
+        // happen (the root span is already ended), so the exported AGENT span
+        // is a FORCE_CLOSED one missing this run's final output. Surface that
+        // rather than silently dropping the completion data.
+        console.warn(
+          "[traceroot-pi] agent_end arrived after this run's root span was already force-closed " +
+            'by a reentrant dispose(); the exported AGENT span is missing its final output/retry ' +
+            'attributes.',
+        );
+      }
       state.rootSpan = undefined;
       state.rootCtx = undefined;
       // Deliberately do NOT clear state.pendingInputText here, and do NOT
