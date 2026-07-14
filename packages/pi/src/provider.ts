@@ -16,8 +16,10 @@
  * directly.
  */
 import { isSpanContextValid, trace } from '@opentelemetry/api';
+import { ExportResultCode } from '@opentelemetry/core';
+import type { ExportResult } from '@opentelemetry/core';
 import { BatchSpanProcessor, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import type { SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan, SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import type { Context, Span, SpanOptions, Tracer } from '@opentelemetry/api';
@@ -104,19 +106,70 @@ function createReresolvingSharedTracer(): Tracer {
   };
 }
 
+// A persistently-failing export would otherwise print this warning once per
+// batch forever; cap it so a broken backend can't flood the host's console.
+const MAX_EXPORT_FAILURE_WARNINGS = 10;
+
+// Wraps a SpanExporter so a FAILED export result surfaces as a console.warn
+// notice — matching this package's other operational warnings — instead of
+// vanishing into OTel's diag channel. That channel is a no-op by default in
+// standalone pi (it never calls diag.setLogger) and is suppressed even under
+// TraceRoot's default logLevel of 'error', so a failing export (bad base URL /
+// API key, unreachable backend) silently drops every span with no signal at
+// all. A persistent export failure is also the leading indicator of
+// queue-overflow drops: once exports stop draining the BatchSpanProcessor's
+// bounded queue, it begins discarding spans too. Warnings are bounded (see
+// MAX_EXPORT_FAILURE_WARNINGS) so a systematically-failing endpoint can't spam
+// the console; the wrapper is otherwise a transparent pass-through that never
+// alters spans, results, or the export/shutdown contract.
+function wrapExporterWithFailureNotice(exporter: SpanExporter): SpanExporter {
+  let warningsEmitted = 0;
+  return {
+    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
+      exporter.export(spans, (result) => {
+        if (
+          result.code === ExportResultCode.FAILED &&
+          warningsEmitted < MAX_EXPORT_FAILURE_WARNINGS
+        ) {
+          warningsEmitted += 1;
+          const suffix =
+            warningsEmitted === MAX_EXPORT_FAILURE_WARNINGS
+              ? ' Further export-failure warnings will be suppressed.'
+              : '';
+          console.warn(
+            `[traceroot-pi] failed to export ${spans.length} span(s) to the tracing backend — ` +
+              'they were dropped. Check the TraceRoot base URL / API key and that the backend is ' +
+              'reachable.' +
+              suffix,
+            result.error ?? '',
+          );
+        }
+        resultCallback(result);
+      });
+    },
+    shutdown(): Promise<void> {
+      return exporter.shutdown();
+    },
+    forceFlush(): Promise<void> {
+      return exporter.forceFlush ? exporter.forceFlush() : Promise.resolve();
+    },
+  };
+}
+
 function buildPrivateTracing(config: ResolvedPiInstrumentationConfig): TracingHandle {
-  const exporter: SpanExporter =
+  const exporter: SpanExporter = wrapExporterWithFailureNotice(
     config.spanExporterOverride ??
-    new OTLPTraceExporter({
-      url: `${config.baseUrl}/api/v1/public/traces`,
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        'x-traceroot-sdk-name': SDK_NAME,
-        'x-traceroot-sdk-version': SDK_VERSION,
-      },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      compression: 'gzip' as any,
-    });
+      new OTLPTraceExporter({
+        url: `${config.baseUrl}/api/v1/public/traces`,
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          'x-traceroot-sdk-name': SDK_NAME,
+          'x-traceroot-sdk-version': SDK_VERSION,
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        compression: 'gzip' as any,
+      }),
+  );
 
   // A test-injected exporter never touches the network, so a SimpleSpanProcessor
   // (synchronous, no batching) keeps span assertions deterministic in tests.
