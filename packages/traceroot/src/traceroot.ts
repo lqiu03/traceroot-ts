@@ -31,6 +31,23 @@ const DEFAULT_BASE_URL = 'https://app.traceroot.ai';
 let _isInitialized = false;
 let _provider: NodeTracerProvider | undefined;
 
+/**
+ * True when `provider` is the concrete TracerProvider the OTel global proxy
+ * currently delegates to — i.e. TraceRoot's registration is still the active
+ * one, so it's safe to reset the process-wide global singletons on teardown.
+ * Duck-typed on getDelegate() (matching pi's own provider detection) rather
+ * than instanceof ProxyTracerProvider, which is defeated by a dual-copy
+ * @opentelemetry/api install.
+ */
+function isActiveGlobalDelegate(provider: NodeTracerProvider): boolean {
+  const globalProvider = trace.getTracerProvider() as { getDelegate?: () => unknown };
+  const delegate =
+    typeof globalProvider.getDelegate === 'function'
+      ? globalProvider.getDelegate()
+      : globalProvider;
+  return delegate === provider;
+}
+
 export class TraceRoot {
   private constructor() {}
 
@@ -175,18 +192,32 @@ export class TraceRoot {
   }
 
   static async shutdown(): Promise<void> {
-    await _provider?.shutdown();
+    const provider = _provider;
+    await provider?.shutdown();
     _isInitialized = false;
     _provider = undefined;
     _resetObserveState();
-    // Without these three calls, OTel's global registration stays pinned to the
-    // now-shut-down provider: a subsequent initialize()'s register() is silently
-    // rejected (global registration is first-write-wins), so every tracer -- new
-    // and old -- resolves to the dead provider and its spans are never exported
-    // for the rest of the process. Mirrors _resetForTesting()'s cleanup below.
-    trace.disable();
-    context.disable();
-    propagation.disable();
+    // trace/context/propagation .disable() reset OTel's PROCESS-WIDE global
+    // singletons, not just this provider. Without them, OTel's global
+    // registration stays pinned to the now-shut-down provider: a subsequent
+    // initialize()'s register() is silently rejected (registration is
+    // first-write-wins), so every tracer -- new and old -- resolves to the
+    // dead provider and its spans are never exported for the rest of the
+    // process. But reset them ONLY when this provider is still the active
+    // global delegate -- i.e. TraceRoot won the first-write-wins registration
+    // for all three at initialize() time. If a different OTel consumer owns
+    // the global (it registered before us, so our own register() was
+    // rejected), disabling here would silently wipe ITS context/propagation
+    // too; leave the globals alone and tear down only our own provider. (A
+    // host that shares TraceRoot's OWN provider without registering its own
+    // cannot be distinguished here and will still see the reset -- an accepted
+    // limitation.) Mirrors _resetForTesting()'s cleanup below, which is
+    // unconditional because tests always want a clean slate.
+    if (provider && isActiveGlobalDelegate(provider)) {
+      trace.disable();
+      context.disable();
+      propagation.disable();
+    }
   }
 }
 
