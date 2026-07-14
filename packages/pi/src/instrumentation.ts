@@ -234,30 +234,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     return sdk;
   }
 
-  Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
-
   const { tracer, forceFlush, ownsProvider } = tracing;
-  // Only register our own flush hook when we built our own private
-  // provider. In shared mode, a globally-registered provider elsewhere in
-  // the process (e.g. TraceRoot.initialize()) already owns flush -- via its
-  // own 'beforeExit' hook -- so registering a second one here would be
-  // redundant at best, and calling forceFlush() on a provider we don't own
-  // is not this package's responsibility to manage.
-  if (ownsProvider) {
-    // The BatchSpanProcessor holds spans for up to a couple seconds before
-    // exporting — without this, a short-lived script (the common case for a
-    // one-shot Pi prompt) would exit before anything is ever sent, matching
-    // packages/traceroot/src/traceroot.ts's own process.once('beforeExit', ...)
-    // auto-flush convention. Deliberately forceFlush(), not shutdown(): this
-    // handler only fires once (the first time the event loop drains), but a
-    // long-lived host process can keep running new Pi sessions afterward —
-    // shutdown() would permanently disable all further export from that point
-    // on, while forceFlush() only flushes what's pending and leaves the
-    // pipeline usable for every subsequent session in the same process.
-    process.once('beforeExit', () => {
-      void forceFlush();
-    });
-  }
 
   // Per-session FIFO queue, not a single slot: a second prompt() call can
   // fire before the first run's agent_start event has arrived (overlapping
@@ -273,249 +250,328 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   // to reach whichever session's SessionSpanState (if any) it was called on.
   const sessionSpanState = new WeakMap<AgentSessionInstance, SessionSpanState>();
 
-  const originalPrompt = proto.prompt;
-  proto.prompt = function (this: AgentSessionInstance, text, options) {
-    // Before choosing a proactive (enumerate-the-early-returns) vs reactive
-    // (clean up by reference identity once THIS call's own promise settles)
-    // strategy here, the real question is: for the path that DOES reach
-    // _runAgentPrompt, is agent_start GUARANTEED to have already fired (and
-    // already shifted some queue entry) by the time prompt()'s own returned
-    // promise settles? Reading the real, installed
-    // @earendil-works/pi-coding-agent@0.80.6 source alone says yes:
-    // `_runAgentPrompt` is the last expression `prompt()` awaits, and inside
-    // it `await this.agent.prompt(messages)` cannot itself resolve before the
-    // underlying Agent has already emitted agent_start. That would make a
-    // purely reactive `result.finally(removeIfStillQueued)` sound in theory.
-    //
-    // It is NOT sound in practice for this specific FIFO design, though —
-    // verified empirically, not assumed: the very feature this queue exists
-    // for (two prompt() calls queuing before EITHER's agent_start has fired
-    // yet — see the "two overlapping prompt() calls" and retry/compaction
-    // continuation tests) means a still-genuinely-in-flight call's own
-    // promise can legitimately still be unsettled/settled independently of
-    // when ITS OWN agent_start arrives, from the perspective of anything
-    // that can only observe promise settlement, not the SDK's real internal
-    // ordering. Trying `result.finally(removeIfStillQueued)` here and running
-    // the full suite reproduced exactly that: 13 unrelated, previously-green
-    // tests started failing because their queued entries were reactively
-    // stripped before their own later-emitted agent_start could claim them.
-    // A reactive strategy is therefore the wrong choice here, regardless of
-    // what the raw promise-ordering guarantee alone would suggest — this
-    // package's own FIFO semantics don't preserve the "settle implies
-    // consumed" property a reactive check needs. Proactive enumeration,
-    // extended below to cover as many early-return paths as can be
-    // determined SYNCHRONOUSLY and precisely from public SDK surface, is the
-    // safe option.
-    //
-    // (a) isStreaming + streamingBehavior — verified against the real,
-    // installed SDK (dist/core/agent-session.js:812-824): when
-    // `this.isStreaming` is true and `options.streamingBehavior` is set,
-    // prompt() calls `_queueSteer`/`_queueFollowUp` (which inject the message
-    // into the CURRENTLY-running Agent loop, not a new run) and returns —
-    // `_runAgentPrompt` is never reached. `this.isStreaming` is read
-    // synchronously here, before `originalPrompt` is invoked — matching the
-    // real prompt()'s own synchronous read of the same getter.
-    const isStreamedQueueOnly = this.isStreaming === true && !!options?.streamingBehavior;
-    // (b) a leading "/" matched by a registered extension command — verified
-    // against the real, installed SDK (dist/core/agent-session.js:783-790):
-    // `if (expandPromptTemplates && text.startsWith("/")) { const handled =
-    // await this._tryExecuteExtensionCommand(text); if (handled) {
-    // preflightResult?.(true); return; } }`. This is decidable precisely
-    // (not just heuristically) from outside: _tryExecuteExtensionCommand's
-    // own command lookup (agent-session.js:903-908) parses the command name
-    // identically to below, and its try/catch (913-925) means ANY registered
-    // command — even one whose handler throws — still returns true. So a
-    // truthy `getCommand()` lookup via the SDK's own public
-    // `session.extensionRunner` getter (agent-session.js:2629-2630, and
-    // ExtensionRunner.getCommand is itself public — dist/core/extensions/
-    // runner.d.ts:128) deterministically means this call will never reach
-    // agent_start, with no false-positive case.
-    const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-    let matchesExtensionCommand = false;
-    if (expandPromptTemplates && typeof text === 'string' && text.startsWith('/')) {
-      const spaceIndex = text.indexOf(' ');
-      const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-      matchesExtensionCommand = !!this.extensionRunner?.getCommand?.(commandName);
+  // Install everything below (the flush hook plus every prototype method
+  // patch), then — and only then — stamp the wrap-once guard. Stamping the
+  // guard up front and then throwing partway through setup (a bad option, an
+  // exotic duck-type check that throws) would leave the prototype permanently
+  // marked "wrapped" while the SDK was never actually patched: every later
+  // instrumentPiCodingAgent() call would then be silently rejected with
+  // "config ignored" instead of the real failure ever surfacing. Each patch
+  // records an undo on `rollback`, so a mid-setup failure restores the
+  // prototype to exactly how it was found (no half-patched state that a later
+  // retry would double-wrap) before rethrowing a clear install error.
+  const rollback: Array<() => void> = [];
+  try {
+    // Only register our own flush hook when we built our own private
+    // provider. In shared mode, a globally-registered provider elsewhere in
+    // the process (e.g. TraceRoot.initialize()) already owns flush -- via its
+    // own 'beforeExit' hook -- so registering a second one here would be
+    // redundant at best, and calling forceFlush() on a provider we don't own
+    // is not this package's responsibility to manage.
+    if (ownsProvider) {
+      // The BatchSpanProcessor holds spans for up to a couple seconds before
+      // exporting — without this, a short-lived script (the common case for a
+      // one-shot Pi prompt) would exit before anything is ever sent, matching
+      // packages/traceroot/src/traceroot.ts's own process.once('beforeExit', ...)
+      // auto-flush convention. Deliberately forceFlush(), not shutdown(): this
+      // handler only fires once (the first time the event loop drains), but a
+      // long-lived host process can keep running new Pi sessions afterward —
+      // shutdown() would permanently disable all further export from that point
+      // on, while forceFlush() only flushes what's pending and leaves the
+      // pipeline usable for every subsequent session in the same process.
+      const flushOnExit = (): void => {
+        void forceFlush();
+      };
+      process.once('beforeExit', flushOnExit);
+      rollback.push(() => process.removeListener('beforeExit', flushOnExit));
     }
-    // (c) any extension with an 'input' hook returning action: 'handled' —
-    // verified against the real, installed SDK (dist/core/agent-session.js:
-    // 794-799): `if (this._extensionRunner.hasHandlers("input")) { const
-    // inputResult = await this._extensionRunner.emitInput(...); if
-    // (inputResult.action === "handled") { preflightResult?.(true); return; }
-    // }`. Unlike (b), this is NOT precisely decidable from outside: whether a
-    // specific text ends up "handled" depends on the registered hook
-    // function's own logic, which this patch layer cannot inspect or
-    // pre-invoke (calling it ourselves to find out would double-invoke a
-    // potentially side-effecting extension). The best available signal is
-    // the SDK's own public `session.hasExtensionHandlers('input')`
-    // (agent-session.js:618, mirrors the exact same `hasHandlers("input")`
-    // check prompt() itself makes) — true whenever ANY 'input' hook is
-    // registered, whether or not it will actually intercept THIS text. This
-    // is a deliberate, documented best-effort heuristic, not a precise
-    // detection: a session with an 'input' hook that only intercepts SOME
-    // messages will, for every message it does NOT intercept, still take
-    // this proactive branch and skip queuing — losing that real run's
-    // input.value (falling back to agent_start's empty-queue heuristic)
-    // rather than corrupting a LATER call's attribution. That tradeoff —
-    // graceful degradation (a missing/stale input.value) over the
-    // cross-call corruption this queue exists to prevent — is preferred
-    // given the SDK exposes no way to precisely predict a specific hook's
-    // decision without invoking it. This (and the enumeration of early-return
-    // paths above) must be kept in sync with the SDK and may miss future
-    // early-return paths a later SDK version adds.
-    const mayBeHandledByInputHook = this.hasExtensionHandlers?.('input') === true;
-    const willQueueWithoutAgentStart =
-      isStreamedQueueOnly || matchesExtensionCommand || mayBeHandledByInputHook;
-    let entry: QueuedPrompt | undefined;
-    if (typeof text === 'string' && !willQueueWithoutAgentStart) {
-      entry = { text };
-      const queue = pendingInput.get(this);
-      if (queue) queue.push(entry);
-      else pendingInput.set(this, [entry]);
-    }
-    ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
-    // A prompt() call that never reaches agent_start (a synchronous throw,
-    // or its returned Promise rejecting — e.g. a validation failure inside
-    // Pi's own prompt() before the agent loop starts) must not leave its
-    // text sitting in the FIFO queue: agent_start will never fire to shift()
-    // it back out, so it would otherwise silently become the wrong (stale)
-    // input text attached to whatever LATER, genuinely-successful prompt()
-    // call on this same session shifts it out instead — and every prompt()
-    // after that would be off by one, permanently. Remove by reference
-    // identity, not by string match, so a different still-pending queue
-    // entry that happens to hold an equal string is never removed instead.
-    // Deliberately still gated on rejection only (.catch(), not .finally())
-    // — see this function's opening comment for why widening this to also
-    // run on resolve is unsafe for this FIFO's own overlapping-call
-    // semantics, even though it would be sound against the raw SDK guarantee
-    // alone.
-    const removeIfStillQueued = (): void => {
-      if (!entry) return;
-      const queue = pendingInput.get(this);
-      if (!queue) return;
-      const idx = queue.indexOf(entry);
-      if (idx !== -1) queue.splice(idx, 1);
-    };
-    let result: Promise<void>;
-    try {
-      result = originalPrompt.call(this, text, options);
-    } catch (err) {
-      removeIfStillQueued();
-      throw err;
-    }
-    result.catch(removeIfStillQueued);
-    return result;
-  };
 
-  // steer() and followUp() are standalone public SDK entry points, not
-  // aliases or wrappers of prompt() — a host embedding an interactive Pi
-  // session (this package's own README target) can call
-  // session.steer(text)/session.followUp(text) directly, without ever
-  // calling session.prompt() on that session first. Before this patch,
-  // attachSpanListener() was only ever reached from inside proto.prompt
-  // above, so a session whose first (or only) interaction was steer()/
-  // followUp() never got session.subscribe() called on it at all — every
-  // subsequent AgentEvent (agent_start through agent_end) silently produced
-  // zero spans for the entire lifetime of that session.
-  //
-  // Deliberately NOT enqueuing steer()/followUp() text into pendingInput the
-  // way prompt() does above: verified against the real, installed
-  // @earendil-works/pi-agent-core@0.80.6 (dist/agent.js:169-176),
-  // Agent.steer()/Agent.followUp() only ever push onto an internal queue —
-  // neither one ever itself triggers a fresh run (only Agent.prompt()/
-  // continue() do, via runPromptMessages()). Because pendingInput is a FIFO
-  // consumed exclusively by agent_start, queuing steer()/followUp() text
-  // into it would misattribute that text to whatever LATER, unrelated run's
-  // agent_start happens to fire next — a worse bug than the "no tracing at
-  // all" defect this patch fixes. Only patched when present as a function —
-  // defensive, like the dispose() patch below, so a minimal/partial double
-  // never disables prompt instrumentation over a missing, unrelated method.
-  if (typeof proto.steer === 'function') {
-    const originalSteer = proto.steer;
-    proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
-      return originalSteer.call(this, text, images);
-    };
-  }
-  if (typeof proto.followUp === 'function') {
-    const originalFollowUp = proto.followUp;
-    proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
-      return originalFollowUp.call(this, text, images);
-    };
-  }
-
-  // Patched once here (guarded by the same WRAPPED check/stamp above that
-  // guards proto.prompt — this whole function body only runs once per sdk),
-  // never per-session: dispose() is a single shared prototype method, same
-  // as prompt(). Only patched when dispose actually exists as a function —
-  // AgentSessionInstance's type declares it as required, but this stays
-  // defensive so a minimal/partial double never disables prompt
-  // instrumentation over a missing, unrelated method.
-  if (typeof proto.dispose === 'function') {
-    const originalDispose = proto.dispose;
-    proto.dispose = function (this: AgentSessionInstance): void {
-      // See this file's module header and types.ts's AgentSessionInstance
-      // doc comment: the real dispose() only reassigns the SDK's private
-      // _eventListeners array, which stops our subscribe() callback from
-      // ever firing again but does nothing to whatever spans that callback
-      // had already opened. If a host calls dispose() mid-run — after
-      // agent_start but before agent_end — this session's SessionSpanState
-      // (if it was ever subscribed) can still have an open rootSpan/llmSpan/
-      // toolSpans that will now never see their normal close event. Force-
-      // close them here first, exactly like agent_start's own dangling-span
-      // sweep, so they still export instead of leaking silently (a span
-      // that never has .end() called on it is never recorded/exported at
-      // all) — then delegate to the real dispose().
-      const state = sessionSpanState.get(this);
-      if (state) {
-        try {
-          sweepDanglingSpans(state, { includeRoot: true });
-        } catch (err) {
-          // A misbehaving span/exporter must never make dispose() throw —
-          // the host still needs its session torn down even if this
-          // best-effort tracing cleanup failed.
-          console.warn(
-            '[traceroot-pi] failed to force-close in-flight spans during dispose() (a span may leak):',
-            err,
-          );
-        } finally {
-          state.rootSpan = undefined;
-          state.rootCtx = undefined;
-          state.llmSpan = undefined;
-          state.llmCtx = undefined;
-          // Avoids re-sweeping already-ended spans if dispose() is ever
-          // called twice on the same session; a second call now takes the
-          // same no-op path as a session with no SessionSpanState at all.
-          sessionSpanState.delete(this);
-          pendingInput.delete(this);
-          // subscribedSessions gates every "already subscribed?" check at
-          // the top of proto.prompt/steer/followUp above. Nothing in the
-          // real SDK stops a host from calling prompt()/steer()/followUp()
-          // again on a session instance after dispose() — dispose() only
-          // clears the SDK's own _eventListeners array (see this file's
-          // module header), it does not make the session instance itself
-          // unusable. Without this delete, a session reused after dispose()
-          // would find subscribedSessions.has(this) still true forever and
-          // silently never call attachSpanListener()/session.subscribe()
-          // again — every span from every run after the first dispose()
-          // would be dropped with no warning. Deleting here, alongside
-          // sessionSpanState, means the next prompt()/steer()/followUp()
-          // call on this same instance re-subscribes and resumes tracing
-          // normally, exactly like a brand-new session would.
-          subscribedSessions.delete(this);
-        }
+    const originalPrompt = proto.prompt;
+    proto.prompt = function (this: AgentSessionInstance, text, options) {
+      // Before choosing a proactive (enumerate-the-early-returns) vs reactive
+      // (clean up by reference identity once THIS call's own promise settles)
+      // strategy here, the real question is: for the path that DOES reach
+      // _runAgentPrompt, is agent_start GUARANTEED to have already fired (and
+      // already shifted some queue entry) by the time prompt()'s own returned
+      // promise settles? Reading the real, installed
+      // @earendil-works/pi-coding-agent@0.80.6 source alone says yes:
+      // `_runAgentPrompt` is the last expression `prompt()` awaits, and inside
+      // it `await this.agent.prompt(messages)` cannot itself resolve before the
+      // underlying Agent has already emitted agent_start. That would make a
+      // purely reactive `result.finally(removeIfStillQueued)` sound in theory.
+      //
+      // It is NOT sound in practice for this specific FIFO design, though —
+      // verified empirically, not assumed: the very feature this queue exists
+      // for (two prompt() calls queuing before EITHER's agent_start has fired
+      // yet — see the "two overlapping prompt() calls" and retry/compaction
+      // continuation tests) means a still-genuinely-in-flight call's own
+      // promise can legitimately still be unsettled/settled independently of
+      // when ITS OWN agent_start arrives, from the perspective of anything
+      // that can only observe promise settlement, not the SDK's real internal
+      // ordering. Trying `result.finally(removeIfStillQueued)` here and running
+      // the full suite reproduced exactly that: 13 unrelated, previously-green
+      // tests started failing because their queued entries were reactively
+      // stripped before their own later-emitted agent_start could claim them.
+      // A reactive strategy is therefore the wrong choice here, regardless of
+      // what the raw promise-ordering guarantee alone would suggest — this
+      // package's own FIFO semantics don't preserve the "settle implies
+      // consumed" property a reactive check needs. Proactive enumeration,
+      // extended below to cover as many early-return paths as can be
+      // determined SYNCHRONOUSLY and precisely from public SDK surface, is the
+      // safe option.
+      //
+      // (a) isStreaming + streamingBehavior — verified against the real,
+      // installed SDK (dist/core/agent-session.js:812-824): when
+      // `this.isStreaming` is true and `options.streamingBehavior` is set,
+      // prompt() calls `_queueSteer`/`_queueFollowUp` (which inject the message
+      // into the CURRENTLY-running Agent loop, not a new run) and returns —
+      // `_runAgentPrompt` is never reached. `this.isStreaming` is read
+      // synchronously here, before `originalPrompt` is invoked — matching the
+      // real prompt()'s own synchronous read of the same getter.
+      const isStreamedQueueOnly = this.isStreaming === true && !!options?.streamingBehavior;
+      // (b) a leading "/" matched by a registered extension command — verified
+      // against the real, installed SDK (dist/core/agent-session.js:783-790):
+      // `if (expandPromptTemplates && text.startsWith("/")) { const handled =
+      // await this._tryExecuteExtensionCommand(text); if (handled) {
+      // preflightResult?.(true); return; } }`. This is decidable precisely
+      // (not just heuristically) from outside: _tryExecuteExtensionCommand's
+      // own command lookup (agent-session.js:903-908) parses the command name
+      // identically to below, and its try/catch (913-925) means ANY registered
+      // command — even one whose handler throws — still returns true. So a
+      // truthy `getCommand()` lookup via the SDK's own public
+      // `session.extensionRunner` getter (agent-session.js:2629-2630, and
+      // ExtensionRunner.getCommand is itself public — dist/core/extensions/
+      // runner.d.ts:128) deterministically means this call will never reach
+      // agent_start, with no false-positive case.
+      const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+      let matchesExtensionCommand = false;
+      if (expandPromptTemplates && typeof text === 'string' && text.startsWith('/')) {
+        const spaceIndex = text.indexOf(' ');
+        const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+        matchesExtensionCommand = !!this.extensionRunner?.getCommand?.(commandName);
       }
-      // A session that was never subscribed (no prompt() call ever reached
-      // the attachSpanListener() branch above) or that has no open spans
-      // left (the common, already-idle case — e.g. dispose() called after
-      // agent_end already closed everything normally) hits nothing but the
-      // `if (state)` check above, so this call into the real dispose() is
-      // unchanged: same arguments, same return value, same timing as before
-      // this patch existed.
-      return originalDispose.call(this);
+      // (c) any extension with an 'input' hook returning action: 'handled' —
+      // verified against the real, installed SDK (dist/core/agent-session.js:
+      // 794-799): `if (this._extensionRunner.hasHandlers("input")) { const
+      // inputResult = await this._extensionRunner.emitInput(...); if
+      // (inputResult.action === "handled") { preflightResult?.(true); return; }
+      // }`. Unlike (b), this is NOT precisely decidable from outside: whether a
+      // specific text ends up "handled" depends on the registered hook
+      // function's own logic, which this patch layer cannot inspect or
+      // pre-invoke (calling it ourselves to find out would double-invoke a
+      // potentially side-effecting extension). The best available signal is
+      // the SDK's own public `session.hasExtensionHandlers('input')`
+      // (agent-session.js:618, mirrors the exact same `hasHandlers("input")`
+      // check prompt() itself makes) — true whenever ANY 'input' hook is
+      // registered, whether or not it will actually intercept THIS text. This
+      // is a deliberate, documented best-effort heuristic, not a precise
+      // detection: a session with an 'input' hook that only intercepts SOME
+      // messages will, for every message it does NOT intercept, still take
+      // this proactive branch and skip queuing — losing that real run's
+      // input.value (falling back to agent_start's empty-queue heuristic)
+      // rather than corrupting a LATER call's attribution. That tradeoff —
+      // graceful degradation (a missing/stale input.value) over the
+      // cross-call corruption this queue exists to prevent — is preferred
+      // given the SDK exposes no way to precisely predict a specific hook's
+      // decision without invoking it. This (and the enumeration of early-return
+      // paths above) must be kept in sync with the SDK and may miss future
+      // early-return paths a later SDK version adds.
+      const mayBeHandledByInputHook = this.hasExtensionHandlers?.('input') === true;
+      const willQueueWithoutAgentStart =
+        isStreamedQueueOnly || matchesExtensionCommand || mayBeHandledByInputHook;
+      let entry: QueuedPrompt | undefined;
+      if (typeof text === 'string' && !willQueueWithoutAgentStart) {
+        entry = { text };
+        const queue = pendingInput.get(this);
+        if (queue) queue.push(entry);
+        else pendingInput.set(this, [entry]);
+      }
+      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
+      // A prompt() call that never reaches agent_start (a synchronous throw,
+      // or its returned Promise rejecting — e.g. a validation failure inside
+      // Pi's own prompt() before the agent loop starts) must not leave its
+      // text sitting in the FIFO queue: agent_start will never fire to shift()
+      // it back out, so it would otherwise silently become the wrong (stale)
+      // input text attached to whatever LATER, genuinely-successful prompt()
+      // call on this same session shifts it out instead — and every prompt()
+      // after that would be off by one, permanently. Remove by reference
+      // identity, not by string match, so a different still-pending queue
+      // entry that happens to hold an equal string is never removed instead.
+      // Deliberately still gated on rejection only (.catch(), not .finally())
+      // — see this function's opening comment for why widening this to also
+      // run on resolve is unsafe for this FIFO's own overlapping-call
+      // semantics, even though it would be sound against the raw SDK guarantee
+      // alone.
+      const removeIfStillQueued = (): void => {
+        if (!entry) return;
+        const queue = pendingInput.get(this);
+        if (!queue) return;
+        const idx = queue.indexOf(entry);
+        if (idx !== -1) queue.splice(idx, 1);
+      };
+      let result: Promise<void>;
+      try {
+        result = originalPrompt.call(this, text, options);
+      } catch (err) {
+        removeIfStillQueued();
+        throw err;
+      }
+      result.catch(removeIfStillQueued);
+      return result;
     };
+    rollback.push(() => {
+      proto.prompt = originalPrompt;
+    });
+
+    // steer() and followUp() are standalone public SDK entry points, not
+    // aliases or wrappers of prompt() — a host embedding an interactive Pi
+    // session (this package's own README target) can call
+    // session.steer(text)/session.followUp(text) directly, without ever
+    // calling session.prompt() on that session first. Before this patch,
+    // attachSpanListener() was only ever reached from inside proto.prompt
+    // above, so a session whose first (or only) interaction was steer()/
+    // followUp() never got session.subscribe() called on it at all — every
+    // subsequent AgentEvent (agent_start through agent_end) silently produced
+    // zero spans for the entire lifetime of that session.
+    //
+    // Deliberately NOT enqueuing steer()/followUp() text into pendingInput the
+    // way prompt() does above: verified against the real, installed
+    // @earendil-works/pi-agent-core@0.80.6 (dist/agent.js:169-176),
+    // Agent.steer()/Agent.followUp() only ever push onto an internal queue —
+    // neither one ever itself triggers a fresh run (only Agent.prompt()/
+    // continue() do, via runPromptMessages()). Because pendingInput is a FIFO
+    // consumed exclusively by agent_start, queuing steer()/followUp() text
+    // into it would misattribute that text to whatever LATER, unrelated run's
+    // agent_start happens to fire next — a worse bug than the "no tracing at
+    // all" defect this patch fixes. Only patched when present as a function —
+    // defensive, like the dispose() patch below, so a minimal/partial double
+    // never disables prompt instrumentation over a missing, unrelated method.
+    if (typeof proto.steer === 'function') {
+      const originalSteer = proto.steer;
+      proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
+        ensureSubscribed(
+          this,
+          tracer,
+          resolved,
+          pendingInput,
+          subscribedSessions,
+          sessionSpanState,
+        );
+        return originalSteer.call(this, text, images);
+      };
+      rollback.push(() => {
+        proto.steer = originalSteer;
+      });
+    }
+    if (typeof proto.followUp === 'function') {
+      const originalFollowUp = proto.followUp;
+      proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
+        ensureSubscribed(
+          this,
+          tracer,
+          resolved,
+          pendingInput,
+          subscribedSessions,
+          sessionSpanState,
+        );
+        return originalFollowUp.call(this, text, images);
+      };
+      rollback.push(() => {
+        proto.followUp = originalFollowUp;
+      });
+    }
+
+    // Patched once here (guarded by the same WRAPPED check/stamp above that
+    // guards proto.prompt — this whole function body only runs once per sdk),
+    // never per-session: dispose() is a single shared prototype method, same
+    // as prompt(). Only patched when dispose actually exists as a function —
+    // AgentSessionInstance's type declares it as required, but this stays
+    // defensive so a minimal/partial double never disables prompt
+    // instrumentation over a missing, unrelated method.
+    if (typeof proto.dispose === 'function') {
+      const originalDispose = proto.dispose;
+      proto.dispose = function (this: AgentSessionInstance): void {
+        // See this file's module header and types.ts's AgentSessionInstance
+        // doc comment: the real dispose() only reassigns the SDK's private
+        // _eventListeners array, which stops our subscribe() callback from
+        // ever firing again but does nothing to whatever spans that callback
+        // had already opened. If a host calls dispose() mid-run — after
+        // agent_start but before agent_end — this session's SessionSpanState
+        // (if it was ever subscribed) can still have an open rootSpan/llmSpan/
+        // toolSpans that will now never see their normal close event. Force-
+        // close them here first, exactly like agent_start's own dangling-span
+        // sweep, so they still export instead of leaking silently (a span
+        // that never has .end() called on it is never recorded/exported at
+        // all) — then delegate to the real dispose().
+        const state = sessionSpanState.get(this);
+        if (state) {
+          try {
+            sweepDanglingSpans(state, { includeRoot: true });
+          } catch (err) {
+            // A misbehaving span/exporter must never make dispose() throw —
+            // the host still needs its session torn down even if this
+            // best-effort tracing cleanup failed.
+            console.warn(
+              '[traceroot-pi] failed to force-close in-flight spans during dispose() (a span may leak):',
+              err,
+            );
+          } finally {
+            state.rootSpan = undefined;
+            state.rootCtx = undefined;
+            state.llmSpan = undefined;
+            state.llmCtx = undefined;
+            // Avoids re-sweeping already-ended spans if dispose() is ever
+            // called twice on the same session; a second call now takes the
+            // same no-op path as a session with no SessionSpanState at all.
+            sessionSpanState.delete(this);
+            pendingInput.delete(this);
+            // subscribedSessions gates every "already subscribed?" check at
+            // the top of proto.prompt/steer/followUp above. Nothing in the
+            // real SDK stops a host from calling prompt()/steer()/followUp()
+            // again on a session instance after dispose() — dispose() only
+            // clears the SDK's own _eventListeners array (see this file's
+            // module header), it does not make the session instance itself
+            // unusable. Without this delete, a session reused after dispose()
+            // would find subscribedSessions.has(this) still true forever and
+            // silently never call attachSpanListener()/session.subscribe()
+            // again — every span from every run after the first dispose()
+            // would be dropped with no warning. Deleting here, alongside
+            // sessionSpanState, means the next prompt()/steer()/followUp()
+            // call on this same instance re-subscribes and resumes tracing
+            // normally, exactly like a brand-new session would.
+            subscribedSessions.delete(this);
+          }
+        }
+        // A session that was never subscribed (no prompt() call ever reached
+        // the attachSpanListener() branch above) or that has no open spans
+        // left (the common, already-idle case — e.g. dispose() called after
+        // agent_end already closed everything normally) hits nothing but the
+        // `if (state)` check above, so this call into the real dispose() is
+        // unchanged: same arguments, same return value, same timing as before
+        // this patch existed.
+        return originalDispose.call(this);
+      };
+      rollback.push(() => {
+        proto.dispose = originalDispose;
+      });
+    }
+  } catch (err) {
+    // Undo every patch already applied, newest first, so a failed install
+    // leaves AgentSession.prototype exactly as it was found rather than
+    // half-patched — then surface the failure loudly instead of leaving a
+    // silently-broken, "wrapped"-but-uninstrumented prototype behind.
+    for (let i = rollback.length - 1; i >= 0; i--) {
+      rollback[i]();
+    }
+    throw new Error('[traceroot-pi] failed to install instrumentation on AgentSession.prototype', {
+      cause: err,
+    });
   }
+
+  // Setup fully succeeded: only now is it correct to mark this prototype
+  // wrapped, so the wrap-once guard can never be left true over a prototype
+  // that was never actually patched.
+  Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
 
   return sdk;
 }
