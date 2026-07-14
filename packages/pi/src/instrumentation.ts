@@ -84,7 +84,26 @@ const WRAPPED = Symbol.for('traceroot.pi_coding_agent.wrapped');
 // still-pending queue entry that happens to hold an equal string value.
 interface QueuedPrompt {
   text: string;
+  // Wall-clock time (Date.now()) this entry was enqueued, consulted at dequeue
+  // to detect an entry that was stranded in the FIFO because its prompt() call
+  // never reached agent_start (and, resolving rather than rejecting, never hit
+  // removeIfStillQueued either). See MAX_QUEUED_PROMPT_AGE_MS.
+  enqueuedAt: number;
 }
+
+// A queued prompt() entry older than this when a later agent_start arrives to
+// claim it is treated as abandoned and skipped rather than trusted. A prompt()
+// call whose run never starts — it hangs with no resolve/reject and no
+// agent_start, so neither removeIfStillQueued (rejection-only) nor a normal
+// agent_start dequeue ever removes it — would otherwise sit in the FIFO
+// forever and be shifted out by some unrelated LATER run's agent_start,
+// misattributing its text to that run and throwing every subsequent call off
+// by one, permanently. This window is deliberately generous — far longer than
+// any realistic single agent run a legitimately-queued overlapping prompt()
+// could be waiting behind — so a genuinely-queued entry is never discarded,
+// while a truly-stranded entry can only ever corrupt a call within this
+// bounded window instead of cascading indefinitely.
+const MAX_QUEUED_PROMPT_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 interface SessionSpanState {
   rootSpan: Span | undefined;
@@ -168,6 +187,33 @@ function sweepDanglingSpans(
     safeCloseDanglingSpan(state.rootSpan, 'root');
     state.rootSpan = undefined;
   }
+}
+
+// Shifts the oldest genuinely-fresh entry off a session's FIFO input queue,
+// discarding any head entries that have gone stale (their prompt() call never
+// reached agent_start — see MAX_QUEUED_PROMPT_AGE_MS). Skips past every stale
+// head entry rather than stopping at the first, so a run of stranded entries
+// can never block the fresh one queued behind them. Returns undefined when the
+// queue holds nothing but stale entries (or is empty), so agent_start falls
+// back to its usual state.pendingInputText path instead of trusting stale
+// text. Warns once per dequeue that discarded anything, matching this file's
+// other console.warn conventions, so a real host-side "prompt never started"
+// anomaly is visible rather than silently swallowed.
+function dequeueFreshQueuedPrompt(queue: QueuedPrompt[]): QueuedPrompt | undefined {
+  const now = Date.now();
+  let discarded = 0;
+  let entry = queue.shift();
+  while (entry && now - entry.enqueuedAt > MAX_QUEUED_PROMPT_AGE_MS) {
+    discarded += 1;
+    entry = queue.shift();
+  }
+  if (discarded > 0) {
+    console.warn(
+      `[traceroot-pi] discarded ${discarded} stale queued prompt(s) whose run never started ` +
+        '(older than the staleness window) instead of misattributing their text to this run.',
+    );
+  }
+  return entry;
 }
 
 // Shared by proto.prompt/proto.steer/proto.followUp below: each of those
@@ -392,7 +438,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         isStreamedQueueOnly || matchesExtensionCommand || mayBeHandledByInputHook;
       let entry: QueuedPrompt | undefined;
       if (typeof text === 'string' && !willQueueWithoutAgentStart) {
-        entry = { text };
+        entry = { text, enqueuedAt: Date.now() };
         const queue = pendingInput.get(this);
         if (queue) queue.push(entry);
         else pendingInput.set(this, [entry]);
@@ -706,7 +752,8 @@ function handleEvent(
         state.reserveInputForRetry = false;
         inputText = state.pendingInputText;
       } else {
-        const queuedEntry = pendingInput.get(session)?.shift();
+        const queue = pendingInput.get(session);
+        const queuedEntry = queue ? dequeueFreshQueuedPrompt(queue) : undefined;
         inputText = queuedEntry ? queuedEntry.text : state.pendingInputText;
       }
       state.pendingInputText = inputText;
