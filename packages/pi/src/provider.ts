@@ -15,7 +15,7 @@
  * losing register() call fails silently. The returned Tracer is used
  * directly.
  */
-import { trace } from '@opentelemetry/api';
+import { isSpanContextValid, trace } from '@opentelemetry/api';
 import { BatchSpanProcessor, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
@@ -38,37 +38,40 @@ export interface TracingHandle {
 }
 
 // Detects whether a REAL TracerProvider is already globally registered, as
-// opposed to the default no-op the OTel API returns before anyone has
-// called .register(). Deliberately duck-typed (checks for a getDelegate
-// method and inspects what it returns by constructor NAME) rather than
-// `instanceof ProxyTracerProvider` / `instanceof NoopTracerProvider` --
-// instanceof fails across a dual-copy @opentelemetry/api dependency-tree
-// duplication (two physically separate installs of the same package are
-// two different class objects in memory, even with identical source),
-// which is a real, empirically-reproduced hazard whenever a host app's
-// dependency tree ends up with a second copy of @opentelemetry/api.
-// Cross-copy detection still works via duck-typing because
-// globalThis-based storage (keyed by
-// Symbol.for(`opentelemetry.js.api.<major>`), see @opentelemetry/api's own
-// internal/global-utils.ts) is genuinely shared across copies of the same
-// major version -- only nominal instanceof checks are defeated by the
-// cross-copy class-identity mismatch, not method presence or the object
-// actually retrieved.
+// opposed to the default no-op the OTel API returns before anyone has called
+// .register(). Uses a BEHAVIORAL probe rather than a class-name string
+// compare: it asks whatever provider is globally registered for a tracer,
+// starts a throwaway probe span, and inspects the span handed back. Before any
+// real .register(), the API's default provider hands back a non-recording span
+// carrying the all-zero, structurally-invalid INVALID_SPAN_CONTEXT; any real
+// provider (NodeTracerProvider, or another SDK's) hands back a span that is
+// either recording OR carries a valid, randomly-generated SpanContext
+// (non-zero trace/span ids — true even for a real provider whose sampler is
+// not recording this particular span). Both signals are immune to
+// production-bundler class-name mangling (webpack prod mode / esbuild / Terser
+// routinely rename classes), unlike the previous
+// `getDelegate().constructor.name === 'NoopTracerProvider'` check, which those
+// tools could silently flip either direction.
+//
+// Going through the global `trace` facade (rather than duck-typing
+// getDelegate()) is also inherently robust to a dual-copy @opentelemetry/api
+// install: the global provider registration lives in globalThis-based storage
+// keyed by Symbol.for(`opentelemetry.js.api.<major>`) (see @opentelemetry/api's
+// own internal/global-utils.ts) and is shared across copies of the same major
+// version, so the probe always resolves to the genuinely-registered provider —
+// even though a nominal instanceof check would be defeated by the cross-copy
+// class-identity mismatch.
 function hasRealGlobalProvider(): boolean {
-  // Cast through `unknown` first: TracerProvider (the real return type of
-  // trace.getTracerProvider()) doesn't structurally overlap with this
-  // duck-typed shape enough for a direct assertion, even though the actual
-  // runtime object (a ProxyTracerProvider) does carry getDelegate().
-  const provider = trace.getTracerProvider() as unknown as {
-    getDelegate?: () => { constructor: { name: string } };
-  };
-  if (typeof provider.getDelegate !== 'function') {
-    // Not a Proxy-shaped provider at all -- some other, non-default
-    // TracerProvider implementation is already active. Treat as real.
-    return true;
-  }
-  const delegate = provider.getDelegate();
-  return delegate.constructor.name !== 'NoopTracerProvider';
+  const probe = trace.getTracer(SDK_NAME, SDK_VERSION).startSpan('traceroot-pi.provider-probe');
+  const isReal = probe.isRecording() || isSpanContextValid(probe.spanContext());
+  // Only end() a NON-recording probe: end() is inert on a no-op span. A
+  // RECORDING probe is deliberately left unended so it is NEVER routed through
+  // the real provider's processors/exporter — ending it would emit a
+  // meaningless 'provider-probe' span into the host's own traces. The unended
+  // span is a single GC-able object created once per instrumentPiCodingAgent()
+  // call and never exported.
+  if (!isReal) probe.end();
+  return isReal;
 }
 
 // In shared mode the tracer must NOT be captured once at wrap time and closed
