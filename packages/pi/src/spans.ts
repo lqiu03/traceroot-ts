@@ -74,31 +74,60 @@ function endSpanSafe(span: Span | undefined): void {
 // pair, which would corrupt the UTF-8 an OTLP/proto collector requires.
 const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 
+// Appended by both the mid-serialization budget (makeBudgetedReplacer) and the
+// post-hoc backstop (truncateJsonSafe) whenever tool I/O had to be cut, so a
+// truncated payload is always distinguishable from one that merely happened to
+// end this way. Single source of truth for the marker text.
+const TRUNCATION_MARKER = '…[truncated]';
+
 // sliceSurrogateSafe (./surrogate-safe) is the shared boundary-detection cut,
-// no marker appended — callers that need a "…[truncated]" suffix
-// (truncateJsonSafe) or a bare cap (capOversizedStringValue, used
+// no marker appended — callers that need the TRUNCATION_MARKER suffix
+// (truncateJsonSafe) or a bare cap (makeBudgetedReplacer, used
 // mid-serialization) each append what they need on top of it.
 function truncateJsonSafe(json: string): string {
   if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
-  return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}…[truncated]`;
+  return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}${TRUNCATION_MARKER}`;
 }
 
-// Caps any individual string value to MAX_TOOL_IO_JSON_CHARS as JSON.stringify
-// visits it via the replacer parameter — i.e. *during* the tree walk, before
-// it is embedded into the growing output string. truncateJsonSafe alone is
-// not enough: JSON.stringify(args) fully materializes the serialized payload
-// first and only then gets truncated, so a single huge field (the dominant
-// real-world case — full file content, long command stdout) is built out to
-// its full size in memory before the cap ever applies. Capping per-string
-// here means no single field can inflate the intermediate JSON.stringify
-// output past this bound, regardless of how large the source value is.
-// truncateJsonSafe remains a backstop below for the many-small-fields case,
-// where no single field is oversized but the combined JSON still is.
-function capOversizedStringValue(_key: string, value: unknown): unknown {
-  if (typeof value === 'string' && value.length > MAX_TOOL_IO_JSON_CHARS) {
-    return sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS);
-  }
-  return value;
+// Returns a JSON.stringify replacer that enforces a running output-length
+// budget as the tree is walked, capping tool I/O *during* serialization rather
+// than after the full payload has already been built. Each call gets its own
+// fresh closure — the budget is per-serialization, never shared across calls.
+//
+// Two distinct oversize shapes both have to be deflected before JSON.stringify
+// materializes them:
+//   - ONE huge field (full file content, long command stdout — the dominant
+//     real-world case): capped to at most MAX_TOOL_IO_JSON_CHARS on its own.
+//   - MANY small fields (a large grep/find result: an array of thousands of
+//     short lines, none individually oversized): the per-field cap alone never
+//     fires for any single element, so without a *running* budget the whole
+//     multi-hundred-KB payload is built out in full before truncateJsonSafe's
+//     post-hoc slice ever runs — O(N) work and memory on the exact input this
+//     is most likely to see.
+// A single running `remaining` budget covers both: each visited string is
+// first capped to the per-field bound, then charged against `remaining`; once
+// `remaining` is spent, every subsequent string is cut to '' (sliceSurrogateSafe
+// with a zero/negative bound returns ''), so neither shape can push the
+// intermediate serialized output past the budget. truncateJsonSafe remains the
+// final backstop that appends the marker and enforces the hard length bound.
+function makeBudgetedReplacer(): (key: string, value: unknown) => unknown {
+  let remaining = MAX_TOOL_IO_JSON_CHARS;
+  return function budgetedReplacer(_key: string, value: unknown): unknown {
+    if (typeof value !== 'string') return value;
+    const capped =
+      value.length > MAX_TOOL_IO_JSON_CHARS
+        ? sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS)
+        : value;
+    if (capped.length <= remaining) {
+      remaining -= capped.length;
+      return capped;
+    }
+    // Crosses the running budget: emit only what's left (surrogate-safe) and
+    // spend the rest, so every subsequent string value is likewise cut to ''.
+    const fit = sliceSurrogateSafe(capped, remaining);
+    remaining = 0;
+    return fit;
+  };
 }
 
 // JSON.stringify's real runtime return type is `string | undefined`, not the
@@ -112,7 +141,7 @@ function capOversizedStringValue(_key: string, value: unknown): unknown {
 // packages/traceroot/src/claude-agent-sdk.ts's tryStringify.
 function stringifyToolIo(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  return JSON.stringify(value, capOversizedStringValue);
+  return JSON.stringify(value, makeBudgetedReplacer());
 }
 
 function textOf(message: AgentMessage | undefined): string | undefined {

@@ -1,6 +1,6 @@
 /**
  * Lens: the shared surrogate-pair-safe slicing primitive that spans.ts's
- * truncateJsonSafe/capOversizedStringValue and span-name.ts's
+ * truncateJsonSafe/makeBudgetedReplacer and span-name.ts's
  * describeToolCallSpan both delegate to. Before this file's fix landed, the
  * boundary-detection algorithm (length check, charCodeAt high-surrogate
  * range test, backoff, slice) was copy-pasted independently into spans.ts's
