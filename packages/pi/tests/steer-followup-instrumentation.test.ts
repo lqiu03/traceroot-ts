@@ -22,71 +22,27 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/types';
+import { assistantMessage, attrs, CapturingExporter, makeFakeSessionClass } from './test-helpers';
 
-class CapturingExporter implements SpanExporter {
-  readonly spans: ReadableSpan[] = [];
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.spans.push(...spans);
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  async shutdown(): Promise<void> {}
-}
-
-// Mirrors the real SDK's shape: prompt/steer/followUp/subscribe all exist as
-// standalone public methods on AgentSession.prototype (verified against the
-// installed @earendil-works/pi-coding-agent@0.80.6 .d.ts).
-function makeFakeSessionClass() {
-  return class FakeAgentSession {
-    sessionId = 'sess-1';
-    private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
+// Extends the shared FakeAgentSession with the standalone steer()/followUp()
+// entry points the base fixture deliberately omits (see test-helpers.ts, and
+// shared-mode-instrumentation.test.ts's own makeSteerableSessionClass, which
+// adds steer() the same way for the same reason), so a host whose first
+// interaction is steer()/followUp() can be exercised here. Fresh per call,
+// like makeFakeSessionClass itself, so prototype patches never stack across
+// tests.
+function makeSteerAndFollowUpSessionClass() {
+  const Base = makeFakeSessionClass();
+  return class SteerAndFollowUpAgentSession extends Base {
     async steer(_text: string, _images?: unknown[]): Promise<void> {}
     async followUp(_text: string, _images?: unknown[]): Promise<void> {}
-    subscribe(listener: (event: AgentEvent) => void): () => void {
-      this.listeners.push(listener);
-      return () => {
-        this.listeners = this.listeners.filter((l) => l !== listener);
-      };
-    }
-    emit(event: AgentEvent): void {
-      for (const listener of this.listeners) listener(event);
-    }
   };
-}
-
-function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
-  return {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'done' }],
-    api: 'anthropic-messages',
-    provider: 'anthropic',
-    model: 'claude-sonnet-5',
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: 'stop',
-    timestamp: 0,
-    ...overrides,
-  } as AssistantMessage;
-}
-
-function attrs(span: ReadableSpan): Record<string, unknown> {
-  return span.attributes as Record<string, unknown>;
 }
 
 test('calling steer() as the FIRST interaction (no prior prompt() call) still attaches tracing', async () => {
   const capture = new CapturingExporter();
-  const Session = makeFakeSessionClass();
+  const Session = makeSteerAndFollowUpSessionClass();
   const sdk = { AgentSession: Session };
   instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
   const session = new Session();
@@ -107,7 +63,7 @@ test('calling steer() as the FIRST interaction (no prior prompt() call) still at
 
 test('calling followUp() as the FIRST interaction (no prior prompt() call) still attaches tracing', async () => {
   const capture = new CapturingExporter();
-  const Session = makeFakeSessionClass();
+  const Session = makeSteerAndFollowUpSessionClass();
   const sdk = { AgentSession: Session };
   instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
   const session = new Session();
@@ -126,7 +82,7 @@ test('calling followUp() as the FIRST interaction (no prior prompt() call) still
 
 test('a session already subscribed via prompt() does not get double-subscribed when steer()/followUp() are called later', async () => {
   const capture = new CapturingExporter();
-  const Session = makeFakeSessionClass();
+  const Session = makeSteerAndFollowUpSessionClass();
   const sdk = { AgentSession: Session };
   instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
   const session = new Session();
