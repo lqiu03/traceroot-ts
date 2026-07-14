@@ -14,7 +14,7 @@ import { trace } from '@opentelemetry/api';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import { assistantMessage, makeFakeSessionClass } from './test-helpers';
+import { assistantMessage, attrs, makeFakeSessionClass, makeRig } from './test-helpers';
 
 test('a full prompt() run in shared mode exports its span tree through the pre-registered global provider', async () => {
   const exporter = new InMemorySpanExporter();
@@ -131,26 +131,46 @@ test('captureContent: false suppresses input/output.value in shared mode exactly
   }
 });
 
-// Regression guard, not a red: instrumentPiCodingAgent() calling
-// createTracing() before the host has registered its own provider must not
-// throw, and must not retroactively rewire once a provider does show up
-// later. This behavior is unaffected by whether ownsProvider exists at all,
-// so it passes both before and after this phase's production change.
-test('DOCUMENTED CAVEAT: instrumentPiCodingAgent() called BEFORE the host registers its provider stays on its own private pipeline for the rest of the process', () => {
-  const Session = makeFakeSessionClass();
-  const sdk = { AgentSession: Session };
-  instrumentPiCodingAgent(sdk, { apiKey: 'test-key' }); // nothing registered yet -> private provider
+// Positive assertion of the non-retroactive-rebind guarantee named in this
+// phase's commit message ("a tracer already bound to a private provider
+// never retroactively rebinds if a real provider registers later") --
+// instrumentPiCodingAgent() builds and closes over a tracer exactly once,
+// inside createTracing(), so a REAL global provider that registers later in
+// the same process must never receive spans from a session instrumented
+// before that registration. Uses _spanExporter to force private mode with a
+// capturable exporter (see shared-provider-detection.test.ts's "_spanExporter
+// override always forces private-provider mode" test) so which pipeline the
+// spans land in is pinned down precisely -- private mode here could equally
+// have been chosen by plain auto-discovery (nothing registered yet), since
+// the underlying mechanism under test (the tracer is captured once and never
+// re-evaluated per event) is identical either way.
+test('DOCUMENTED CAVEAT: a session already bound to a private provider never retroactively rebinds onto a global provider registered later', async () => {
+  const { capture, Session } = makeRig(); // _spanExporter -> private provider, bound now
 
   const lateExporter = new InMemorySpanExporter();
   const lateProvider = new NodeTracerProvider();
   lateProvider.addSpanProcessor(new SimpleSpanProcessor(lateExporter));
   lateProvider.register(); // registers AFTER instrumentPiCodingAgent() already committed
   try {
-    // Spans from this sdk's sessions continue going to pi's own private
-    // pipeline, not lateProvider -- there is no assertion needed against
-    // lateExporter directly here (that pipeline never receives anything
-    // from this sdk); the point under test is that this does NOT throw
-    // and does NOT retroactively rewire, matching documented behavior.
+    const session = new Session();
+    await session.prompt('does this rebind onto the late-registered provider?');
+    session.emit({ type: 'agent_start' });
+    session.emit({
+      type: 'agent_end',
+      messages: [assistantMessage({ content: [{ type: 'text', text: 'no rebind' }] })],
+      willRetry: false,
+    });
+
+    const rootSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+    assert.ok(
+      rootSpan,
+      "the AGENT span must still land in this sdk's own private pipeline, bound at instrumentPiCodingAgent() time",
+    );
+    assert.deepEqual(
+      lateExporter.getFinishedSpans(),
+      [],
+      'a provider registered AFTER instrumentation must never receive spans from an already-private-bound session',
+    );
   } finally {
     trace.disable();
   }
