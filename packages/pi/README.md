@@ -46,6 +46,8 @@ try {
 
 Use `createAgentSession()` — Pi's own documented SDK entry point — rather than constructing `AgentSession` directly; its constructor requires assembling several internal objects (`Agent`, `SessionManager`, `SettingsManager`, `ResourceLoader`) that `createAgentSession()` builds for you. `instrumentPiCodingAgent()` patches `AgentSession.prototype`, so it instruments sessions built either way.
 
+If you also use TraceRoot's core SDK, `instrumentPiCodingAgent()` must run after `TraceRoot.initialize()` (or any other global OpenTelemetry provider registration) in the same process to attach to that shared pipeline; if it runs first, it commits to its own private export pipeline for the life of the process and will not pick up a provider registered later.
+
 ## Configuration
 
 | Option | Default | Description |
