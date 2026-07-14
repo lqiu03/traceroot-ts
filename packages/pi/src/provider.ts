@@ -20,7 +20,7 @@ import { BatchSpanProcessor, SimpleSpanProcessor } from '@opentelemetry/sdk-trac
 import type { SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
-import type { Tracer } from '@opentelemetry/api';
+import type { Context, Span, SpanOptions, Tracer } from '@opentelemetry/api';
 import { SDK_NAME } from './config';
 import type { ResolvedPiInstrumentationConfig } from './config';
 import { SDK_VERSION } from './package-version';
@@ -69,6 +69,36 @@ function hasRealGlobalProvider(): boolean {
   }
   const delegate = provider.getDelegate();
   return delegate.constructor.name !== 'NoopTracerProvider';
+}
+
+// In shared mode the tracer must NOT be captured once at wrap time and closed
+// over forever. trace.disable() (called by TraceRoot.shutdown(), among others)
+// swaps the OTel API's internal ProxyTracerProvider for a brand-new instance
+// rather than mutating the old one, so a Tracer captured before that swap
+// stays bound to the old, now-detached provider — after a
+// shutdown()/initialize() cycle every span it opens goes silently dark, with
+// no recovery path (the Symbol.for() wrap-once guard blocks re-instrumenting
+// to pick up a fresh tracer). Instead, re-resolve through the global `trace`
+// facade on each span-open, mirroring ProxyTracer's own lazy-delegate-rebind
+// pattern one level up: whatever TracerProvider is globally active at the
+// moment a span is opened is the one that span routes to. In steady state
+// (no disable() ever called) this behaves identically to a captured tracer.
+function createReresolvingSharedTracer(): Tracer {
+  const resolveTracer = (): Tracer => trace.getTracer(SDK_NAME, SDK_VERSION);
+  return {
+    startSpan(name: string, options?: SpanOptions, ctx?: Context): Span {
+      return resolveTracer().startSpan(name, options, ctx);
+    },
+    // pi itself only ever calls startSpan (see spans.ts), but implement
+    // startActiveSpan faithfully — forwarding exactly the arguments supplied,
+    // so the right overload is honored — to keep this a complete, drop-in
+    // Tracer for any future caller.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    startActiveSpan(name: string, ...rest: any[]): any {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (resolveTracer().startActiveSpan as (n: string, ...r: any[]) => any)(name, ...rest);
+    },
+  };
 }
 
 function buildPrivateTracing(config: ResolvedPiInstrumentationConfig): TracingHandle {
@@ -123,7 +153,7 @@ export function createTracing(config: ResolvedPiInstrumentationConfig): TracingH
   // pass _spanExporter via makeRig()) unaffected by this change.
   if (!config.spanExporterOverride && hasRealGlobalProvider()) {
     return {
-      tracer: trace.getTracer(SDK_NAME, SDK_VERSION),
+      tracer: createReresolvingSharedTracer(),
       forceFlush: async () => {}, // flush is the shared provider owner's responsibility
       ownsProvider: false,
     };
