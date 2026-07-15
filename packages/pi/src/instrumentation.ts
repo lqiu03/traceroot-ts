@@ -123,17 +123,16 @@ interface SessionSpanState {
   // observable via any AgentEvent field) only get the weaker empty-queue
   // fallback.
   reserveInputForRetry: boolean;
-  // How this run's root span was closed, so agent_end can tell "I closed it
-  // normally" from "a reentrant dispose() force-closed it out from under me".
-  // 'sweep' is set by dispose()'s force-close of a still-open root; 'normal'
-  // by agent_end's own closeRootSpan(). A host listener that calls
-  // session.dispose() synchronously while handling agent_end (dispose()
-  // reassigns the listener array rather than mutating it, so pi's own
-  // agent_end handler still runs afterward in the same dispatch) would
-  // otherwise leave pi silently skipping the real close purely because
-  // state.rootSpan is already undefined — producing an incomplete trace with
-  // no signal. This flag lets agent_end detect and surface that instead.
-  closedBy: 'sweep' | 'normal' | undefined;
+  // True when dispose()'s force-close swept this run's still-open root span,
+  // so agent_end can tell that apart from having already closed it normally
+  // itself. A host listener that calls session.dispose() synchronously while
+  // handling agent_end (dispose() reassigns the listener array rather than
+  // mutating it, so pi's own agent_end handler still runs afterward in the
+  // same dispatch) would otherwise leave pi silently skipping the real close
+  // purely because state.rootSpan is already undefined — producing an
+  // incomplete trace with no signal. This flag lets agent_end detect and
+  // surface that instead.
+  rootForceClosedBySweep: boolean;
 }
 
 // Rate-limit for the dangling-span close-failure warning below. A Span
@@ -631,7 +630,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
           // host's own agent_end listener triggered this dispose() reentrantly,
           // pi's own agent_end handler will still run afterward and must be
           // able to tell its root span was force-closed out from under it (see
-          // agent_end's handler and SessionSpanState.closedBy).
+          // agent_end's handler and SessionSpanState.rootForceClosedBySweep).
           const hadOpenRootSpan = state.rootSpan !== undefined;
           try {
             sweepDanglingSpans(state, { includeRoot: true });
@@ -644,7 +643,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
               err,
             );
           } finally {
-            if (hadOpenRootSpan) state.closedBy = 'sweep';
+            if (hadOpenRootSpan) state.rootForceClosedBySweep = true;
             state.rootSpan = undefined;
             state.rootCtx = undefined;
             state.llmSpan = undefined;
@@ -731,7 +730,7 @@ function attachSpanListener(
     toolSpans: new Map(),
     pendingInputText: undefined,
     reserveInputForRetry: false,
-    closedBy: undefined,
+    rootForceClosedBySweep: false,
   };
   // Reachable from AgentSession.prototype.dispose (patched once, in
   // instrumentPiCodingAgent() above) so a mid-run dispose() can force-close
@@ -844,7 +843,7 @@ function handleEvent(
       // Fresh run: clear any close-disposition left over from a prior run on
       // this reused state object, so agent_end's reentrant-dispose detection
       // can never fire on a stale flag.
-      state.closedBy = undefined;
+      state.rootForceClosedBySweep = false;
       break;
     }
     case 'message_start': {
@@ -932,8 +931,7 @@ function handleEvent(
       state.llmCtx = undefined;
       if (state.rootSpan) {
         closeRootSpan(state.rootSpan, event.messages, event.willRetry, config.captureContent);
-        state.closedBy = 'normal';
-      } else if (state.closedBy === 'sweep') {
+      } else if (state.rootForceClosedBySweep) {
         // This run's root span is gone not because agent_end already ran, but
         // because a reentrant dispose() (a host's own earlier-registered
         // agent_end listener disposing the session synchronously) force-closed

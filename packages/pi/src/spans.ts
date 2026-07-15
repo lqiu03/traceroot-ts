@@ -206,6 +206,10 @@ function textOf(message: AgentMessage | undefined): string | undefined {
   if (!message) return undefined;
   if (message.role === 'user' && typeof message.content === 'string') return message.content;
   if (message.role !== 'assistant') return undefined;
+  // A malformed/non-array content (e.g. undefined) is treated as "no text"
+  // rather than thrown: callers close a span right after this call, and a
+  // throw here would skip that close entirely, leaking the span.
+  if (!Array.isArray(message.content)) return undefined;
   const parts = message.content
     .filter((c): c is { type: 'text'; text: string } => {
       return typeof c === 'object' && c !== null && (c as { type?: unknown }).type === 'text';
@@ -236,14 +240,8 @@ export function closeRootSpan(
 ): void {
   setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
   if (captureContent) {
-    try {
-      const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
-    } catch {
-      // content may be a malformed/non-array shape — skip rather than crash
-      // before endSpanSafe() below ever gets a chance to close the span,
-      // matching the defensive pattern openToolSpan/closeToolSpan already use.
-    }
+    const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
+    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
   }
   endSpanSafe(span);
 }
@@ -264,13 +262,7 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
   if (captureContent) {
-    try {
-      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
-    } catch {
-      // content may be a malformed/non-array shape — skip rather than crash
-      // before endSpanSafe() below ever gets a chance to close the span,
-      // matching the defensive pattern openToolSpan/closeToolSpan already use.
-    }
+    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
   }
   if (message.stopReason === 'error' || message.stopReason === 'aborted') {
     span.setStatus({
