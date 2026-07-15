@@ -658,6 +658,22 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         proto.dispose = originalDispose;
       });
     }
+
+    // Setup fully succeeded: only now is it correct to mark this prototype
+    // wrapped, so the wrap-once guard can never be left true over a prototype
+    // that was never actually patched. This MUST be the last statement INSIDE
+    // the try: if the prototype was frozen/sealed between the patches above and
+    // here (or a conflicting non-configurable WRAPPED-keyed property already
+    // exists), Object.defineProperty throws — and that failure has to unwind
+    // the method patches already applied, exactly like any other mid-setup
+    // failure. Left outside the try (as it once was), a throw here escaped
+    // rollback: the prototype stayed patched but UNSTAMPED, so the very next
+    // instrumentPiCodingAgent() call saw no guard, re-patched the already-
+    // patched methods, and every event emitted duplicate spans forever. No
+    // rollback entry is pushed for the stamp itself: Object.defineProperty
+    // never partially applies, so on failure the property was never defined and
+    // there is nothing to undo for it — only the PRIOR patches need unwinding.
+    Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
   } catch (err) {
     // Undo every patch already applied, newest first, so a failed install
     // leaves AgentSession.prototype exactly as it was found rather than
@@ -670,11 +686,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       cause: err,
     });
   }
-
-  // Setup fully succeeded: only now is it correct to mark this prototype
-  // wrapped, so the wrap-once guard can never be left true over a prototype
-  // that was never actually patched.
-  Object.defineProperty(proto, WRAPPED, { value: true, enumerable: false });
 
   return sdk;
 }
