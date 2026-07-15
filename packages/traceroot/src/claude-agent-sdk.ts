@@ -90,6 +90,10 @@ type ActiveLLMSpanState = {
   span: OTelSpan;
 };
 
+// wrapQuery() only ever calls startSpan on the re-resolving tracer, so narrow
+// to just that method rather than carrying the full Tracer surface.
+type SpanFactory = Pick<Tracer, 'startSpan'>;
+
 type QueryState = {
   accumulatedOutputTokens: number;
   activeLLMSpansByParent: Map<string, ActiveLLMSpanState>;
@@ -104,7 +108,7 @@ type QueryState = {
   subagents: Map<string, SubagentState>;
   toolUseToParent: Map<string, string | null>;
   tools: Map<string, ToolState>;
-  tracer: Tracer;
+  tracer: SpanFactory;
 };
 
 // Use the global symbol registry so duplicated package copies still avoid double wrapping.
@@ -128,20 +132,11 @@ const TRACER_NAME = '@traceroot-ai/claude-agent-sdk';
 // active at the moment a span is opened is the one that span routes to. In
 // steady state (no disable() ever called) this behaves identically to a
 // tracer captured once.
-function createReresolvingTracer(): Tracer {
+function createReresolvingTracer(): SpanFactory {
   const resolveTracer = (): Tracer => trace.getTracer(TRACER_NAME);
   return {
     startSpan(name: string, options?: SpanOptions, ctx?: Context): OTelSpan {
       return resolveTracer().startSpan(name, options, ctx);
-    },
-    // wrapQuery() only ever calls startSpan (see below), but implement
-    // startActiveSpan faithfully -- forwarding exactly the arguments
-    // supplied, so the right overload is honored -- to keep this a complete,
-    // drop-in Tracer for any future caller.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    startActiveSpan(name: string, ...rest: any[]): any {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (resolveTracer().startActiveSpan as (n: string, ...r: any[]) => any)(name, ...rest);
     },
   };
 }
@@ -586,6 +581,24 @@ function trackToolUseContext(state: QueryState, message: ClaudeAgentSDKMessage):
   }
 }
 
+// End and remove an active LLM span for a given parent, applying an optional
+// status first. Keeps every teardown path (malformed-group bail-out, normal
+// success close, and endInFlight's cleanup) ending these spans symmetrically
+// with how tools/subagents are ended, so no active-LLM entry is ever dropped
+// via a bare .clear() without .end() being called.
+function endActiveLLMSpan(
+  state: QueryState,
+  parentKey: string,
+  endTime: Date,
+  status?: { code: SpanStatusCode; message?: string },
+): void {
+  const activeLLM = state.activeLLMSpansByParent.get(parentKey);
+  if (!activeLLM) return;
+  if (status) activeLLM.span.setStatus(status);
+  activeLLM.span.end(endTime);
+  state.activeLLMSpansByParent.delete(parentKey);
+}
+
 function emitLLMSpan(
   state: QueryState,
   messages: ClaudeAgentSDKMessage[],
@@ -598,22 +611,15 @@ function emitLLMSpan(
   if (firstMessage.type !== 'assistant' || !lastMessage.message) {
     // ensureActiveLLMSpan() opens a span for this group eagerly, on the first
     // assistant chunk that carries usage — before the group's LAST chunk (the
-    // one this bail-out is reacting to) is known. If that span was opened and
-    // we bail here, it would otherwise stay in activeLLMSpansByParent without
-    // ever having .end() called on it: endInFlight() only .clear()s the map,
-    // so the span is never handed to the SpanProcessor and is lost for good.
-    // End it now, so a malformed/incomplete group still exports.
-    const parentToolUseId = firstMessage.parent_tool_use_id ?? null;
-    const parentKey = llmParentKey(parentToolUseId);
-    const activeLLM = state.activeLLMSpansByParent.get(parentKey);
-    if (activeLLM) {
-      activeLLM.span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: 'assistant message group ended without a complete final message',
-      });
-      activeLLM.span.end(endTime);
-      state.activeLLMSpansByParent.delete(parentKey);
-    }
+    // one this bail-out is reacting to) is known. End it here so the span
+    // carries the correct end time and an ERROR status pinned to the malformed
+    // group, rather than deferring to endInFlight()'s catch-all teardown at
+    // query end (which would export it, but only with the query's end time).
+    const parentKey = llmParentKey(firstMessage.parent_tool_use_id ?? null);
+    endActiveLLMSpan(state, parentKey, endTime, {
+      code: SpanStatusCode.ERROR,
+      message: 'assistant message group ended without a complete final message',
+    });
     return;
   }
 
@@ -644,8 +650,7 @@ function emitLLMSpan(
     setJsonAttribute(span, OI_OUTPUT_VALUE, output);
   }
   span.setStatus({ code: SpanStatusCode.OK });
-  span.end(endTime);
-  state.activeLLMSpansByParent.delete(parentKey);
+  endActiveLLMSpan(state, parentKey, endTime);
   state.accumulatedOutputTokens += usage?.output_tokens ?? 0;
   state.currentMessageStartTime = endTime;
 }
@@ -785,7 +790,11 @@ function endInFlight(state: QueryState, status?: { code: SpanStatusCode; message
     }
   }
   state.subagents.clear();
-  state.activeLLMSpansByParent.clear();
+
+  for (const parentKey of [...state.activeLLMSpansByParent.keys()]) {
+    endActiveLLMSpan(state, parentKey, now, status);
+  }
+
   state.agentIdToToolUseId.clear();
   state.rawSubagentToolUseIdToToolUseId.clear();
   state.toolUseToParent.clear();
