@@ -595,7 +595,27 @@ function emitLLMSpan(
   if (messages.length === 0) return;
   const firstMessage = messages[0];
   const lastMessage = messages[messages.length - 1];
-  if (firstMessage.type !== 'assistant' || !lastMessage.message) return;
+  if (firstMessage.type !== 'assistant' || !lastMessage.message) {
+    // ensureActiveLLMSpan() opens a span for this group eagerly, on the first
+    // assistant chunk that carries usage — before the group's LAST chunk (the
+    // one this bail-out is reacting to) is known. If that span was opened and
+    // we bail here, it would otherwise stay in activeLLMSpansByParent without
+    // ever having .end() called on it: endInFlight() only .clear()s the map,
+    // so the span is never handed to the SpanProcessor and is lost for good.
+    // End it now, so a malformed/incomplete group still exports.
+    const parentToolUseId = firstMessage.parent_tool_use_id ?? null;
+    const parentKey = llmParentKey(parentToolUseId);
+    const activeLLM = state.activeLLMSpansByParent.get(parentKey);
+    if (activeLLM) {
+      activeLLM.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: 'assistant message group ended without a complete final message',
+      });
+      activeLLM.span.end(endTime);
+      state.activeLLMSpansByParent.delete(parentKey);
+    }
+    return;
+  }
 
   const usage = usageOverride ?? getUsage(lastMessage);
   const parentToolUseId = firstMessage.parent_tool_use_id ?? null;
