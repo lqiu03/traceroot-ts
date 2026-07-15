@@ -41,6 +41,21 @@ function loadInstrumentation(pkg: string, exportName: string): InstrumentationCt
 }
 
 /**
+ * Extracts the missing module specifier from a Node MODULE_NOT_FOUND error
+ * message, whose format is stably `Cannot find module '<specifier>'`. Returns
+ * undefined when no specifier can be parsed (a non-string message, or a future
+ * message-format change), so callers can fall back conservatively rather than
+ * mislabel. Used by wirePiCodingAgentInstrumentation() to tell "@traceroot-ai/pi
+ * itself is absent" from "@traceroot-ai/pi is present but a dependency deeper
+ * inside it is missing".
+ */
+function parseMissingModuleSpecifier(message: unknown): string | undefined {
+  if (typeof message !== 'string') return undefined;
+  const match = message.match(/Cannot find module '([^']+)'/);
+  return match ? match[1] : undefined;
+}
+
+/**
  * An `instrumentModules.piCodingAgent` value is the bare `{ module, config }`
  * wrapper form (as opposed to a raw `@earendil-works/pi-coding-agent` module
  * ref) when it carries a `module` property and is NOT itself a pi module
@@ -94,13 +109,35 @@ function wirePiCodingAgentInstrumentation(
       instrumentPiCodingAgent = pkg.instrumentPiCodingAgent as typeof instrumentPiCodingAgent;
     }
   } catch (err) {
-    // Distinguish a genuinely-absent optional peer package (require() throws
-    // with code MODULE_NOT_FOUND) from one that IS installed but fails to load
-    // (a syntax error, a throwing top-level side effect, a broken transitive
-    // dependency). The former is the expected, benign "you didn't install the
-    // optional peer" case; the latter is a real defect whose diagnostic must
-    // NOT be discarded behind a misleading "not installed" message.
-    if ((err as { code?: unknown } | null)?.code === 'MODULE_NOT_FOUND') {
+    // Distinguish a genuinely-absent optional peer package from one that IS
+    // installed but fails to load (a syntax error, a throwing top-level side
+    // effect, a broken transitive dependency). The former is the expected,
+    // benign "you didn't install the optional peer" case; the latter is a real
+    // defect whose diagnostic must NOT be discarded behind a misleading "not
+    // installed" message.
+    //
+    // MODULE_NOT_FOUND alone does NOT prove the peer is absent: Node throws the
+    // identical code when @traceroot-ai/pi IS installed but one of ITS OWN
+    // require() calls fails to resolve a transitive/peer dependency. And the
+    // requireStack is populated in BOTH cases (verified empirically — a
+    // top-level miss lists the caller, a nested miss lists the pi file that
+    // required it), so its mere presence can't tell them apart either. The one
+    // reliable signal is WHICH specifier Node reports as missing: its message
+    // is always `Cannot find module '<specifier>'`. When that specifier is
+    // @traceroot-ai/pi itself, the top-level require failed — genuinely not
+    // installed. When it's some OTHER specifier, the package was found and
+    // started loading before a dependency deeper inside it was missing —
+    // installed but broken.
+    const error = err as { code?: unknown; message?: unknown } | null;
+    const missingSpecifier =
+      error?.code === 'MODULE_NOT_FOUND' ? parseMissingModuleSpecifier(error.message) : undefined;
+    // Treat an unparseable MODULE_NOT_FOUND message as "pi itself missing" so
+    // the common, benign not-installed case is never mislabeled; only a
+    // confidently-different specifier routes to the broken-install branch.
+    const isPiItselfMissing =
+      error?.code === 'MODULE_NOT_FOUND' &&
+      (missingSpecifier === undefined || missingSpecifier === '@traceroot-ai/pi');
+    if (isPiItselfMissing) {
       console.warn(
         '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi is not ' +
           'installed. Install it: npm install @traceroot-ai/pi',
