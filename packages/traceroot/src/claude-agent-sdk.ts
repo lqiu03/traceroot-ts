@@ -1,5 +1,5 @@
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
-import type { Context, Span as OTelSpan } from '@opentelemetry/api';
+import type { Context, Span as OTelSpan, SpanOptions, Tracer } from '@opentelemetry/api';
 import {
   OI_INPUT_VALUE,
   OI_LLM_MODEL_NAME,
@@ -103,7 +103,7 @@ type QueryState = {
   subagents: Map<string, SubagentState>;
   toolUseToParent: Map<string, string | null>;
   tools: Map<string, ToolState>;
-  tracer: ReturnType<typeof trace.getTracer>;
+  tracer: Tracer;
 };
 
 // Use the global symbol registry so duplicated package copies still avoid double wrapping.
@@ -111,6 +111,39 @@ const WRAPPED = Symbol.for('traceroot.claude_agent_sdk.wrapped');
 const ROOT_LLM_PARENT_KEY = '__root__';
 const LLM_SPAN_NAME = 'anthropic.messages.create';
 const QUERY_SPAN_NAME = 'ClaudeAgent.query';
+const TRACER_NAME = '@traceroot-ai/claude-agent-sdk';
+
+// trace.disable() (called by TraceRoot.shutdown()) swaps the OTel API's
+// internal ProxyTracerProvider for a brand-new instance rather than mutating
+// the old one, so a Tracer captured once at wrap time (via a single
+// trace.getTracer() call) stays permanently bound to the old, now-detached
+// provider -- after a shutdown()/initialize() cycle every span it opens goes
+// silently dark. wrapQuery()'s WRAPPED guard also means the module is only
+// ever wrapped once, so there is no later re-wrap to pick up a fresh tracer.
+// Re-resolve through the global `trace` facade on every span-open instead,
+// mirroring ProxyTracer's own lazy-delegate-rebind pattern one level up and
+// pi's identical fix in packages/pi/src/provider.ts
+// (createReresolvingSharedTracer): whatever TracerProvider is globally
+// active at the moment a span is opened is the one that span routes to. In
+// steady state (no disable() ever called) this behaves identically to a
+// tracer captured once.
+function createReresolvingTracer(): Tracer {
+  const resolveTracer = (): Tracer => trace.getTracer(TRACER_NAME);
+  return {
+    startSpan(name: string, options?: SpanOptions, ctx?: Context): OTelSpan {
+      return resolveTracer().startSpan(name, options, ctx);
+    },
+    // wrapQuery() only ever calls startSpan (see below), but implement
+    // startActiveSpan faithfully -- forwarding exactly the arguments
+    // supplied, so the right overload is honored -- to keep this a complete,
+    // drop-in Tracer for any future caller.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    startActiveSpan(name: string, ...rest: any[]): any {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (resolveTracer().startActiveSpan as (n: string, ...r: any[]) => any)(name, ...rest);
+    },
+  };
+}
 
 const OI_SPAN_KIND_VALUE = {
   AGENT: 'AGENT',
@@ -553,19 +586,25 @@ function trackToolUseContext(state: QueryState, message: ClaudeAgentSDKMessage):
   }
 }
 
-function emitLLMSpan(state: QueryState, messages: ClaudeAgentSDKMessage[], endTime: Date): void {
+function emitLLMSpan(
+  state: QueryState,
+  messages: ClaudeAgentSDKMessage[],
+  endTime: Date,
+  usageOverride?: ClaudeUsage,
+): void {
   if (messages.length === 0) return;
   const firstMessage = messages[0];
   const lastMessage = messages[messages.length - 1];
   if (firstMessage.type !== 'assistant' || !lastMessage.message) return;
 
+  const usage = usageOverride ?? getUsage(lastMessage);
   const parentToolUseId = firstMessage.parent_tool_use_id ?? null;
   const parentKey = llmParentKey(parentToolUseId);
   const activeLLM = ensureActiveLLMSpan(state, parentToolUseId, state.currentMessageStartTime);
   const model = getMessageModel(lastMessage, state.params.options);
   const span = activeLLM.span;
   setCommonModel(span, model);
-  setUsageAttributes(span, getUsage(lastMessage));
+  setUsageAttributes(span, usage);
   if (!firstMessage.parent_tool_use_id) {
     if (typeof state.params.prompt === 'string') {
       setJsonAttribute(span, OI_INPUT_VALUE, [{ role: 'user', content: state.params.prompt }]);
@@ -587,13 +626,17 @@ function emitLLMSpan(state: QueryState, messages: ClaudeAgentSDKMessage[], endTi
   span.setStatus({ code: SpanStatusCode.OK });
   span.end(endTime);
   state.activeLLMSpansByParent.delete(parentKey);
-  state.accumulatedOutputTokens += getUsage(lastMessage)?.output_tokens ?? 0;
+  state.accumulatedOutputTokens += usage?.output_tokens ?? 0;
   state.currentMessageStartTime = endTime;
 }
 
-function flushPendingLLMSpan(state: QueryState, endTime = new Date()): void {
+function flushPendingLLMSpan(
+  state: QueryState,
+  endTime = new Date(),
+  usageOverride?: ClaudeUsage,
+): void {
   if (state.pendingAssistantMessages.length === 0) return;
-  emitLLMSpan(state, state.pendingAssistantMessages, endTime);
+  emitLLMSpan(state, state.pendingAssistantMessages, endTime, usageOverride);
   state.pendingAssistantMessages = [];
 }
 
@@ -620,29 +663,33 @@ function updateCurrentMessageId(state: QueryState, message: ClaudeAgentSDKMessag
 function adjustPendingAssistantUsageFromResult(
   state: QueryState,
   resultMessage: ClaudeAgentSDKMessage,
-): void {
-  if (state.pendingAssistantMessages.length === 0) return;
+): ClaudeUsage | undefined {
+  if (state.pendingAssistantMessages.length === 0) return undefined;
 
   const finalUsage = getUsage(resultMessage);
-  if (!finalUsage) return;
-  const finalOutputTokens = finalUsage?.output_tokens;
-  if (finalOutputTokens === undefined) return;
+  if (!finalUsage) return undefined;
+  const finalOutputTokens = finalUsage.output_tokens;
+  if (finalOutputTokens === undefined) return undefined;
 
   const lastMessage = state.pendingAssistantMessages[state.pendingAssistantMessages.length - 1];
   const lastUsage = lastMessage?.message?.usage;
-  if (!lastUsage) return;
+  if (!lastUsage) return undefined;
+
+  const adjustedUsage: ClaudeUsage = { ...lastUsage };
 
   const remainingOutputTokens = finalOutputTokens - state.accumulatedOutputTokens;
   if (remainingOutputTokens >= 0) {
-    lastUsage.output_tokens = remainingOutputTokens;
+    adjustedUsage.output_tokens = remainingOutputTokens;
   }
 
   if (finalUsage.cache_read_input_tokens !== undefined) {
-    lastUsage.cache_read_input_tokens = finalUsage.cache_read_input_tokens;
+    adjustedUsage.cache_read_input_tokens = finalUsage.cache_read_input_tokens;
   }
   if (finalUsage.cache_creation_input_tokens !== undefined) {
-    lastUsage.cache_creation_input_tokens = finalUsage.cache_creation_input_tokens;
+    adjustedUsage.cache_creation_input_tokens = finalUsage.cache_creation_input_tokens;
   }
+
+  return adjustedUsage;
 }
 
 function processMessage(
@@ -683,8 +730,8 @@ function processMessage(
 
   if (message.type === 'result') {
     const now = new Date();
-    adjustPendingAssistantUsageFromResult(state, message);
-    flushPendingLLMSpan(state, now);
+    const usageOverride = adjustPendingAssistantUsageFromResult(state, message);
+    flushPendingLLMSpan(state, now, usageOverride);
     if (typeof message.result === 'string') {
       state.querySpan.setAttribute(OI_OUTPUT_VALUE, message.result);
     }
@@ -727,123 +774,149 @@ function endInFlight(state: QueryState, status?: { code: SpanStatusCode; message
 function wrapQuery(
   original: NonNullable<ClaudeAgentSDKModule['query']>,
 ): NonNullable<ClaudeAgentSDKModule['query']> {
-  const tracer = trace.getTracer('@traceroot-ai/claude-agent-sdk');
+  const tracer = createReresolvingTracer();
 
   return function wrappedQuery(
     params: ClaudeAgentSDKQueryParams,
   ): AsyncIterable<ClaudeAgentSDKMessage> {
     const parentCtx = context.active();
 
+    // Building the query span, tracing state, and underlying iterator is deferred
+    // until the returned iterable is actually iterated. This keeps wrappedQuery()
+    // side-effect-free for callers that construct the iterable but never consume it
+    // (no leaked open span, no eager invocation of `original`), while memoizing the
+    // built iterator so repeated [Symbol.asyncIterator]() calls reuse the same
+    // underlying execution instead of re-invoking `original`.
+    let built: { iterator: AsyncIterator<ClaudeAgentSDKMessage> } | { error: unknown } | undefined;
+
+    function buildIterator(): AsyncIterator<ClaudeAgentSDKMessage> {
+      const querySpan = tracer.startSpan(
+        QUERY_SPAN_NAME,
+        {
+          attributes: {
+            [OI_SPAN_KIND]: OI_SPAN_KIND_VALUE.AGENT,
+            ...(params.options?.model
+              ? { [CLAUDE_AGENT_ATTRIBUTES.MODEL]: params.options.model }
+              : {}),
+          },
+        },
+        parentCtx,
+      );
+      if (typeof params.prompt === 'string') querySpan.setAttribute(OI_INPUT_VALUE, params.prompt);
+
+      const state: QueryState = {
+        accumulatedOutputTokens: 0,
+        activeLLMSpansByParent: new Map(),
+        agentIdToToolUseId: new Map(),
+        currentMessageStartTime: new Date(),
+        ctx: trace.setSpan(parentCtx, querySpan),
+        params,
+        pendingAssistantMessages: [],
+        querySpan,
+        rawSubagentToolUseIdToToolUseId: new Map(),
+        subagents: new Map(),
+        toolUseToParent: new Map(),
+        tools: new Map(),
+        tracer,
+      };
+
+      const modifiedParams = {
+        ...params,
+        options: mergeHooks(params.options, createTracingHooks(state)),
+      };
+
+      let finished = false;
+      const finish = (
+        status: { code: SpanStatusCode; message?: string } = { code: SpanStatusCode.OK },
+        error?: unknown,
+      ): void => {
+        if (finished) return;
+        finished = true;
+        endInFlight(state, status);
+        if (error !== undefined) {
+          querySpan.recordException(error instanceof Error ? error : new Error(String(error)));
+        }
+        querySpan.setStatus(status);
+        querySpan.end();
+      };
+
+      let inner: AsyncIterator<ClaudeAgentSDKMessage>;
+      try {
+        inner = original(modifiedParams)[Symbol.asyncIterator]();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        finish({ code: SpanStatusCode.ERROR, message }, error);
+        throw error;
+      }
+
+      return {
+        async next() {
+          try {
+            const result = await context.with(state.ctx, () => inner.next());
+            if (!result.done) {
+              processMessage(state, result.value, params);
+            } else {
+              finish();
+            }
+            return result;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            finish({ code: SpanStatusCode.ERROR, message }, error);
+            throw error;
+          }
+        },
+        async return(value?: unknown) {
+          if (finished) return { done: true as const, value: undefined };
+          try {
+            const result = inner.return
+              ? await inner.return(value as ClaudeAgentSDKMessage)
+              : { done: true as const, value: undefined };
+            finish();
+            return result;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            finish({ code: SpanStatusCode.ERROR, message }, error);
+            throw error;
+          }
+        },
+        async throw(error?: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (finished) throw error;
+          try {
+            if (inner.throw) {
+              const result = await inner.throw(error);
+              finish({ code: SpanStatusCode.ERROR, message }, error);
+              return result;
+            }
+            finish({ code: SpanStatusCode.ERROR, message }, error);
+            throw error;
+          } catch (thrown) {
+            const thrownMessage = thrown instanceof Error ? thrown.message : String(thrown);
+            finish({ code: SpanStatusCode.ERROR, message: thrownMessage }, thrown);
+            throw thrown;
+          }
+        },
+      };
+    }
+
+    function ensureBuilt():
+      | { iterator: AsyncIterator<ClaudeAgentSDKMessage> }
+      | { error: unknown } {
+      if (!built) {
+        try {
+          built = { iterator: buildIterator() };
+        } catch (error) {
+          built = { error };
+        }
+      }
+      return built;
+    }
+
     return {
       [Symbol.asyncIterator]() {
-        const querySpan = tracer.startSpan(
-          QUERY_SPAN_NAME,
-          {
-            attributes: {
-              [OI_SPAN_KIND]: OI_SPAN_KIND_VALUE.AGENT,
-              ...(params.options?.model
-                ? { [CLAUDE_AGENT_ATTRIBUTES.MODEL]: params.options.model }
-                : {}),
-            },
-          },
-          parentCtx,
-        );
-        if (typeof params.prompt === 'string')
-          querySpan.setAttribute(OI_INPUT_VALUE, params.prompt);
-
-        const state: QueryState = {
-          accumulatedOutputTokens: 0,
-          activeLLMSpansByParent: new Map(),
-          agentIdToToolUseId: new Map(),
-          currentMessageStartTime: new Date(),
-          ctx: trace.setSpan(parentCtx, querySpan),
-          params,
-          pendingAssistantMessages: [],
-          querySpan,
-          rawSubagentToolUseIdToToolUseId: new Map(),
-          subagents: new Map(),
-          toolUseToParent: new Map(),
-          tools: new Map(),
-          tracer,
-        };
-
-        const modifiedParams = {
-          ...params,
-          options: mergeHooks(params.options, createTracingHooks(state)),
-        };
-
-        let finished = false;
-        const finish = (
-          status: { code: SpanStatusCode; message?: string } = { code: SpanStatusCode.OK },
-          error?: unknown,
-        ): void => {
-          if (finished) return;
-          finished = true;
-          endInFlight(state, status);
-          if (error !== undefined) {
-            querySpan.recordException(error instanceof Error ? error : new Error(String(error)));
-          }
-          querySpan.setStatus(status);
-          querySpan.end();
-        };
-
-        let inner: AsyncIterator<ClaudeAgentSDKMessage>;
-        try {
-          inner = original(modifiedParams)[Symbol.asyncIterator]();
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          finish({ code: SpanStatusCode.ERROR, message }, error);
-          throw error;
-        }
-
-        return {
-          async next() {
-            try {
-              const result = await context.with(state.ctx, () => inner.next());
-              if (!result.done) {
-                processMessage(state, result.value, params);
-              } else {
-                finish();
-              }
-              return result;
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              finish({ code: SpanStatusCode.ERROR, message }, error);
-              throw error;
-            }
-          },
-          async return(value?: unknown) {
-            if (finished) return { done: true as const, value: undefined };
-            try {
-              const result = inner.return
-                ? await inner.return(value as ClaudeAgentSDKMessage)
-                : { done: true as const, value: undefined };
-              finish();
-              return result;
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              finish({ code: SpanStatusCode.ERROR, message }, error);
-              throw error;
-            }
-          },
-          async throw(error?: unknown) {
-            const message = error instanceof Error ? error.message : String(error);
-            if (finished) throw error;
-            try {
-              if (inner.throw) {
-                const result = await inner.throw(error);
-                finish({ code: SpanStatusCode.ERROR, message }, error);
-                return result;
-              }
-              finish({ code: SpanStatusCode.ERROR, message }, error);
-              throw error;
-            } catch (thrown) {
-              const thrownMessage = thrown instanceof Error ? thrown.message : String(thrown);
-              finish({ code: SpanStatusCode.ERROR, message: thrownMessage }, thrown);
-              throw thrown;
-            }
-          },
-        };
+        const result = ensureBuilt();
+        if ('error' in result) throw result.error;
+        return result.iterator;
       },
     };
   };

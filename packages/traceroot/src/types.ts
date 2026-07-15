@@ -69,6 +69,25 @@ export interface InitializeOptions {
     openAI?: unknown;
     anthropic?: unknown;
     langchain?: unknown;
+    /**
+     * @anthropic-ai/claude-agent-sdk module ref. Pass
+     * `import * as claudeAgentSDK from '@anthropic-ai/claude-agent-sdk'`.
+     *
+     * LIMITATION: instrumentation replaces query() with a wrapper that returns
+     * a bare async-iterable of messages. Methods that live on the SDK's Query
+     * object beyond async iteration — e.g. interrupt() and setPermissionMode()
+     * (streaming-input mode) — are NOT forwarded and will be undefined on the
+     * returned value. A host that needs those must call them on an
+     * un-instrumented query(). (This mirrors the OpenInference reference
+     * instrumentation's identical shape.)
+     *
+     * PII / CONTENT CAPTURE: unlike {@link piCodingAgent}, this accepts only
+     * the bare module ref — there is no `{ module, config }` wrapper and no
+     * captureContent/captureToolIo toggle. Prompt input/output and tool I/O
+     * are captured unconditionally onto every AGENT/LLM/TOOL span this
+     * instrumentation emits, with no way to opt out short of not enabling it.
+     * Do not assume parity with piCodingAgent's PII controls here.
+     */
     claudeAgentSDK?: unknown;
     bedrock?: unknown;
     /**
