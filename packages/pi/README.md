@@ -21,6 +21,42 @@ npm install @traceroot-ai/pi @earendil-works/pi-coding-agent
 
 ## Usage
 
+Use `createAgentSession()` — Pi's own documented SDK entry point — rather than constructing `AgentSession` directly; its constructor requires assembling several internal objects (`Agent`, `SessionManager`, `SettingsManager`, `ResourceLoader`) that `createAgentSession()` builds for you. `instrumentPiCodingAgent()` patches `AgentSession.prototype`, so it instruments sessions built either way, whether it's called directly or via TraceRoot's core SDK.
+
+### With TraceRoot core (recommended)
+
+If you already use TraceRoot's core SDK, wire pi through `TraceRoot.initialize()`'s `instrumentModules.piCodingAgent` option instead of calling `instrumentPiCodingAgent()` yourself. `initialize()` lazy-loads `@traceroot-ai/pi` and delegates to its `instrumentPiCodingAgent()`, threading its own resolved `apiKey`/`baseUrl` down as defaults so pi's spans land in the same shared pipeline as the rest of TraceRoot's traces.
+
+```ts
+import * as pi from "@earendil-works/pi-coding-agent";
+import { AuthStorage, createAgentSession, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { TraceRoot } from "@traceroot-ai/traceroot";
+
+// Instrument BEFORE creating any session.
+TraceRoot.initialize({
+  apiKey: process.env.TRACEROOT_API_KEY,
+  instrumentModules: { piCodingAgent: pi },
+});
+
+const authStorage = AuthStorage.create();
+const modelRegistry = ModelRegistry.create(authStorage);
+const [model] = await modelRegistry.getAvailable();
+
+const { session } = await createAgentSession({ model, authStorage, modelRegistry });
+
+try {
+  await session.prompt("Fix the failing test in src/math.ts");
+} finally {
+  session.dispose();
+}
+```
+
+`instrumentModules.piCodingAgent` accepts either a bare module ref (`pi`, as above) or a `{ module, config }` wrapper — e.g. `{ module: pi, config: { captureContent: false } }` — when you need to override `captureContent`/`captureToolIo` or the `apiKey`/`baseUrl` for the pi pipeline specifically, without changing `initialize()`'s own defaults.
+
+### Standalone (no core / bring-your-own-OTel)
+
+Call `instrumentPiCodingAgent()` directly if you don't use TraceRoot's core SDK. Note that this path builds its own private OTel export pipeline unless a global provider is already registered in the process.
+
 ```ts
 import * as pi from "@earendil-works/pi-coding-agent";
 import { AuthStorage, createAgentSession, ModelRegistry } from "@earendil-works/pi-coding-agent";
@@ -43,8 +79,6 @@ try {
   session.dispose();
 }
 ```
-
-Use `createAgentSession()` — Pi's own documented SDK entry point — rather than constructing `AgentSession` directly; its constructor requires assembling several internal objects (`Agent`, `SessionManager`, `SettingsManager`, `ResourceLoader`) that `createAgentSession()` builds for you. `instrumentPiCodingAgent()` patches `AgentSession.prototype`, so it instruments sessions built either way.
 
 If you also use TraceRoot's core SDK, `instrumentPiCodingAgent()` must run after `TraceRoot.initialize()` (or any other global OpenTelemetry provider registration) in the same process to attach to that shared pipeline; if it runs first, it commits to its own private export pipeline for the life of the process and will not pick up a provider registered later.
 
