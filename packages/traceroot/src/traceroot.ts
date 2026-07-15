@@ -31,6 +31,10 @@ const DEFAULT_BASE_URL = 'https://app.traceroot.ai';
 
 let _isInitialized = false;
 let _provider: NodeTracerProvider | undefined;
+// The beforeExit listener initialize() installed, so shutdown()/_resetForTesting()
+// can remove exactly that one instead of leaving it to fire (harmlessly, but as an
+// accumulating listener) on every future process exit after a shutdown.
+let _beforeExitHandler: (() => void) | undefined;
 // The exact ContextManager / TextMapPropagator instances TraceRoot ATTEMPTED to
 // register at initialize() time. NodeTracerProvider.register(config) mutates the
 // config object it's handed, filling in config.contextManager (always) and
@@ -239,15 +243,44 @@ export class TraceRoot {
     _registeredContextManager = registerConfig.contextManager;
     _registeredPropagator = registerConfig.propagator;
 
-    // Thread the resolved apiKey/baseUrl so a lazily-wired pi pipeline gets
-    // them even when the host configured TraceRoot programmatically and never
-    // set TRACEROOT_API_KEY (see wirePiCodingAgentInstrumentation()).
-    wireInstrumentations(options.instrumentModules, { apiKey, baseUrl });
+    try {
+      // Thread the resolved apiKey/baseUrl so a lazily-wired pi pipeline gets
+      // them even when the host configured TraceRoot programmatically and never
+      // set TRACEROOT_API_KEY (see wirePiCodingAgentInstrumentation()).
+      wireInstrumentations(options.instrumentModules, { apiKey, baseUrl });
+    } catch (error) {
+      // register() above already won the global trace/context/propagation
+      // slots. If wiring then throws (e.g. a misshaped instrumentModules
+      // entry), leaving that registration in place would break the
+      // "a registered global provider <=> _isInitialized === true" invariant:
+      // _isInitialized stays false, so the double-init guard never fires, but
+      // a retried initialize()'s new provider would lose the first-write-wins
+      // race for slots this orphaned provider still holds — silently
+      // stranding the process without a working export pipeline. Tear down
+      // exactly what this call registered, using the same per-slot ownership
+      // checks shutdown() uses, before re-throwing.
+      const orphaned = _provider;
+      if (orphaned && isActiveGlobalDelegate(orphaned)) {
+        trace.disable();
+      }
+      if (isActiveContextManager()) {
+        context.disable();
+      }
+      if (isActivePropagator()) {
+        propagation.disable();
+      }
+      _provider = undefined;
+      _registeredContextManager = undefined;
+      _registeredPropagator = undefined;
+      void orphaned?.shutdown().catch(() => {});
+      throw error;
+    }
 
     _isInitialized = true;
-    process.once('beforeExit', () => {
+    _beforeExitHandler = () => {
       void _provider?.forceFlush();
-    });
+    };
+    process.once('beforeExit', _beforeExitHandler);
   }
 
   static async flush(): Promise<void> {
@@ -256,6 +289,10 @@ export class TraceRoot {
 
   static async shutdown(): Promise<void> {
     const provider = _provider;
+    if (_beforeExitHandler) {
+      process.removeListener('beforeExit', _beforeExitHandler);
+      _beforeExitHandler = undefined;
+    }
     await provider?.shutdown();
     _isInitialized = false;
     _provider = undefined;
@@ -298,6 +335,10 @@ export class TraceRoot {
 export function _resetForTesting(): void {
   _isInitialized = false;
   _provider = undefined;
+  if (_beforeExitHandler) {
+    process.removeListener('beforeExit', _beforeExitHandler);
+    _beforeExitHandler = undefined;
+  }
   _registeredContextManager = undefined;
   _registeredPropagator = undefined;
   _resetObserveState();
