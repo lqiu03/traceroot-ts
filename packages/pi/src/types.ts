@@ -91,10 +91,15 @@ export type AgentMessage = AssistantMessage | UserMessage | ToolResultMessage | 
  * `Agent.subscribe()`. `AgentSession.subscribe()` is a strict superset
  * (adds `willRetry` to `agent_end`, plus session-level events this package
  * does not use) — only the shared, raw `AgentEvent` shapes are mirrored here.
+ * The exception is `auto_retry_end`, a session-level event that IS mirrored
+ * because this package consumes its `success: false` form to disarm the
+ * `willRetry` input reservation armed by `agent_end` when the SDK cancels or
+ * exhausts a retry.
  */
 export type AgentEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; messages: AgentMessage[]; willRetry?: boolean }
+  | { type: 'auto_retry_end'; success: boolean; attempt?: number; finalError?: string }
   | { type: 'turn_start' }
   | { type: 'turn_end'; message: AgentMessage; toolResults: ToolResultMessage[] }
   | { type: 'message_start'; message: AgentMessage }

@@ -375,6 +375,32 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       // shutdown() would permanently disable all further export from that point
       // on, while forceFlush() only flushes what's pending and leaves the
       // pipeline usable for every subsequent session in the same process.
+      // Registration is bounded per DISTINCT AgentSession module object
+      // instrumented, not deduped process-wide: each successful call here
+      // builds and owns its own private OTLP pipeline (see createTracing()
+      // above) and therefore needs its own flush hook. `rollback` only
+      // removes this listener on a mid-setup failure (see the try/catch
+      // below) -- there is deliberately no public API to remove it after a
+      // SUCCESSFUL install. That is fine for the common case (a host calls
+      // instrumentPiCodingAgent() once per process, guarded by WRAPPED
+      // above, and the listener lives for the process's lifetime alongside
+      // the provider it flushes), but it IS a real, intentional gap for a
+      // host that instruments multiple independent SDK objects over its
+      // lifetime (HMR module reload, per-tenant pooling): each one leaves
+      // its own permanent listener + provider behind with no way to tear
+      // either down, even after every session built from that SDK object has
+      // long since been disposed. proto.dispose (patched below) only clears
+      // per-session span state; it intentionally does not touch this
+      // process-level hook, since one session's dispose() must not silently
+      // kill flush for every other session still sharing this same private
+      // pipeline. Bounded-per-process growth (proportional to the number of
+      // distinct SDK objects a host instruments, not to session count) is
+      // the accepted tradeoff for now rather than building real
+      // multi-pipeline teardown; see
+      // tests/test-helpers.ts's makeRig() and the bounded-listener-growth
+      // test in tests/test-helpers.test.ts for how this is verified and kept
+      // from silently regressing behind Node's MaxListenersExceededWarning
+      // threshold.
       const flushOnExit = (): void => {
         void forceFlush();
       };
@@ -768,9 +794,9 @@ function handleEvent(
       // when the queue is non-empty. A retry's phantom continuation must
       // reuse the retrying run's OWN text, never whatever a second, genuinely
       // distinct prompt() call already queued behind it — see
-      // agent-end-continuation-input-requeue.test.ts's "reuses ITS OWN
-      // pendingInputText even when a second ... prompt() call is already
-      // queued behind it" test for the exact corruption this prevents. The
+      // prompt-queue.test.ts's "reuses ITS OWN pendingInputText even when a
+      // second ... prompt() call is already queued behind it" test for the
+      // exact corruption this prevents. The
       // flag is consumed here exactly once: it is set immediately before
       // this specific agent_start (agent.continue() is called synchronously,
       // with no other event able to interleave in between — see agent_end's
@@ -829,7 +855,7 @@ function handleEvent(
       // still exports instead of having its state.llmSpan slot silently
       // overwritten below, mirroring tool_execution_start's identical
       // duplicate-open handling further down in this switch.
-      if (state.llmSpan) closeDanglingSpan(state.llmSpan);
+      safeCloseDanglingSpan(state.llmSpan, 'LLM');
       // Falls back to ROOT_CONTEXT, never context.active(): the latter is
       // whatever the host process's own OTel context manager happens to have
       // ambiently active right now, which has nothing to do with this Pi
@@ -874,7 +900,7 @@ function handleEvent(
       // matching the same never-leak-silently philosophy applied to dangling
       // spans everywhere else in this handler (agent_start, turn_end, agent_end).
       const existing = state.toolSpans.get(event.toolCallId);
-      if (existing) closeDanglingSpan(existing);
+      safeCloseDanglingSpan(existing, `tool (toolCallId=${event.toolCallId})`);
       // See message_start's comment: fall back to ROOT_CONTEXT, never the
       // ambient context.active(), to avoid parenting a stray event under
       // whatever unrelated span the host process happens to have active.
@@ -966,6 +992,22 @@ function handleEvent(
       // approximation for those two.
       if (event.willRetry) {
         state.reserveInputForRetry = true;
+      }
+      break;
+    }
+    case 'auto_retry_end': {
+      // The SDK cancelled the retry (session.abort() -> abortRetry() aborts
+      // _prepareRetry's backoff sleep, which returns false so NO continuation
+      // agent_start fires) or exhausted it. Either way the reservation armed
+      // by agent_end{willRetry:true} above will never be consumed by a retry
+      // continuation; clear it so it can't be mis-consumed by a LATER,
+      // genuinely-new prompt() call's agent_start (which would then export
+      // that new run's span carrying the previous run's input.value, shifting
+      // every overlapping call off by one). Clearing on the retries-exhausted
+      // path is harmless: willRetry is false at maxRetries so the reservation
+      // was never armed there.
+      if (event.success === false) {
+        state.reserveInputForRetry = false;
       }
       break;
     }

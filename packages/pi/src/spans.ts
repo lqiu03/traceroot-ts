@@ -22,7 +22,6 @@ import type { AgentMessage, AssistantMessage } from './types';
 const TR_ATTRIBUTES = {
   SDK_NAME: 'traceroot.sdk.name',
   SDK_VERSION: 'traceroot.sdk.version',
-  COST_TOTAL: 'traceroot.pi.cost.total',
   WILL_RETRY: 'traceroot.pi.will_retry',
   FORCE_CLOSED: 'traceroot.pi.force_closed',
 } as const;
@@ -35,7 +34,14 @@ const OI_ATTRIBUTES = {
   SESSION_ID: 'session.id',
 } as const;
 
-// gen_ai semconv (standard, used by multiple platforms)
+// gen_ai semconv (standard, used by multiple platforms). Pi emits ONLY the
+// gen_ai.* family (gen_ai.request.model, gen_ai.response.model,
+// gen_ai.usage.*) -- unlike packages/traceroot/src/claude-agent-sdk.ts,
+// which emits a mixed family (llm.token_count.* plus its own
+// gen_ai.response.model). This is a deliberate divergence, not a bug: the
+// backend's otel_transform.py reads pi's gen_ai.* keys directly via its own
+// fallback chain, independently of how it reads claude-agent-sdk's
+// llm.token_count.* keys. No dual-write is needed here.
 const GEN_AI_ATTRIBUTES = {
   SYSTEM: 'gen_ai.system',
   REQUEST_MODEL: 'gen_ai.request.model',
@@ -251,7 +257,6 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
   setAttr(span, GEN_AI_ATTRIBUTES.USAGE_OUTPUT_TOKENS, message.usage?.output);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
-  setAttr(span, TR_ATTRIBUTES.COST_TOTAL, message.usage?.cost?.total);
   if (captureContent) {
     setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
   }

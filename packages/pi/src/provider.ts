@@ -55,6 +55,21 @@ export interface TracingHandle {
 // `getDelegate().constructor.name === 'NoopTracerProvider'` check, which those
 // tools could silently flip either direction.
 //
+// The probe is deliberately started as a ROOT span ({ root: true }) so it can
+// never inherit an ambient or extracted parent SpanContext. Without root:
+// true, the OTel API's no-op tracer builds its non-recording span from
+// whatever parent context is active, so a host that extracted an incoming
+// traceparent (e.g. from an inbound request) but never registered a real
+// TracerProvider would hand back a span carrying that extracted, structurally
+// valid SpanContext — making isSpanContextValid() wrongly true and forcing
+// shared mode against a no-op provider, silently dropping every span for the
+// life of the process. Forcing root: true makes the no-op tracer short-circuit
+// to a fresh span carrying INVALID_SPAN_CONTEXT regardless of ambient context,
+// while any real provider still generates a brand-new, valid SpanContext for a
+// root span (id generation happens independent of, and prior to, the
+// sampler's recording decision) — so both detection directions stay correct
+// whether or not the host has propagation context active.
+//
 // Going through the global `trace` facade (rather than duck-typing
 // getDelegate()) is also inherently robust to a dual-copy @opentelemetry/api
 // install: the global provider registration lives in globalThis-based storage
@@ -64,7 +79,9 @@ export interface TracingHandle {
 // even though a nominal instanceof check would be defeated by the cross-copy
 // class-identity mismatch.
 function hasRealGlobalProvider(): boolean {
-  const probe = trace.getTracer(SDK_NAME, SDK_VERSION).startSpan('traceroot-pi.provider-probe');
+  const probe = trace
+    .getTracer(SDK_NAME, SDK_VERSION)
+    .startSpan('traceroot-pi.provider-probe', { root: true });
   const isReal = probe.isRecording() || isSpanContextValid(probe.spanContext());
   // Only end() a NON-recording probe: end() is inert on a no-op span. A
   // RECORDING probe is deliberately left unended so it is NEVER routed through
