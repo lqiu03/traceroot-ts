@@ -34,6 +34,7 @@ import type { Context, Span, Tracer } from '@opentelemetry/api';
 import { resolveConfig } from './config';
 import type { PiInstrumentationConfig, ResolvedPiInstrumentationConfig } from './config';
 import { createTracing } from './provider';
+import { PromptQueue, getPromptQueue, shouldSkipQueue } from './prompt-queue';
 import {
   closeDanglingSpan,
   closeLlmSpan,
@@ -77,52 +78,12 @@ import type { AgentEvent, AgentSessionInstance, PiCodingAgentModule } from './ty
 // that multiplexing support first.
 const WRAPPED = Symbol.for('traceroot.pi_coding_agent.wrapped');
 
-// A queued prompt() call's text, boxed in its own object rather than stored
-// as a raw string: proto.prompt's rejection handler below needs to remove
-// EXACTLY the entry it pushed (by reference identity) if that specific call
-// never reaches agent_start, without accidentally removing a different,
-// still-pending queue entry that happens to hold an equal string value.
-interface QueuedPrompt {
-  text: string;
-  // Wall-clock time (Date.now()) this entry was enqueued, consulted at dequeue
-  // to detect an entry that was stranded in the FIFO because its prompt() call
-  // never reached agent_start (and, resolving rather than rejecting, never hit
-  // removeIfStillQueued either). See MAX_QUEUED_PROMPT_AGE_MS.
-  enqueuedAt: number;
-}
-
-// A queued prompt() entry older than this when a later agent_start arrives to
-// claim it is treated as abandoned and skipped rather than trusted. A prompt()
-// call whose run never starts — it hangs with no resolve/reject and no
-// agent_start, so neither removeIfStillQueued (rejection-only) nor a normal
-// agent_start dequeue ever removes it — would otherwise sit in the FIFO
-// forever and be shifted out by some unrelated LATER run's agent_start,
-// misattributing its text to that run and throwing every subsequent call off
-// by one, permanently. This window is deliberately generous — far longer than
-// any realistic single agent run a legitimately-queued overlapping prompt()
-// could be waiting behind — so a genuinely-queued entry is never discarded,
-// while a truly-stranded entry can only ever corrupt a call within this
-// bounded window instead of cascading indefinitely.
-const MAX_QUEUED_PROMPT_AGE_MS = 60 * 60 * 1000; // 1 hour
-
 interface SessionSpanState {
   rootSpan: Span | undefined;
   rootCtx: Context | undefined;
   llmSpan: Span | undefined;
   llmCtx: Context | undefined;
   toolSpans: Map<string, Span>;
-  // The input text this run's root span was opened with (dequeued from
-  // pendingInput at agent_start) — kept around so agent_end can hand it
-  // back to the queue if this run turns out to be retried.
-  pendingInputText: string | undefined;
-  // One-shot reservation set by agent_end when event.willRetry is true,
-  // consumed by exactly the next agent_start. See agent_end's and
-  // agent_start's own comments below for why only the explicitly-observable
-  // retry case gets this strong "reuse regardless of what's queued"
-  // guarantee, while compaction/follow-up continuations (which are NOT
-  // observable via any AgentEvent field) only get the weaker empty-queue
-  // fallback.
-  reserveInputForRetry: boolean;
   // True when dispose()'s force-close swept this run's still-open root span,
   // so agent_end can tell that apart from having already closed it normally
   // itself. A host listener that calls session.dispose() synchronously while
@@ -227,33 +188,6 @@ function sweepDanglingSpans(
   }
 }
 
-// Shifts the oldest genuinely-fresh entry off a session's FIFO input queue,
-// discarding any head entries that have gone stale (their prompt() call never
-// reached agent_start — see MAX_QUEUED_PROMPT_AGE_MS). Skips past every stale
-// head entry rather than stopping at the first, so a run of stranded entries
-// can never block the fresh one queued behind them. Returns undefined when the
-// queue holds nothing but stale entries (or is empty), so agent_start falls
-// back to its usual state.pendingInputText path instead of trusting stale
-// text. Warns once per dequeue that discarded anything, matching this file's
-// other console.warn conventions, so a real host-side "prompt never started"
-// anomaly is visible rather than silently swallowed.
-function dequeueFreshQueuedPrompt(queue: QueuedPrompt[]): QueuedPrompt | undefined {
-  const now = Date.now();
-  let discarded = 0;
-  let entry = queue.shift();
-  while (entry && now - entry.enqueuedAt > MAX_QUEUED_PROMPT_AGE_MS) {
-    discarded += 1;
-    entry = queue.shift();
-  }
-  if (discarded > 0) {
-    console.warn(
-      `[traceroot-pi] discarded ${discarded} stale queued prompt(s) whose run never started ` +
-        '(older than the staleness window) instead of misattributing their text to this run.',
-    );
-  }
-  return entry;
-}
-
 // Shared by proto.prompt/proto.steer/proto.followUp below: each of those
 // three independently-callable entry points can be a session's first
 // interaction, and each must guarantee session.subscribe() has been called
@@ -262,19 +196,19 @@ function dequeueFreshQueuedPrompt(queue: QueuedPrompt[]): QueuedPrompt | undefin
 // has()/add()/attachSpanListener() sequence; extracted here so future
 // changes to the guard (or to attachSpanListener's argument list) only need
 // to be made once. Pure structural extraction — no behavior change: the
-// three call sites always passed session, tracer, resolved, pendingInput,
+// three call sites always passed session, tracer, resolved, promptQueues,
 // sessionSpanState (all closed over here identically) to attachSpanListener.
 function ensureSubscribed(
   session: AgentSessionInstance,
   tracer: Tracer,
   config: ResolvedPiInstrumentationConfig,
-  pendingInput: WeakMap<AgentSessionInstance, QueuedPrompt[]>,
+  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   subscribedSessions: WeakSet<AgentSessionInstance>,
   sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
 ): void {
   if (subscribedSessions.has(session)) return;
   subscribedSessions.add(session);
-  attachSpanListener(session, tracer, config, pendingInput, sessionSpanState);
+  attachSpanListener(session, tracer, config, promptQueues, sessionSpanState);
 }
 
 export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentationConfig): unknown {
@@ -331,14 +265,12 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
 
   const { tracer, forceFlush, ownsProvider } = tracing;
 
-  // Per-session FIFO queue, not a single slot: a second prompt() call can
-  // fire before the first run's agent_start event has arrived (overlapping
-  // runs on the same session), and each run's agent_start must claim the
-  // text from the prompt() call that actually triggered it, in order —
-  // never let a later prompt() call's text clobber an earlier one's.
-  const pendingInput = new WeakMap<AgentSessionInstance, QueuedPrompt[]>();
+  // Per-session input-attribution state (the FIFO prompt queue plus its
+  // remembered-text/retry-reservation fields) — see prompt-queue.ts for why
+  // it is per-session and how a run's agent_start claims the right text.
+  const promptQueues = new WeakMap<AgentSessionInstance, PromptQueue>();
   const subscribedSessions = new WeakSet<AgentSessionInstance>();
-  // Mirrors pendingInput: attachSpanListener() below creates one
+  // Mirrors promptQueues: attachSpanListener() below creates one
   // SessionSpanState per session and closes over it for its own subscribe()
   // callback, but AgentSession.prototype.dispose (patched once, below) has
   // no closure over any particular session — it needs this out-of-band map
@@ -409,135 +341,28 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
 
     const originalPrompt = proto.prompt;
     proto.prompt = function (this: AgentSessionInstance, text, options) {
-      // Before choosing a proactive (enumerate-the-early-returns) vs reactive
-      // (clean up by reference identity once THIS call's own promise settles)
-      // strategy here, the real question is: for the path that DOES reach
-      // _runAgentPrompt, is agent_start GUARANTEED to have already fired (and
-      // already shifted some queue entry) by the time prompt()'s own returned
-      // promise settles? Reading the real, installed
-      // @earendil-works/pi-coding-agent@0.80.6 source alone says yes:
-      // `_runAgentPrompt` is the last expression `prompt()` awaits, and inside
-      // it `await this.agent.prompt(messages)` cannot itself resolve before the
-      // underlying Agent has already emitted agent_start. That would make a
-      // purely reactive `result.finally(removeIfStillQueued)` sound in theory.
-      //
-      // It is NOT sound in practice for this specific FIFO design, though —
-      // verified empirically, not assumed: the very feature this queue exists
-      // for (two prompt() calls queuing before EITHER's agent_start has fired
-      // yet — see the "two overlapping prompt() calls" and retry/compaction
-      // continuation tests) means a still-genuinely-in-flight call's own
-      // promise can legitimately still be unsettled/settled independently of
-      // when ITS OWN agent_start arrives, from the perspective of anything
-      // that can only observe promise settlement, not the SDK's real internal
-      // ordering. Trying `result.finally(removeIfStillQueued)` here and running
-      // the full suite reproduced exactly that: 13 unrelated, previously-green
-      // tests started failing because their queued entries were reactively
-      // stripped before their own later-emitted agent_start could claim them.
-      // A reactive strategy is therefore the wrong choice here, regardless of
-      // what the raw promise-ordering guarantee alone would suggest — this
-      // package's own FIFO semantics don't preserve the "settle implies
-      // consumed" property a reactive check needs. Proactive enumeration,
-      // extended below to cover as many early-return paths as can be
-      // determined SYNCHRONOUSLY and precisely from public SDK surface, is the
-      // safe option.
-      //
-      // (a) isStreaming + streamingBehavior — verified against the real,
-      // installed SDK (dist/core/agent-session.js:812-824): when
-      // `this.isStreaming` is true and `options.streamingBehavior` is set,
-      // prompt() calls `_queueSteer`/`_queueFollowUp` (which inject the message
-      // into the CURRENTLY-running Agent loop, not a new run) and returns —
-      // `_runAgentPrompt` is never reached. `this.isStreaming` is read
-      // synchronously here, before `originalPrompt` is invoked — matching the
-      // real prompt()'s own synchronous read of the same getter.
-      const isStreamedQueueOnly = this.isStreaming === true && !!options?.streamingBehavior;
-      // (b) a leading "/" matched by a registered extension command — verified
-      // against the real, installed SDK (dist/core/agent-session.js:783-790):
-      // `if (expandPromptTemplates && text.startsWith("/")) { const handled =
-      // await this._tryExecuteExtensionCommand(text); if (handled) {
-      // preflightResult?.(true); return; } }`. This is decidable precisely
-      // (not just heuristically) from outside: _tryExecuteExtensionCommand's
-      // own command lookup (agent-session.js:903-908) parses the command name
-      // identically to below, and its try/catch (913-925) means ANY registered
-      // command — even one whose handler throws — still returns true. So a
-      // truthy `getCommand()` lookup via the SDK's own public
-      // `session.extensionRunner` getter (agent-session.js:2629-2630, and
-      // ExtensionRunner.getCommand is itself public — dist/core/extensions/
-      // runner.d.ts:128) deterministically means this call will never reach
-      // agent_start, with no false-positive case.
-      const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-      let matchesExtensionCommand = false;
-      if (expandPromptTemplates && typeof text === 'string' && text.startsWith('/')) {
-        const spaceIndex = text.indexOf(' ');
-        const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-        matchesExtensionCommand = !!this.extensionRunner?.getCommand?.(commandName);
-      }
-      // (c) any extension with an 'input' hook returning action: 'handled' —
-      // verified against the real, installed SDK (dist/core/agent-session.js:
-      // 794-799): `if (this._extensionRunner.hasHandlers("input")) { const
-      // inputResult = await this._extensionRunner.emitInput(...); if
-      // (inputResult.action === "handled") { preflightResult?.(true); return; }
-      // }`. Unlike (b), this is NOT precisely decidable from outside: whether a
-      // specific text ends up "handled" depends on the registered hook
-      // function's own logic, which this patch layer cannot inspect or
-      // pre-invoke (calling it ourselves to find out would double-invoke a
-      // potentially side-effecting extension). The best available signal is
-      // the SDK's own public `session.hasExtensionHandlers('input')`
-      // (agent-session.js:618, mirrors the exact same `hasHandlers("input")`
-      // check prompt() itself makes) — true whenever ANY 'input' hook is
-      // registered, whether or not it will actually intercept THIS text. This
-      // is a deliberate, documented best-effort heuristic, not a precise
-      // detection: a session with an 'input' hook that only intercepts SOME
-      // messages will, for every message it does NOT intercept, still take
-      // this proactive branch and skip queuing — losing that real run's
-      // input.value (falling back to agent_start's empty-queue heuristic)
-      // rather than corrupting a LATER call's attribution. That tradeoff —
-      // graceful degradation (a missing/stale input.value) over the
-      // cross-call corruption this queue exists to prevent — is preferred
-      // given the SDK exposes no way to precisely predict a specific hook's
-      // decision without invoking it. This (and the enumeration of early-return
-      // paths above) must be kept in sync with the SDK and may miss future
-      // early-return paths a later SDK version adds.
-      const mayBeHandledByInputHook = this.hasExtensionHandlers?.('input') === true;
-      const willQueueWithoutAgentStart =
-        isStreamedQueueOnly || matchesExtensionCommand || mayBeHandledByInputHook;
-      let entry: QueuedPrompt | undefined;
-      if (typeof text === 'string' && !willQueueWithoutAgentStart) {
-        entry = { text, enqueuedAt: Date.now() };
-        const queue = pendingInput.get(this);
-        if (queue) queue.push(entry);
-        else pendingInput.set(this, [entry]);
-      }
-      ensureSubscribed(this, tracer, resolved, pendingInput, subscribedSessions, sessionSpanState);
-      // A prompt() call that never reaches agent_start (a synchronous throw,
-      // or its returned Promise rejecting — e.g. a validation failure inside
-      // Pi's own prompt() before the agent loop starts) must not leave its
-      // text sitting in the FIFO queue: agent_start will never fire to shift()
-      // it back out, so it would otherwise silently become the wrong (stale)
-      // input text attached to whatever LATER, genuinely-successful prompt()
-      // call on this same session shifts it out instead — and every prompt()
-      // after that would be off by one, permanently. Remove by reference
-      // identity, not by string match, so a different still-pending queue
-      // entry that happens to hold an equal string is never removed instead.
-      // Deliberately still gated on rejection only (.catch(), not .finally())
-      // — see this function's opening comment for why widening this to also
-      // run on resolve is unsafe for this FIFO's own overlapping-call
-      // semantics, even though it would be sound against the raw SDK guarantee
-      // alone.
-      const removeIfStillQueued = (): void => {
-        if (!entry) return;
-        const queue = pendingInput.get(this);
-        if (!queue) return;
-        const idx = queue.indexOf(entry);
-        if (idx !== -1) queue.splice(idx, 1);
-      };
+      // Queue this call's text for its own agent_start to claim — unless it is
+      // a call that will never reach agent_start (shouldSkipQueue enumerates
+      // those early-return paths from public SDK surface). See prompt-queue.ts
+      // for the enqueue/claim contract and the proactive-vs-reactive rationale.
+      const promptQueue = getPromptQueue(promptQueues, this);
+      const entry =
+        typeof text === 'string' && !shouldSkipQueue(this, text, options)
+          ? promptQueue.enqueue(text)
+          : undefined;
+      ensureSubscribed(this, tracer, resolved, promptQueues, subscribedSessions, sessionSpanState);
+      // If this call throws synchronously or its promise rejects, it never
+      // reached agent_start, so its queued entry must be removed by reference
+      // identity before a LATER call mis-claims it (rejection only, not
+      // .finally() — see PromptQueue.removeIfStillQueued).
       let result: Promise<void>;
       try {
         result = originalPrompt.call(this, text, options);
       } catch (err) {
-        removeIfStillQueued();
+        promptQueue.removeIfStillQueued(entry);
         throw err;
       }
-      result.catch(removeIfStillQueued);
+      result.catch(() => promptQueue.removeIfStillQueued(entry));
       return result;
     };
     rollback.push(() => {
@@ -555,13 +380,13 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     // subsequent AgentEvent (agent_start through agent_end) silently produced
     // zero spans for the entire lifetime of that session.
     //
-    // Deliberately NOT enqueuing steer()/followUp() text into pendingInput the
-    // way prompt() does above: verified against the real, installed
+    // Deliberately NOT enqueuing steer()/followUp() text into the prompt queue
+    // the way prompt() does above: verified against the real, installed
     // @earendil-works/pi-agent-core@0.80.6 (dist/agent.js:169-176),
     // Agent.steer()/Agent.followUp() only ever push onto an internal queue —
     // neither one ever itself triggers a fresh run (only Agent.prompt()/
-    // continue() do, via runPromptMessages()). Because pendingInput is a FIFO
-    // consumed exclusively by agent_start, queuing steer()/followUp() text
+    // continue() do, via runPromptMessages()). Because the prompt queue is a
+    // FIFO consumed exclusively by agent_start, queuing steer()/followUp() text
     // into it would misattribute that text to whatever LATER, unrelated run's
     // agent_start happens to fire next — a worse bug than the "no tracing at
     // all" defect this patch fixes. Only patched when present as a function —
@@ -574,7 +399,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
           this,
           tracer,
           resolved,
-          pendingInput,
+          promptQueues,
           subscribedSessions,
           sessionSpanState,
         );
@@ -591,7 +416,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
           this,
           tracer,
           resolved,
-          pendingInput,
+          promptQueues,
           subscribedSessions,
           sessionSpanState,
         );
@@ -621,9 +446,9 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // (if it was ever subscribed) can still have an open rootSpan/llmSpan/
         // toolSpans that will now never see their normal close event. Force-
         // close them here first, exactly like agent_start's own dangling-span
-        // sweep, so they still export instead of leaking silently (a span
-        // that never has .end() called on it is never recorded/exported at
-        // all) — then delegate to the real dispose().
+        // sweep, so they still export instead of leaking silently (see
+        // safeCloseDanglingSpan on why a never-.end()ed span is never exported)
+        // — then delegate to the real dispose().
         const state = sessionSpanState.get(this);
         if (state) {
           // Whether this dispose() force-closed a still-open root span. If a
@@ -652,7 +477,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
             // called twice on the same session; a second call now takes the
             // same no-op path as a session with no SessionSpanState at all.
             sessionSpanState.delete(this);
-            pendingInput.delete(this);
+            promptQueues.delete(this);
             // subscribedSessions gates every "already subscribed?" check at
             // the top of proto.prompt/steer/followUp above. Nothing in the
             // real SDK stops a host from calling prompt()/steer()/followUp()
@@ -719,7 +544,7 @@ function attachSpanListener(
   session: AgentSessionInstance,
   tracer: Tracer,
   config: ResolvedPiInstrumentationConfig,
-  pendingInput: WeakMap<AgentSessionInstance, QueuedPrompt[]>,
+  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
 ): void {
   const state: SessionSpanState = {
@@ -728,8 +553,6 @@ function attachSpanListener(
     llmSpan: undefined,
     llmCtx: undefined,
     toolSpans: new Map(),
-    pendingInputText: undefined,
-    reserveInputForRetry: false,
     rootForceClosedBySweep: false,
   };
   // Reachable from AgentSession.prototype.dispose (patched once, in
@@ -739,7 +562,7 @@ function attachSpanListener(
 
   session.subscribe((event: AgentEvent) => {
     try {
-      handleEvent(event, session, tracer, config, pendingInput, state);
+      handleEvent(event, session, tracer, config, promptQueues, state);
     } catch (err) {
       // A handler throw must never reach Pi's event dispatcher — that would
       // crash or destabilize the host app's agent loop over a tracing bug.
@@ -756,7 +579,7 @@ function handleEvent(
   session: AgentSessionInstance,
   tracer: Tracer,
   config: ResolvedPiInstrumentationConfig,
-  pendingInput: WeakMap<AgentSessionInstance, QueuedPrompt[]>,
+  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   state: SessionSpanState,
 ): void {
   switch (event.type) {
@@ -778,60 +601,15 @@ function handleEvent(
       // no rootSpan to gate on. Without sweeping each one unconditionally,
       // that orphan would never be swept here and would either stay open
       // forever (tool span) or have its reference silently overwritten below
-      // without ever calling .end() on it (LLM span) — and a span that never
-      // has .end() called on it is never recorded/exported at all, not
-      // merely "left open".
+      // without ever calling .end() on it (LLM span) — see safeCloseDanglingSpan
+      // on why a never-.end()ed span is never exported, not merely "left open".
       sweepDanglingSpans(state, { includeRoot: true });
       const parentCtx = context.active();
-      // pendingInput is a per-session FIFO queue (see instrumentPiCodingAgent's
-      // own comment) — dequeue the oldest queued text so overlapping prompt()
-      // calls each hand their text to the correct run's agent_start, in order.
-      //
-      // EXCEPTION: if agent_end just reserved this exact next agent_start for
-      // a retry (state.reserveInputForRetry — set only when event.willRetry
-      // was true, see agent_end's comment below), that reservation wins even
-      // when the queue is non-empty. A retry's phantom continuation must
-      // reuse the retrying run's OWN text, never whatever a second, genuinely
-      // distinct prompt() call already queued behind it — see
-      // prompt-queue.test.ts's "reuses ITS OWN pendingInputText even when a
-      // second ... prompt() call is already queued behind it" test for the
-      // exact corruption this prevents. The
-      // flag is consumed here exactly once: it is set immediately before
-      // this specific agent_start (agent.continue() is called synchronously,
-      // with no other event able to interleave in between — see agent_end's
-      // comment), so it can never leak forward onto some LATER, unrelated
-      // agent_start.
-      //
-      // If the reservation is not set AND nothing is queued, this agent_start
-      // has NO corresponding new prompt() call at all. Verified against the
-      // real, installed @earendil-works/pi-coding-agent@0.80.6
-      // (dist/core/agent-session.js): AgentSession._runAgentPrompt() runs
-      // `while (await this._handlePostAgentRun()) { await
-      // this.agent.continue(); }`, and _handlePostAgentRun() returns true for
-      // THREE independent reasons — a retryable error, an ordinary
-      // auto-compaction continuation (_checkCompaction), or an
-      // extension-queued follow-up from its own agent_end handler
-      // (agent.hasQueuedMessages()) — and agent.continue() unconditionally
-      // emits a fresh agent_start in every case. None of those three push
-      // anything onto pendingInput, so an empty queue here (with no
-      // reservation active) means this run is a continuation of whichever
-      // run just used state.pendingInputText (deliberately left untouched by
-      // agent_end — see its comment) rather than a genuinely new call. This
-      // empty-queue heuristic is the best available fallback for compaction/
-      // follow-up specifically because — unlike a retry — the SDK gives no
-      // event field that distinguishes those two from a genuinely new call,
-      // so they cannot get the same positive-priority reservation a retry
-      // gets.
-      let inputText: string | undefined;
-      if (state.reserveInputForRetry) {
-        state.reserveInputForRetry = false;
-        inputText = state.pendingInputText;
-      } else {
-        const queue = pendingInput.get(session);
-        const queuedEntry = queue ? dequeueFreshQueuedPrompt(queue) : undefined;
-        inputText = queuedEntry ? queuedEntry.text : state.pendingInputText;
-      }
-      state.pendingInputText = inputText;
+      // Resolve this run's input text from its per-session PromptQueue: the
+      // oldest queued prompt() text, a retry reservation, or the remembered
+      // continuation text — the entire decision (and its rationale) lives in
+      // PromptQueue.claimForRun (see prompt-queue.ts).
+      const inputText = getPromptQueue(promptQueues, session).claimForRun();
       state.rootSpan = openRootSpan(tracer, parentCtx, {
         text: inputText,
         sessionId: session.sessionId,
@@ -948,64 +726,28 @@ function handleEvent(
       }
       state.rootSpan = undefined;
       state.rootCtx = undefined;
-      // Deliberately do NOT clear state.pendingInputText here, and do NOT
-      // gate reuse on event.willRetry. `willRetry` reflects ONLY Pi's
-      // auto-retry heuristic (computed purely from _isRetryableError on the
-      // last assistant message — verified against the real, installed
-      // @earendil-works/pi-coding-agent@0.80.6's
-      // AgentSession._willRetryAfterAgentEnd). But
-      // AgentSession._runAgentPrompt()'s own loop (`while (await
-      // this._handlePostAgentRun()) { await this.agent.continue(); }`)
-      // re-enters — firing a fresh agent_start with no corresponding new
-      // prompt() call — for two other, completely unrelated reasons too: an
-      // ordinary auto-compaction continuation (_checkCompaction returning
-      // true on a routine successful turn) and an extension queueing a
-      // follow-up message from its own agent_end handler
-      // (agent.hasQueuedMessages()). Both leave willRetry false, so gating
-      // the reuse on willRetry alone silently discarded the input text (or
-      // let the next agent_start mis-dequeue an unrelated queued call's
-      // text) on those two paths. Rather than special-case each mechanism
-      // here — this event carries no signal that distinguishes them —
-      // simply leave state.pendingInputText as whatever this run used.
-      // agent_start's own handler (see its comment) decides whether to reuse
-      // it (nothing new queued — a continuation of any kind) or overwrite it
-      // with a genuinely new prompt() call's text (queue non-empty).
-      //
-      // willRetry DOES get one extra, stronger guarantee on top of that
-      // shared fallback: when it's true, reserve this run's pendingInputText
-      // for the very next agent_start via a one-shot flag (consumed in
-      // agent_start's handler above), so the retry's phantom continuation
-      // reuses its own text even if a second, genuinely distinct prompt()
-      // call is already sitting at the front of the queue (see that test's
-      // "even when a second ... prompt() call is already queued behind it"
-      // case). This asymmetry — positive priority for retry, but only the
-      // weaker empty-queue heuristic for compaction/follow-up — exists
-      // because retry is the ONE reason _handlePostAgentRun() can return true
-      // that IS explicitly observable on this event (event.willRetry).
-      // Compaction and extension-queued-follow-up are not: both leave
-      // willRetry false and this event's shape ({messages, willRetry?}) has
-      // no other field to tell them apart from a genuinely new prompt() call,
-      // so there is no SDK signal available to give them the same strong
-      // guarantee — the empty-queue fallback is the best available
-      // approximation for those two.
+      // Arm the one-shot retry reservation when — and only when — Pi's own
+      // auto-retry heuristic says this run will retry (event.willRetry). The
+      // remembered input text is never cleared here (regardless of willRetry)
+      // so compaction/follow-up continuations still get the empty-queue
+      // fallback; retry alone is explicitly observable, so it alone gets the
+      // stronger reservation. See prompt-queue.ts for the full asymmetry.
       if (event.willRetry) {
-        state.reserveInputForRetry = true;
+        getPromptQueue(promptQueues, session).reserveForRetry();
       }
       break;
     }
     case 'auto_retry_end': {
       // The SDK cancelled the retry (session.abort() -> abortRetry() aborts
       // _prepareRetry's backoff sleep, which returns false so NO continuation
-      // agent_start fires) or exhausted it. Either way the reservation armed
-      // by agent_end{willRetry:true} above will never be consumed by a retry
-      // continuation; clear it so it can't be mis-consumed by a LATER,
-      // genuinely-new prompt() call's agent_start (which would then export
-      // that new run's span carrying the previous run's input.value, shifting
-      // every overlapping call off by one). Clearing on the retries-exhausted
+      // agent_start fires) or exhausted it. Either way the reservation armed by
+      // agent_end{willRetry:true} above will never be consumed by a retry
+      // continuation; clear it so a LATER, genuinely-new prompt() call's
+      // agent_start can't mis-consume it. Clearing on the retries-exhausted
       // path is harmless: willRetry is false at maxRetries so the reservation
       // was never armed there.
       if (event.success === false) {
-        state.reserveInputForRetry = false;
+        getPromptQueue(promptQueues, session).clearReservation();
       }
       break;
     }
