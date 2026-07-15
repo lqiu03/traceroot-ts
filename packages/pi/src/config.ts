@@ -40,7 +40,7 @@ export interface ResolvedPiInstrumentationConfig {
 // undefined so a degenerate value like "" or "///" falls through to the next
 // candidate instead of surviving as a truthy-but-unusable base URL.
 function normalizeBaseUrl(value: string | undefined): string | undefined {
-  const stripped = value?.replace(/\/+$/, '');
+  const stripped = value?.trim().replace(/\/+$/, '');
   return stripped ? stripped : undefined;
 }
 

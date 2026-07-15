@@ -236,8 +236,14 @@ export function closeRootSpan(
 ): void {
   setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
   if (captureContent) {
-    const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
+    try {
+      const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
+      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
+    } catch {
+      // content may be a malformed/non-array shape — skip rather than crash
+      // before endSpanSafe() below ever gets a chance to close the span,
+      // matching the defensive pattern openToolSpan/closeToolSpan already use.
+    }
   }
   endSpanSafe(span);
 }
@@ -258,7 +264,13 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
   if (captureContent) {
-    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
+    try {
+      setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
+    } catch {
+      // content may be a malformed/non-array shape — skip rather than crash
+      // before endSpanSafe() below ever gets a chance to close the span,
+      // matching the defensive pattern openToolSpan/closeToolSpan already use.
+    }
   }
   if (message.stopReason === 'error' || message.stopReason === 'aborted') {
     span.setStatus({
