@@ -10,6 +10,7 @@ import {
   OI_TRACE_SESSION_ID,
   TOOL_NAME,
 } from './constants';
+import { trySerialize } from './attributes';
 
 type ClaudeAgentSDKMessage = {
   type?: string;
@@ -175,14 +176,13 @@ const CLAUDE_AGENT_ATTRIBUTES = {
   TOTAL_COST_USD: 'claude_agent_sdk.total_cost_usd',
 } as const;
 
+// Pre-checks specific to this file's callers (pass a string through as-is
+// rather than JSON-quoting it, e.g. a tool's raw text response) on top of the
+// shared JSON.stringify-or-undefined primitive in attributes.ts.
 function tryStringify(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return undefined;
-  }
+  return trySerialize(value);
 }
 
 function setJsonAttribute(span: OTelSpan, key: string, value: unknown): void {

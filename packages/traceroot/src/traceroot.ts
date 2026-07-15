@@ -108,6 +108,32 @@ function isActivePropagator(): boolean {
   return current === _registeredPropagator;
 }
 
+/**
+ * Resets exactly the global trace/context/propagation slots THIS module's
+ * registration still owns, per the three independent ownership predicates
+ * above, and clears the bookkeeping fields that back them. Shared by
+ * shutdown() (the normal teardown path) and initialize()'s wiring-failure
+ * rollback (an abnormal teardown of a provider that only ever got as far as
+ * register()) — both need the identical per-slot ownership dance, and
+ * duplicating it would leave two copies of a subtle invariant to keep in
+ * sync. Does NOT touch _isInitialized, _provider, or call provider.shutdown()
+ * — callers own those since the two call sites differ on exactly those
+ * points (sync vs async, and what "provider" even means at that point).
+ */
+function _releaseGlobalSlots(provider: NodeTracerProvider | undefined): void {
+  if (provider && isActiveGlobalDelegate(provider)) {
+    trace.disable();
+  }
+  if (isActiveContextManager()) {
+    context.disable();
+  }
+  if (isActivePropagator()) {
+    propagation.disable();
+  }
+  _registeredContextManager = undefined;
+  _registeredPropagator = undefined;
+}
+
 export class TraceRoot {
   private constructor() {}
 
@@ -257,21 +283,10 @@ export class TraceRoot {
       // a retried initialize()'s new provider would lose the first-write-wins
       // race for slots this orphaned provider still holds — silently
       // stranding the process without a working export pipeline. Tear down
-      // exactly what this call registered, using the same per-slot ownership
-      // checks shutdown() uses, before re-throwing.
+      // exactly what this call registered before re-throwing.
       const orphaned = _provider;
-      if (orphaned && isActiveGlobalDelegate(orphaned)) {
-        trace.disable();
-      }
-      if (isActiveContextManager()) {
-        context.disable();
-      }
-      if (isActivePropagator()) {
-        propagation.disable();
-      }
+      _releaseGlobalSlots(orphaned);
       _provider = undefined;
-      _registeredContextManager = undefined;
-      _registeredPropagator = undefined;
       void orphaned?.shutdown().catch(() => {});
       throw error;
     }
@@ -317,17 +332,7 @@ export class TraceRoot {
     // distinguished here and will still see the reset -- an accepted
     // limitation.) _resetForTesting() below is unconditional because tests
     // always want a clean slate.
-    if (provider && isActiveGlobalDelegate(provider)) {
-      trace.disable();
-    }
-    if (isActiveContextManager()) {
-      context.disable();
-    }
-    if (isActivePropagator()) {
-      propagation.disable();
-    }
-    _registeredContextManager = undefined;
-    _registeredPropagator = undefined;
+    _releaseGlobalSlots(provider);
   }
 }
 
