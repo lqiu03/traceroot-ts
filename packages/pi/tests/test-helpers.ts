@@ -86,7 +86,38 @@ export function makeRig(config: Omit<PiInstrumentationConfig, 'apiKey' | '_spanE
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
   const sdk = { AgentSession: Session };
+  // instrumentPiCodingAgent() always runs in private mode here (a rig-local
+  // apiKey/_spanExporter, never a shared global provider), so every call
+  // registers its own process.once('beforeExit', flushOnExit) hook (see
+  // instrumentation.ts) and never removes it on a normal, successful
+  // install -- only a mid-setup failure rolls it back. That is a deliberate
+  // per-process-lifetime design for real hosts (each independently
+  // instrumented SDK object owns its own private OTLP pipeline and needs its
+  // own flush hook), but this rig is called fresh, in private mode, from
+  // every single test across ~10 files in this directory -- so without
+  // cleanup here, the process accumulates one live 'beforeExit' listener per
+  // test for the rest of the file's run, tripping Node's
+  // MaxListenersExceededWarning well before a consolidated file (e.g.
+  // spans-truncation.test.ts's 11 tests) finishes. No test in this package
+  // depends on that listener ever firing: everything here observes spans via
+  // CapturingExporter's own export() callback (invoked by the
+  // BatchSpanProcessor on span end), never via the beforeExit flush path
+  // (that path is exercised directly, with its own explicit cleanup, only by
+  // provider-shared-mode-behavior.test.ts). It is therefore safe to strip
+  // whatever this call added immediately after setup rather than leaving it
+  // live for the remainder of the process. Diffing
+  // process.listeners('beforeExit') before/after -- rather than assuming
+  // exactly one listener was added -- matches this package's own established
+  // idiom (see provider-shared-mode-behavior.test.ts) and stays correct even
+  // if a future config combination changes how many hooks a single call
+  // registers.
+  const beforeExitListenersBeforeSetup = new Set(process.listeners('beforeExit'));
   instrumentPiCodingAgent(sdk, { apiKey: 'test-key', _spanExporter: capture, ...config });
+  for (const listener of process.listeners('beforeExit')) {
+    if (!beforeExitListenersBeforeSetup.has(listener)) {
+      process.removeListener('beforeExit', listener);
+    }
+  }
   return { capture, Session };
 }
 

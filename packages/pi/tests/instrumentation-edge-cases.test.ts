@@ -21,8 +21,10 @@ function makeFakeSessionClass() {
   return class FakeAgentSession {
     sessionId = 'sess-1';
     private listeners: Array<(event: AgentEvent) => void> = [];
+    subscribeCallCount = 0;
     async prompt(_text: string, _options?: unknown): Promise<void> {}
     subscribe(listener: (event: AgentEvent) => void): () => void {
+      this.subscribeCallCount += 1;
       this.listeners.push(listener);
       return () => {
         this.listeners = this.listeners.filter((l) => l !== listener);
@@ -454,4 +456,119 @@ test('willRetry: true still closes the root span (one span per attempt), recordi
   );
   assert.equal(attrs(capture.spans[0]!)['traceroot.pi.will_retry'], true);
   assert.equal(attrs(capture.spans[1]!)['traceroot.pi.will_retry'], false);
+});
+
+test('a genuine second session.prompt() call after the first runs agent_end already fired cleanly produces a fully separate span tree, reusing the same subscribe() listener rather than re-subscribing', async () => {
+  const capture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  const sdk = { AgentSession: Session };
+  instrumentPiCodingAgent(sdk, { apiKey: 'k', _spanExporter: capture });
+  const session = new Session();
+
+  // Run 1: a full, clean turn with a tool call, then agent_end.
+  await session.prompt('first task');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-1-model' }) });
+  session.emit({ type: 'message_end', message: assistantMessage({ model: 'run-1-model' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'call-1',
+    toolName: 'bash',
+    args: { command: 'echo run1' },
+  });
+  session.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'call-1',
+    toolName: 'bash',
+    result: {},
+    isError: false,
+  });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'run1 done' }] })],
+    willRetry: false,
+  });
+
+  assert.equal(capture.spans.length, 3, 'run 1: root + LLM + tool span');
+
+  // Run 2: a genuine second call to prompt() on the SAME session instance
+  // (e.g. the user sends a second chat message), well after run 1's
+  // agent_end already tore its state down. Deliberately reuses run 1's
+  // toolCallId ("call-1") to prove a stale Map entry from run 1 cannot
+  // bleed into run 2 — agent_end already cleared state.toolSpans.
+  await session.prompt('second task');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
+  session.emit({ type: 'message_end', message: assistantMessage({ model: 'run-2-model' }) });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'call-1',
+    toolName: 'bash',
+    args: { command: 'echo run2' },
+  });
+  session.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'call-1',
+    toolName: 'bash',
+    result: {},
+    isError: false,
+  });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'run2 done' }] })],
+    willRetry: false,
+  });
+
+  assert.equal(
+    session.subscribeCallCount,
+    1,
+    'a second real prompt() call on the same session instance must not re-subscribe — the ' +
+      'subscribedSessions WeakSet guard must hold across repeated prompt() calls, not just ' +
+      'across repeated instrumentPiCodingAgent() calls',
+  );
+
+  assert.equal(capture.spans.length, 6, 'run 1 (3) + run 2 (3), none dropped or duplicated');
+
+  const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+  assert.equal(rootSpans.length, 2);
+  const run1Root = rootSpans.find((s) => attrs(s)['input.value'] === 'first task');
+  const run2Root = rootSpans.find((s) => attrs(s)['input.value'] === 'second task');
+  assert.ok(run1Root, "run 1's root span must carry run 1's own prompt text");
+  assert.ok(
+    run2Root,
+    "run 2's root span must carry run 2's own prompt text, not a stale copy of run 1's",
+  );
+  assert.equal(attrs(run1Root!)['output.value'], 'run1 done');
+  assert.equal(attrs(run2Root!)['output.value'], 'run2 done');
+  assert.notEqual(
+    run1Root!.spanContext().traceId,
+    run2Root!.spanContext().traceId,
+    'the two runs must live in genuinely separate traces',
+  );
+
+  const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.call.id'] === 'call-1');
+  assert.equal(toolSpans.length, 2, 'each run gets its own span despite reusing the toolCallId');
+  const run1Tool = toolSpans.find((s) => s.name.includes('run1'));
+  const run2Tool = toolSpans.find((s) => s.name.includes('run2'));
+  assert.ok(run1Tool);
+  assert.ok(run2Tool);
+  // ReadableSpan has no top-level traceId field — it lives under
+  // spanContext().traceId, matching how root-span trace ids are read above.
+  assert.notEqual(
+    run1Tool!.spanContext().traceId,
+    run2Tool!.spanContext().traceId,
+    "run 2's reused-id tool span must not be attached to run 1's trace",
+  );
+  assert.equal(
+    run1Tool!.spanContext().traceId,
+    run1Root!.spanContext().traceId,
+    "run 1's tool span must belong to run 1's own trace",
+  );
+  assert.equal(
+    run2Tool!.spanContext().traceId,
+    run2Root!.spanContext().traceId,
+    "run 2's tool span must belong to run 2's own trace, not leak forward from run 1's now-stale state",
+  );
 });

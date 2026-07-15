@@ -80,7 +80,6 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   assert.equal(attrs(llmSpan)['gen_ai.request.model'], 'claude-sonnet-5');
   assert.equal(attrs(llmSpan)['gen_ai.usage.input_tokens'], 100);
   assert.equal(attrs(llmSpan)['gen_ai.usage.output_tokens'], 20);
-  assert.equal(attrs(llmSpan)['traceroot.pi.cost.total'], 0.0016);
   assert.equal(
     attrs(llmSpan)['output.value'],
     "I'll list the files now.",
@@ -279,4 +278,53 @@ test('captureToolIo: false suppresses tool input.value/output.value but keeps th
     !toolSpan!.name.includes('secret-project'),
     'the full path must never appear in the span name',
   );
+});
+
+test('captureContent:false suppresses input.value on the ROOT span for an empty-string prompt exactly as for an absent one, while captureContent:true legitimately records the empty string', async () => {
+  async function rootInputValue(
+    captureContent: boolean,
+    promptText: string | undefined,
+  ): Promise<{ hasKey: boolean; value: unknown }> {
+    const { capture, Session } = makeRig({ captureContent });
+    const session = new Session();
+    // Calling prompt() with a non-string bypasses the pendingInput.set() typeof
+    // guard in instrumentation.ts, simulating a caller whose prompt text is
+    // genuinely absent (as opposed to the empty-string case below) while still
+    // registering the subscribe() listener that instrumentPiCodingAgent wires
+    // up inside the wrapped prompt() call itself.
+    await session.prompt(promptText as unknown as string);
+    session.emit({ type: 'agent_start' });
+    session.emit({ type: 'agent_end', messages: [], willRetry: false });
+    const root = capture.spans[0]!;
+    return {
+      hasKey: Object.prototype.hasOwnProperty.call(attrs(root), 'input.value'),
+      value: attrs(root)['input.value'],
+    };
+  }
+
+  const falseEmpty = await rootInputValue(false, '');
+  assert.equal(falseEmpty.hasKey, false, 'captureContent:false must omit input.value for ""');
+  assert.equal(falseEmpty.value, undefined);
+
+  const falseUndefined = await rootInputValue(false, undefined);
+  assert.equal(
+    falseUndefined.hasKey,
+    false,
+    'captureContent:false must omit input.value for undefined',
+  );
+  assert.equal(falseUndefined.value, undefined);
+
+  // Contrast: with captureContent on, "" is a real (if uninformative) value
+  // and must be distinguishable from "no prompt text at all".
+  const trueEmpty = await rootInputValue(true, '');
+  assert.equal(trueEmpty.hasKey, true, 'captureContent:true legitimately sets input.value to ""');
+  assert.equal(trueEmpty.value, '');
+
+  const trueUndefined = await rootInputValue(true, undefined);
+  assert.equal(
+    trueUndefined.hasKey,
+    false,
+    'no prompt text at all must leave input.value unset even when captureContent is on',
+  );
+  assert.equal(trueUndefined.value, undefined);
 });

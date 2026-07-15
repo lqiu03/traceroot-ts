@@ -8,13 +8,29 @@
  * for apiKey — plus one end-to-end check that an explicit empty-string
  * apiKey still disables instrumentation exactly like a missing one, proving
  * the safety net lives in instrumentPiCodingAgent() and not resolveConfig()
- * itself.
+ * itself. Also covers config immutability: instrumentPiCodingAgent() must
+ * snapshot the caller's config object at call time instead of holding a
+ * live reference that could change later.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { ExportResult } from '@opentelemetry/core';
+import { ExportResultCode } from '@opentelemetry/core';
+import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { resolveConfig } from '../src/config';
 import { instrumentPiCodingAgent } from '../src/instrumentation';
-import type { AgentEvent } from '../src/types';
+import type { AgentEvent, AssistantMessage } from '../src/types';
+
+// Copied locally per-file, matching every other tests/*.test.ts in this
+// package — no shared module-level exporter/session state across files.
+class CapturingExporter implements SpanExporter {
+  readonly spans: ReadableSpan[] = [];
+  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
+    this.spans.push(...spans);
+    resultCallback({ code: ExportResultCode.SUCCESS });
+  }
+  async shutdown(): Promise<void> {}
+}
 
 // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
 // patches AgentSession.prototype directly, so reusing one class across tests
@@ -34,6 +50,31 @@ function makeFakeSessionClass() {
       for (const listener of this.listeners) listener(event);
     }
   };
+}
+
+function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'done' }],
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    model: 'claude-sonnet-5',
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp: 0,
+    ...overrides,
+  } as AssistantMessage;
+}
+
+function attrs(span: ReadableSpan): Record<string, unknown> {
+  return span.attributes as Record<string, unknown>;
 }
 
 // TRACEROOT_API_KEY/TRACEROOT_HOST_URL are process-global mutable state — every
@@ -151,4 +192,60 @@ test('a slashes-only baseUrl ("///") also falls back to the default, not to an e
     const resolved = resolveConfig({ apiKey: 'k', baseUrl: '///' });
     assert.equal(resolved.baseUrl, 'https://app.traceroot.ai');
   });
+});
+
+test('instrumentPiCodingAgent() snapshots the config object at call time — mutating apiKey/captureContent/_spanExporter on the caller-owned object after the call returns has no effect on already-instrumented behavior', async () => {
+  const originalCapture = new CapturingExporter();
+  const mutatedCapture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  const sdk = { AgentSession: Session };
+
+  // A plain mutable object, exactly as a caller might build and later reuse
+  // or mutate it (e.g. a shared config object edited elsewhere in the host app).
+  const config = {
+    apiKey: 'original-key',
+    captureContent: true,
+    _spanExporter: originalCapture,
+  };
+
+  instrumentPiCodingAgent(sdk, config);
+
+  // Mutate every field AFTER instrumentPiCodingAgent() has already returned.
+  // resolveConfig() must have copied primitive values out (not retained a
+  // live reference to `config`) and must have captured the exporter object
+  // that was live at call time, not one assigned to the field afterward.
+  config.apiKey = 'mutated-key';
+  config.captureContent = false;
+  config._spanExporter = mutatedCapture;
+
+  const session = new Session();
+  await session.prompt('sensitive prompt text');
+  session.emit({ type: 'agent_start' });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'sensitive reply' }] })],
+    willRetry: false,
+  });
+
+  assert.equal(
+    mutatedCapture.spans.length,
+    0,
+    'the exporter assigned to config._spanExporter AFTER the call must never receive spans — ' +
+      'the pipeline was already built from the exporter that was live at call time',
+  );
+  assert.equal(
+    originalCapture.spans.length,
+    1,
+    'the exporter that was live at call time must still receive the span',
+  );
+
+  const [rootSpan] = originalCapture.spans;
+  assert.equal(
+    attrs(rootSpan!)['input.value'],
+    'sensitive prompt text',
+    'captureContent must still resolve to its call-time value (true), not the post-call ' +
+      'mutation to false — resolveConfig() must copy primitives by value, not hold a live ' +
+      'reference to the caller-owned config object',
+  );
+  assert.equal(attrs(rootSpan!)['output.value'], 'sensitive reply');
 });

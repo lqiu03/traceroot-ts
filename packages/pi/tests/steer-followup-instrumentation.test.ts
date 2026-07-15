@@ -27,7 +27,7 @@ import { assistantMessage, attrs, CapturingExporter, makeFakeSessionClass } from
 
 // Extends the shared FakeAgentSession with the standalone steer()/followUp()
 // entry points the base fixture deliberately omits (see test-helpers.ts, and
-// shared-mode-instrumentation.test.ts's own makeSteerableSessionClass, which
+// provider-shared-mode-behavior.test.ts's own makeSteerableSessionClass, which
 // adds steer() the same way for the same reason), so a host whose first
 // interaction is steer()/followUp() can be exercised here. Fresh per call,
 // like makeFakeSessionClass itself, so prototype patches never stack across

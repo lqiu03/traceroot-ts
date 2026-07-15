@@ -1,5 +1,5 @@
 /**
- * Lens: otel-context-and-span-parenting.
+ * Lens: span-context-parenting (formerly otel-context-and-span-parenting).
  *
  * Probes OTel Context/parent-span correctness across turn boundaries within
  * a single agent run: whether a turn-2 LLM span can accidentally inherit
@@ -9,9 +9,20 @@
  * preceding message_start for its turn correctly falls back to the root
  * span instead of a stale ended LLM context, and whether span.updateName()
  * in closeLlmSpan actually changes what the exporter captures.
+ *
+ * Also folds in two tests from the former
+ * confirmed-bugfix-regressions.test.ts grab-bag (its Bug 5):
+ * whether a stray event with NO rootCtx/llmCtx at all (no agent_start ever
+ * fired on the session) parents under whatever span happens to be ambiently
+ * active in the host process's own OTel context, instead of correctly
+ * starting a fresh standalone trace. Same subject — OTel Context/parent-span
+ * correctness — just probing the "nothing is open at all" edge instead of
+ * the "something else is open" edges the rest of this file covers.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { context, trace, ROOT_CONTEXT, TraceFlags } from '@opentelemetry/api';
+import type { Context, ContextManager, SpanContext } from '@opentelemetry/api';
 import type { ExportResult } from '@opentelemetry/core';
 import { ExportResultCode } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
@@ -51,7 +62,20 @@ function makeRig() {
   }
 
   const sdk = { AgentSession: FakeAgentSession };
+  // Always private mode (rig-local apiKey/_spanExporter, no shared global
+  // provider), so every call registers its own never-auto-removed
+  // process.once('beforeExit', ...) hook (see instrumentation.ts and
+  // test-helpers.ts's makeRig(), which documents this in full). No test here
+  // depends on the beforeExit hook actually firing, so it's safe to strip
+  // whatever was just added rather than let it accumulate for the rest of
+  // this file's 6 tests (and beyond, for anyone appending more).
+  const beforeExitListenersBeforeSetup = new Set(process.listeners('beforeExit'));
   instrumentPiCodingAgent(sdk, { apiKey: 'test-key', _spanExporter: capture });
+  for (const listener of process.listeners('beforeExit')) {
+    if (!beforeExitListenersBeforeSetup.has(listener)) {
+      process.removeListener('beforeExit', listener);
+    }
+  }
 
   return { capture, Session: FakeAgentSession };
 }
@@ -80,6 +104,49 @@ function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantM
 function attrs(span: ReadableSpan): Record<string, unknown> {
   return span.attributes as Record<string, unknown>;
 }
+
+// A minimal, real, synchronous ContextManager — needed because
+// @opentelemetry/api's default NoopContextManager makes context.with() a
+// no-op and context.active() always return ROOT_CONTEXT, which would make
+// the ambient-context-contamination bug untestable (it would look "fixed"
+// even against the buggy code, since context.active() and ROOT_CONTEXT are
+// otherwise indistinguishable without a manager registered). Registering
+// this reproduces what a host app's own real OTel setup (e.g.
+// AsyncHooksContextManager) does.
+class StackContextManager implements ContextManager {
+  private stack: Context[] = [ROOT_CONTEXT];
+  active(): Context {
+    return this.stack[this.stack.length - 1]!;
+  }
+  with<A extends unknown[], F extends (...args: A) => ReturnType<F>>(
+    ctx: Context,
+    fn: F,
+    thisArg?: ThisParameterType<F>,
+    ...args: A
+  ): ReturnType<F> {
+    this.stack.push(ctx);
+    try {
+      return fn.call(thisArg, ...args);
+    } finally {
+      this.stack.pop();
+    }
+  }
+  bind<T>(_ctx: Context, target: T): T {
+    return target;
+  }
+  enable(): this {
+    return this;
+  }
+  disable(): this {
+    return this;
+  }
+}
+
+const AMBIENT_SPAN_CONTEXT: SpanContext = {
+  traceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  spanId: 'aaaaaaaaaaaaaaaa',
+  traceFlags: TraceFlags.SAMPLED,
+};
 
 test('two back-to-back turns in one agent run each get their own LLM span parented under the shared root, not under each other', async () => {
   const { capture, Session } = makeRig();
@@ -325,4 +392,81 @@ test('closeLlmSpan span.updateName() changes the name the exporter actually capt
   // rename doesn't clobber the earlier-set attribute.
   assert.equal(attrs(llmSpan!)['gen_ai.request.model'], 'claude-sonnet-5-preview');
   assert.equal(attrs(llmSpan!)['gen_ai.response.model'], 'claude-sonnet-5-20260315');
+});
+
+test('a stray message_start with no rootCtx never parents under whatever span is ambiently active in the host process', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  await session.prompt('a stray assistant message with no agent_start ever fired');
+
+  const manager = new StackContextManager();
+  context.setGlobalContextManager(manager);
+  try {
+    const ambientCtx = trace.setSpanContext(context.active(), AMBIENT_SPAN_CONTEXT);
+    context.with(ambientCtx, () => {
+      session.emit({ type: 'message_start', message: assistantMessage() });
+      session.emit({ type: 'message_end', message: assistantMessage() });
+    });
+  } finally {
+    context.disable();
+  }
+
+  const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
+  assert.ok(llmSpan, 'the stray message still produces an LLM span');
+  assert.equal(
+    llmSpan!.parentSpanId,
+    undefined,
+    'with no rootCtx, the LLM span must start a fresh standalone trace (ROOT_CONTEXT), not ' +
+      'silently attach to whatever span the host process happens to have ambiently active',
+  );
+  assert.notEqual(
+    llmSpan!.spanContext().traceId,
+    AMBIENT_SPAN_CONTEXT.traceId,
+    'the stray LLM span must not join the ambient hosts trace',
+  );
+});
+
+test('a stray tool_execution_start with no llmCtx/rootCtx never parents under whatever span is ambiently active in the host process', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  await session.prompt('a stray tool call with no agent_start ever fired');
+
+  const manager = new StackContextManager();
+  context.setGlobalContextManager(manager);
+  try {
+    const ambientCtx = trace.setSpanContext(context.active(), AMBIENT_SPAN_CONTEXT);
+    context.with(ambientCtx, () => {
+      session.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'stray',
+        toolName: 'bash',
+        args: { command: 'echo stray' },
+      });
+      session.emit({
+        type: 'tool_execution_end',
+        toolCallId: 'stray',
+        toolName: 'bash',
+        result: {},
+        isError: false,
+      });
+    });
+  } finally {
+    context.disable();
+  }
+
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'stray');
+  assert.ok(toolSpan, 'the stray tool call still produces a tool span');
+  assert.equal(
+    toolSpan!.parentSpanId,
+    undefined,
+    'with no llmCtx/rootCtx, the tool span must start a fresh standalone trace, not silently ' +
+      'attach to whatever span the host process happens to have ambiently active',
+  );
+  assert.notEqual(
+    toolSpan!.spanContext().traceId,
+    AMBIENT_SPAN_CONTEXT.traceId,
+    'the stray tool span must not join the ambient hosts trace',
+  );
 });
