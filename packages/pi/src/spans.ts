@@ -110,23 +110,75 @@ function truncateJsonSafe(json: string): string {
 // with a zero/negative bound returns ''), so neither shape can push the
 // intermediate serialized output past the budget. truncateJsonSafe remains the
 // final backstop that appends the marker and enforces the hard length bound.
+//
+// The budget cannot be strings-only, though: a tool result that is a large
+// array of NON-string primitives (thousands of numbers or booleans — a numeric
+// grep/find result, a big matrix) has no oversized string for the per-field cap
+// to catch, so a strings-only replacer returned every element untouched and
+// JSON.stringify materialized the whole payload before truncateJsonSafe's
+// post-hoc slice ran — the exact O(N) blowup a running budget exists to
+// prevent. So numbers and booleans are charged against `remaining` too (by
+// their serialized width), and — critically — a large ARRAY is proactively
+// sliced when the replacer first reaches it, BEFORE JSON.stringify walks its
+// elements: one element serializes to at least one JSON char, so more than
+// `remaining` elements can never fit the budget regardless of content, and
+// slicing there (not merely collapsing each scalar one-by-one, which still
+// requires enumerating every element) is what keeps a huge array O(budget)
+// rather than O(N) to serialize. Once the budget is fully spent, every
+// remaining value collapses to its cheapest valid-JSON form so no further
+// content is embedded and no large container is walked deeper.
 function makeBudgetedReplacer(): (key: string, value: unknown) => unknown {
   let remaining = MAX_TOOL_IO_JSON_CHARS;
   return function budgetedReplacer(_key: string, value: unknown): unknown {
-    if (typeof value !== 'string') return value;
-    const capped =
-      value.length > MAX_TOOL_IO_JSON_CHARS
-        ? sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS)
-        : value;
-    if (capped.length <= remaining) {
-      remaining -= capped.length;
-      return capped;
+    // Budget spent: collapse every remaining value to the cheapest valid JSON so
+    // JSON.stringify neither embeds more content nor keeps walking a large
+    // container. null passes through (already the cheapest literal).
+    if (remaining <= 0) {
+      if (typeof value === 'string') return '';
+      if (typeof value === 'number') return 0;
+      if (typeof value === 'boolean') return false;
+      if (Array.isArray(value)) return [];
+      if (value !== null && typeof value === 'object') return {};
+      return value;
     }
-    // Crosses the running budget: emit only what's left (surrogate-safe) and
-    // spend the rest, so every subsequent string value is likewise cut to ''.
-    const fit = sliceSurrogateSafe(capped, remaining);
-    remaining = 0;
-    return fit;
+    if (typeof value === 'string') {
+      const capped =
+        value.length > MAX_TOOL_IO_JSON_CHARS
+          ? sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS)
+          : value;
+      if (capped.length <= remaining) {
+        remaining -= capped.length;
+        return capped;
+      }
+      // Crosses the running budget: emit only what's left (surrogate-safe) and
+      // spend the rest, so every subsequent value is likewise collapsed above.
+      const fit = sliceSurrogateSafe(capped, remaining);
+      remaining = 0;
+      return fit;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      // Charge the scalar's serialized width (e.g. "12345", "true") so a large
+      // array of non-string primitives drains the budget instead of slipping
+      // through uncounted the way it used to.
+      remaining -= String(value).length;
+      if (remaining < 0) remaining = 0;
+      return value;
+    }
+    if (Array.isArray(value)) {
+      if (value.length > remaining) {
+        // Cap the array to at most `remaining` elements up front, then append a
+        // truncation marker so the cut is self-evident in the payload.
+        // JSON.stringify only walks the sliced copy, so a million-element array
+        // costs O(budget), not O(N). truncateJsonSafe still enforces the final
+        // hard char bound on top.
+        return [...value.slice(0, remaining), TRUNCATION_MARKER];
+      }
+      return value;
+    }
+    // Plain object (or null): pass through while budget remains — its scalar
+    // leaves are charged as the walk reaches them, and any nested array is
+    // sliced when the replacer reaches it in turn.
+    return value;
   };
 }
 
