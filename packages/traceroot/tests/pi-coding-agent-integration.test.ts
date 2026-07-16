@@ -1,20 +1,17 @@
 /**
- * Real cross-package integration: drives the ACTUAL built @traceroot-ai/pi
- * through a REAL TraceRoot.initialize({ instrumentModules }) call — no
- * Module._load interception, no mocked pi export. This is the end-to-end proof
- * that the shared-pipeline wiring works: initialize() lazy-loads the real pi
- * package, threads its own resolved apiKey down to it (with TRACEROOT_API_KEY
- * unset, so the apiKey MUST arrive via config, not the env fallback), pi
- * detects TraceRoot's freshly-registered global provider and runs in shared
- * mode, and the spans pi produces land in TraceRoot's own pipeline WITH
+ * Real cross-package integration: drives the ACTUAL in-tree pi instrumentation
+ * (packages/traceroot/src/pi/) through a REAL TraceRoot.initialize({
+ * instrumentModules }) call — no Module._load interception, no mocked pi
+ * export. This is the end-to-end proof that the shared-pipeline wiring works:
+ * initialize() calls instrumentPiCodingAgent() directly, pi auto-discovers
+ * TraceRoot's freshly-registered global provider and runs in shared mode
+ * (this in-tree integration never builds an export pipeline of its own), and
+ * the spans pi produces land in TraceRoot's own pipeline WITH
  * TraceRootSpanProcessor's enrichment (environment / git repo / git ref /
  * span path) applied.
  *
  * Every other pi<->traceroot test mocks one side or the other; this one mocks
- * neither. It fails against the pre-shared-pipeline state (where pi silently
- * no-ops because it never receives an apiKey and gates instrumentation on one
- * before the shared-vs-private decision) and passes once the plumbing is in
- * place.
+ * neither.
  */
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -97,10 +94,10 @@ afterEach(() => {
   _resetForTesting();
 });
 
-test('the real @traceroot-ai/pi wired through TraceRoot.initialize exports enriched spans into TraceRoot own pipeline', async () => {
-  // Unset so the apiKey can only reach pi via initialize()'s config plumbing,
-  // never the TRACEROOT_API_KEY env fallback — this is the P0 that made pi
-  // silently no-op before the fix.
+test('the real in-tree pi instrumentation wired through TraceRoot.initialize exports enriched spans into TraceRoot own pipeline', async () => {
+  // Irrelevant to this in-tree integration (it builds no export pipeline of
+  // its own and threads no apiKey), but unset for parity with how a real
+  // host would configure TraceRoot without env-var credentials.
   delete process.env.TRACEROOT_API_KEY;
 
   const pi = makePiModule();
@@ -141,11 +138,11 @@ test('the real @traceroot-ai/pi wired through TraceRoot.initialize exports enric
   const rootSpan = spans.find((s) => spanKind(s) === 'AGENT');
   const llmSpan = spans.find((s) => spanKind(s) === 'LLM');
 
-  // The core proof: the real pi package actually produced spans through
-  // TraceRoot's shared provider (pre-fix this array is empty — pi no-op'd).
+  // The core proof: the real in-tree pi instrumentation actually produced
+  // spans through TraceRoot's shared provider.
   assert.ok(
     rootSpan,
-    'the real @traceroot-ai/pi must export an AGENT root span through TraceRoot shared provider',
+    'the real in-tree pi instrumentation must export an AGENT root span through TraceRoot shared provider',
   );
 
   // pi span shape survived the real round trip.

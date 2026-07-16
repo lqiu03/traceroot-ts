@@ -270,10 +270,7 @@ export class TraceRoot {
     _registeredPropagator = registerConfig.propagator;
 
     try {
-      // Thread the resolved apiKey/baseUrl so a lazily-wired pi pipeline gets
-      // them even when the host configured TraceRoot programmatically and never
-      // set TRACEROOT_API_KEY (see wirePiCodingAgentInstrumentation()).
-      wireInstrumentations(options.instrumentModules, { apiKey, baseUrl });
+      wireInstrumentations(options.instrumentModules);
     } catch (error) {
       // register() above already won the global trace/context/propagation
       // slots. If wiring then throws (e.g. a misshaped instrumentModules

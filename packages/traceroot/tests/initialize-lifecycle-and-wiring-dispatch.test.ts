@@ -17,10 +17,11 @@
  *    coverage for a leak where shutdown() never removed the listener initialize()
  *    installed, so each cycle left one behind permanently.
  *
- * These drive the REAL initialize() end to end (the pi path lazy-loads the real
- * @traceroot-ai/pi and patches a fake AgentSession's prototype, which is the
- * observable used to prove pi wiring actually ran). A local, unroutable baseUrl
- * keeps the OTLP exporter from ever touching the network.
+ * These drive the REAL initialize() end to end (the pi path calls straight into
+ * the in-tree instrumentPiCodingAgent(), which patches a fake AgentSession's
+ * prototype -- that patch is the observable used to prove pi wiring actually
+ * ran). A local, unroutable baseUrl keeps the OTLP exporter from ever touching
+ * the network.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,9 +39,9 @@ function activeProvider(): unknown {
 }
 
 // A fake `import * as pi from '@earendil-works/pi-coding-agent'` namespace. The
-// real @traceroot-ai/pi patches AgentSession.prototype.prompt when wired, so a
-// change in that method's identity is a reliable "pi was actually instrumented"
-// signal without having to drive a whole agent turn.
+// real in-tree pi instrumentation patches AgentSession.prototype.prompt when
+// wired, so a change in that method's identity is a reliable "pi was actually
+// instrumented" signal without having to drive a whole agent turn.
 function makePiModule() {
   class FakeAgentSession {
     sessionId = 'core-wiring-sess';

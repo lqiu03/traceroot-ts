@@ -1,19 +1,10 @@
 // src/instrumentation.ts
 import { registerInstrumentations, type Instrumentation } from '@opentelemetry/instrumentation';
-import type { PiInstrumentationConfig } from '@traceroot-ai/pi';
+import type { PiInstrumentationConfig } from './pi/config';
+import { instrumentPiCodingAgent } from './pi/instrumentation';
 import type { InitializeOptions, PiCodingAgentInstrumentation } from './types';
 import { wireOpenAIAgentsProcessor } from './openai-agents';
 import { wireClaudeAgentSDKInstrumentation } from './claude-agent-sdk';
-
-/**
- * initialize()'s own resolved apiKey/baseUrl, threaded down to the pi
- * package so a host that configured TraceRoot programmatically (never via the
- * TRACEROOT_API_KEY env var) still gets pi instrumented.
- */
-interface PiInstrumentationDefaults {
-  apiKey?: string;
-  baseUrl?: string;
-}
 
 type InstrumentationWithManualPatch = Instrumentation & {
   manuallyInstrument(moduleRef: unknown): void;
@@ -41,21 +32,6 @@ function loadInstrumentation(pkg: string, exportName: string): InstrumentationCt
 }
 
 /**
- * Extracts the missing module specifier from a Node MODULE_NOT_FOUND error
- * message, whose format is stably `Cannot find module '<specifier>'`. Returns
- * undefined when no specifier can be parsed (a non-string message, or a future
- * message-format change), so callers can fall back conservatively rather than
- * mislabel. Used by wirePiCodingAgentInstrumentation() to tell "@traceroot-ai/pi
- * itself is absent" from "@traceroot-ai/pi is present but a dependency deeper
- * inside it is missing".
- */
-function parseMissingModuleSpecifier(message: unknown): string | undefined {
-  if (typeof message !== 'string') return undefined;
-  const match = message.match(/Cannot find module '([^']+)'/);
-  return match ? match[1] : undefined;
-}
-
-/**
  * An `instrumentModules.piCodingAgent` value is the bare `{ module, config }`
  * wrapper form (as opposed to a raw `@earendil-works/pi-coding-agent` module
  * ref) when it carries a `module` property and is NOT itself a pi module
@@ -75,108 +51,30 @@ function isPiCodingAgentWrapper(entry: unknown): entry is PiCodingAgentInstrumen
 }
 
 /**
- * Lazy-loads @traceroot-ai/pi and delegates to its instrumentPiCodingAgent(),
- * threading initialize()'s own resolved apiKey/baseUrl (and any explicit
- * per-module config) down to it.
+ * Unwraps the { module, config } form if given, then delegates directly to
+ * the in-tree instrumentPiCodingAgent() (./pi/instrumentation) -- mirroring
+ * how wireClaudeAgentSDKInstrumentation() below calls straight into its
+ * in-tree integration, with no dynamic require() and no missing-optional-peer
+ * diagnosis: pi is a core module now, not a separately-installed package.
  *
- * pi still auto-discovers the already-registered global provider on its own
- * (this function only ever runs from inside wireInstrumentations(), which
- * TraceRoot.initialize() only calls AFTER _provider.register() has completed
- * -- see traceroot.ts -- so the provider is guaranteed live by the time
- * instrumentPiCodingAgent() checks for it). But pi's own config-resolution
- * still gates the private-provider fallback on an apiKey, and a host that
- * configured TraceRoot programmatically never populates TRACEROOT_API_KEY --
- * so the apiKey/baseUrl MUST be passed explicitly here, or pi silently no-ops.
+ * Unlike claudeAgentSDK, pi keeps its own `config` (captureContent/
+ * captureToolIo) -- that divergence is intentional (see PiCodingAgentInstrumentation
+ * in types.ts) and passes straight through unmerged with anything else;
+ * there is no apiKey/baseUrl to thread, since this in-tree integration builds
+ * no export pipeline of its own (see pi/config.ts's module header).
  *
- * Only the require() is wrapped in try/catch, matching loadInstrumentation()'s
- * contract: a missing optional peer package warns and no-ops rather than
- * crashing initialize(), exactly like a missing OpenInference package does.
  * A failure thrown by instrumentPiCodingAgent() itself is intentionally NOT
- * caught -- it surfaces, just as a throwing new Ctor()/manuallyInstrument()
+ * caught here -- it surfaces, just as a throwing new Ctor()/manuallyInstrument()
  * does in the OpenInference loop below.
  */
-function wirePiCodingAgentInstrumentation(
-  entry: unknown,
-  defaults: PiInstrumentationDefaults,
-): void {
-  let instrumentPiCodingAgent:
-    | ((sdk: unknown, config?: PiInstrumentationConfig) => unknown)
-    | undefined;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pkg = require('@traceroot-ai/pi') as { instrumentPiCodingAgent?: unknown };
-    if (typeof pkg.instrumentPiCodingAgent === 'function') {
-      instrumentPiCodingAgent = pkg.instrumentPiCodingAgent as typeof instrumentPiCodingAgent;
-    }
-  } catch (err) {
-    // Distinguish a genuinely-absent optional peer package from one that IS
-    // installed but fails to load (a syntax error, a throwing top-level side
-    // effect, a broken transitive dependency). The former is the expected,
-    // benign "you didn't install the optional peer" case; the latter is a real
-    // defect whose diagnostic must NOT be discarded behind a misleading "not
-    // installed" message.
-    //
-    // MODULE_NOT_FOUND alone does NOT prove the peer is absent: Node throws the
-    // identical code when @traceroot-ai/pi IS installed but one of ITS OWN
-    // require() calls fails to resolve a transitive/peer dependency. And the
-    // requireStack is populated in BOTH cases (verified empirically — a
-    // top-level miss lists the caller, a nested miss lists the pi file that
-    // required it), so its mere presence can't tell them apart either. The one
-    // reliable signal is WHICH specifier Node reports as missing: its message
-    // is always `Cannot find module '<specifier>'`. When that specifier is
-    // @traceroot-ai/pi itself, the top-level require failed — genuinely not
-    // installed. When it's some OTHER specifier, the package was found and
-    // started loading before a dependency deeper inside it was missing —
-    // installed but broken.
-    const error = err as { code?: unknown; message?: unknown } | null;
-    const missingSpecifier =
-      error?.code === 'MODULE_NOT_FOUND' ? parseMissingModuleSpecifier(error.message) : undefined;
-    // Treat an unparseable MODULE_NOT_FOUND message as "pi itself missing" so
-    // the common, benign not-installed case is never mislabeled; only a
-    // confidently-different specifier routes to the broken-install branch.
-    const isPiItselfMissing =
-      error?.code === 'MODULE_NOT_FOUND' &&
-      (missingSpecifier === undefined || missingSpecifier === '@traceroot-ai/pi');
-    if (isPiItselfMissing) {
-      console.warn(
-        '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi is not ' +
-          'installed. Install it: npm install @traceroot-ai/pi',
-      );
-    } else {
-      console.warn(
-        '[TraceRoot] instrumentModules.piCodingAgent was provided but @traceroot-ai/pi failed to ' +
-          'load — it appears installed but broken (bad build, syntax error, or a failing ' +
-          'dependency). The original error follows:',
-        err,
-      );
-    }
-    return;
-  }
-  if (!instrumentPiCodingAgent) {
-    console.warn(
-      '[TraceRoot] @traceroot-ai/pi is installed but does not export instrumentPiCodingAgent(). ' +
-        'Check your installed version.',
-    );
-    return;
-  }
-
-  // Unwrap the { module, config } form if given, then merge: an explicit
-  // per-module apiKey/baseUrl wins, otherwise initialize()'s resolved defaults
-  // fill in. captureContent/captureToolIo (and any other config field) pass
-  // straight through from the explicit config so the caller's PII controls
-  // reach pi verbatim.
+function wirePiCodingAgentInstrumentation(entry: unknown): void {
   let mod: unknown = entry;
   let explicitConfig: PiInstrumentationConfig | undefined;
   if (isPiCodingAgentWrapper(entry)) {
     mod = entry.module;
     explicitConfig = entry.config;
   }
-  const config: PiInstrumentationConfig = {
-    ...explicitConfig,
-    apiKey: explicitConfig?.apiKey ?? defaults.apiKey,
-    baseUrl: explicitConfig?.baseUrl ?? defaults.baseUrl,
-  };
-  instrumentPiCodingAgent(mod, config);
+  instrumentPiCodingAgent(mod, explicitConfig);
 }
 
 /**
@@ -193,7 +91,6 @@ function wirePiCodingAgentInstrumentation(
  */
 export function wireInstrumentations(
   instrumentModules: InitializeOptions['instrumentModules'],
-  piDefaults: PiInstrumentationDefaults = {},
 ): void {
   if (instrumentModules === undefined) {
     // Auto-instrumentation via require-in-the-middle (CJS only).
@@ -230,7 +127,7 @@ export function wireInstrumentations(
     wireOpenAIAgentsProcessor(instrumentModules.openaiAgents);
   }
   if (instrumentModules.piCodingAgent) {
-    wirePiCodingAgentInstrumentation(instrumentModules.piCodingAgent, piDefaults);
+    wirePiCodingAgentInstrumentation(instrumentModules.piCodingAgent);
   }
 
   if (instrs.length > 0) {
