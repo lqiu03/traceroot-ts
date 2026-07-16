@@ -1,5 +1,5 @@
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
-import type { Context, Span as OTelSpan, SpanOptions, Tracer } from '@opentelemetry/api';
+import type { Context, Span as OTelSpan } from '@opentelemetry/api';
 import {
   OI_INPUT_VALUE,
   OI_LLM_MODEL_NAME,
@@ -10,6 +10,8 @@ import {
   OI_TRACE_SESSION_ID,
   TOOL_NAME,
 } from './constants';
+import { createReresolvingTracer } from './reresolving-tracer';
+import type { SpanFactory } from './reresolving-tracer';
 import { trySerialize } from './attributes';
 
 type ClaudeAgentSDKMessage = {
@@ -90,10 +92,6 @@ type ActiveLLMSpanState = {
   span: OTelSpan;
 };
 
-// wrapQuery() only ever calls startSpan on the re-resolving tracer, so narrow
-// to just that method rather than carrying the full Tracer surface.
-type SpanFactory = Pick<Tracer, 'startSpan'>;
-
 type QueryState = {
   accumulatedOutputTokens: number;
   activeLLMSpansByParent: Map<string, ActiveLLMSpanState>;
@@ -117,29 +115,6 @@ const ROOT_LLM_PARENT_KEY = '__root__';
 const LLM_SPAN_NAME = 'anthropic.messages.create';
 const QUERY_SPAN_NAME = 'ClaudeAgent.query';
 const TRACER_NAME = '@traceroot-ai/claude-agent-sdk';
-
-// trace.disable() (called by TraceRoot.shutdown()) swaps the OTel API's
-// internal ProxyTracerProvider for a brand-new instance rather than mutating
-// the old one, so a Tracer captured once at wrap time (via a single
-// trace.getTracer() call) stays permanently bound to the old, now-detached
-// provider -- after a shutdown()/initialize() cycle every span it opens goes
-// silently dark. wrapQuery()'s WRAPPED guard also means the module is only
-// ever wrapped once, so there is no later re-wrap to pick up a fresh tracer.
-// Re-resolve through the global `trace` facade on every span-open instead,
-// mirroring ProxyTracer's own lazy-delegate-rebind pattern one level up and
-// pi's identical fix in packages/pi/src/provider.ts
-// (createReresolvingSharedTracer): whatever TracerProvider is globally
-// active at the moment a span is opened is the one that span routes to. In
-// steady state (no disable() ever called) this behaves identically to a
-// tracer captured once.
-function createReresolvingTracer(): SpanFactory {
-  const resolveTracer = (): Tracer => trace.getTracer(TRACER_NAME);
-  return {
-    startSpan(name: string, options?: SpanOptions, ctx?: Context): OTelSpan {
-      return resolveTracer().startSpan(name, options, ctx);
-    },
-  };
-}
 
 const OI_SPAN_KIND_VALUE = {
   AGENT: 'AGENT',
@@ -803,7 +778,7 @@ function endInFlight(state: QueryState, status?: { code: SpanStatusCode; message
 function wrapQuery(
   original: NonNullable<ClaudeAgentSDKModule['query']>,
 ): NonNullable<ClaudeAgentSDKModule['query']> {
-  const tracer = createReresolvingTracer();
+  const tracer = createReresolvingTracer(TRACER_NAME);
 
   return function wrappedQuery(
     params: ClaudeAgentSDKQueryParams,
