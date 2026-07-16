@@ -70,7 +70,10 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   assert.equal(rootSpan.name, 'AgentSession.prompt');
   assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
   assert.equal(attrs(rootSpan)['session.id'], 'sess-1');
-  assert.equal(attrs(rootSpan)['traceroot.sdk.name'], 'traceroot-pi');
+  // pi no longer self-stamps traceroot.sdk.name; core's TraceRootSpanProcessor
+  // owns it uniformly (matching the Claude Agent SDK integration). This rig
+  // wires no such processor, so the attribute is absent here.
+  assert.equal(attrs(rootSpan)['traceroot.sdk.name'], undefined);
   assert.equal(attrs(rootSpan)['input.value'], 'list files in /tmp');
   assert.equal(attrs(rootSpan)['output.value'], 'listed the files');
   assert.equal(attrs(rootSpan)['traceroot.pi.will_retry'], false);

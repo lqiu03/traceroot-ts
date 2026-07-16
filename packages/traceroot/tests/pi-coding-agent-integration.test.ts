@@ -150,7 +150,11 @@ test('the real in-tree pi instrumentation wired through TraceRoot.initialize exp
   assert.equal(attrOf(rootSpan!)['session.id'], 'integration-sess');
   assert.equal(attrOf(rootSpan!)['input.value'], 'summarize the repository');
   assert.equal(attrOf(rootSpan!)['output.value'], 'the repository has three packages');
-  assert.equal(attrOf(rootSpan!)['traceroot.sdk.name'], 'traceroot-pi');
+  // pi no longer self-stamps SDK identity on its root span; core's
+  // TraceRootSpanProcessor.onStart owns traceroot.sdk.name uniformly across
+  // every span (same as the Claude Agent SDK integration), so the shared
+  // pipeline's 'traceroot-ts' stamp is the expected value here.
+  assert.equal(attrOf(rootSpan!)['traceroot.sdk.name'], 'traceroot-ts');
 
   // TraceRootSpanProcessor enrichment was applied to pi's span on the way out
   // — this is what proves the spans travelled through TraceRoot's OWN pipeline,

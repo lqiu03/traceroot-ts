@@ -231,7 +231,7 @@ test('closeRootSpan records will_retry=false when willRetry is undefined (Boolea
   assert.equal(attrs(spans[0]!)['traceroot.pi.will_retry'], false);
 });
 
-test('openRootSpan sets session id and sdk identity, and gates input.value on captureContent', () => {
+test('openRootSpan sets session id, does not self-stamp sdk identity, and gates input.value on captureContent', () => {
   const { tracer, spans } = makeTracer();
   const withContent = openRootSpan(tracer, ROOT_CONTEXT, {
     text: 'my prompt',
@@ -243,7 +243,10 @@ test('openRootSpan sets session id and sdk identity, and gates input.value on ca
   assert.equal(a['openinference.span.kind'], 'AGENT');
   assert.equal(a['session.id'], 'sess-9');
   assert.equal(a['input.value'], 'my prompt');
-  assert.equal(a['traceroot.sdk.name'], 'traceroot-pi');
+  // pi no longer self-stamps traceroot.sdk.name; core's TraceRootSpanProcessor
+  // owns it uniformly (matching the Claude Agent SDK integration). This unit
+  // harness has no such processor, so the attribute is absent here.
+  assert.equal(a['traceroot.sdk.name'], undefined);
 
   const { tracer: t2, spans: s2 } = makeTracer();
   const noContent = openRootSpan(t2, ROOT_CONTEXT, {

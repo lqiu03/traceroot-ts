@@ -3,16 +3,18 @@
  *
  * Attribute triad (matching every other traceroot-ts integration):
  * OpenInference span-kind/input/output (internal, drives UI rendering),
- * standard OTel gen_ai.* semconv, and a traceroot.* namespace for SDK
- * identity. Span path/ids_path (Mastra's live-ancestry feature) is not
+ * standard OTel gen_ai.* semconv, and a traceroot.pi.* namespace for
+ * retry/force-close markers. SDK identity (traceroot.sdk.name/version) is
+ * NOT stamped here — core's TraceRootSpanProcessor.onStart owns it uniformly
+ * across every span, matching the Claude Agent SDK integration.
+ * Span path/ids_path (Mastra's live-ancestry feature) is not
  * emitted here — Pi delivers a discrete AgentEvent per lifecycle step, so
  * parent/child relationships are already explicit via OTel Context, not
  * reconstructed from a flat event stream the way Mastra's exporter does.
  */
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import type { Context, Span } from '@opentelemetry/api';
-import { SDK_NAME } from './config';
-import { SDK_VERSION } from '../processor';
+import { OI_INPUT_VALUE, OI_OUTPUT_VALUE, OI_SPAN_KIND, OI_TRACE_SESSION_ID } from '../constants';
 import { describeToolCallSpan } from './span-name';
 import { sliceSurrogateSafe } from './surrogate-safe';
 import type { AgentMessage, AssistantMessage } from './types';
@@ -21,19 +23,12 @@ import type { SpanFactory } from '../reresolving-tracer';
 // Span path keys intentionally omitted — see file header. Everything else
 // mirrors packages/mastra/src/exporter.ts's attribute constant shape.
 const TR_ATTRIBUTES = {
-  SDK_NAME: 'traceroot.sdk.name',
-  SDK_VERSION: 'traceroot.sdk.version',
   WILL_RETRY: 'traceroot.pi.will_retry',
   FORCE_CLOSED: 'traceroot.pi.force_closed',
 } as const;
 
-// OpenInference semconv keys — internal only, not exposed in public API.
-const OI_ATTRIBUTES = {
-  SPAN_KIND: 'openinference.span.kind',
-  INPUT_VALUE: 'input.value',
-  OUTPUT_VALUE: 'output.value',
-  SESSION_ID: 'session.id',
-} as const;
+// OpenInference semconv keys are imported from ../constants (single source of
+// truth shared with claude-agent-sdk.ts), not re-defined locally.
 
 // gen_ai semconv (standard, used by multiple platforms). Pi emits ONLY the
 // gen_ai.* family (gen_ai.request.model, gen_ai.response.model,
@@ -225,11 +220,9 @@ export function openRootSpan(
   input: { text: string | undefined; sessionId: string | undefined; captureContent: boolean },
 ): Span {
   const span = tracer.startSpan('AgentSession.prompt', { kind: SpanKind.INTERNAL }, parentCtx);
-  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'AGENT');
-  setAttr(span, OI_ATTRIBUTES.SESSION_ID, input.sessionId);
-  setAttr(span, TR_ATTRIBUTES.SDK_NAME, SDK_NAME);
-  setAttr(span, TR_ATTRIBUTES.SDK_VERSION, SDK_VERSION);
-  if (input.captureContent) setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, input.text);
+  setAttr(span, OI_SPAN_KIND, 'AGENT');
+  setAttr(span, OI_TRACE_SESSION_ID, input.sessionId);
+  if (input.captureContent) setAttr(span, OI_INPUT_VALUE, input.text);
   return span;
 }
 
@@ -242,7 +235,7 @@ export function closeRootSpan(
   setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
   if (captureContent) {
     const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(lastAssistant));
+    setAttr(span, OI_OUTPUT_VALUE, textOf(lastAssistant));
   }
   endSpanSafe(span);
 }
@@ -253,7 +246,7 @@ export function openLlmSpan(
   message: AssistantMessage,
 ): Span {
   const span = tracer.startSpan(message.model || 'pi.llm', { kind: SpanKind.CLIENT }, parentCtx);
-  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'LLM');
+  setAttr(span, OI_SPAN_KIND, 'LLM');
   setAttr(span, GEN_AI_ATTRIBUTES.SYSTEM, message.provider);
   setAttr(span, GEN_AI_ATTRIBUTES.REQUEST_MODEL, message.model);
   return span;
@@ -267,7 +260,7 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
   if (captureContent) {
-    setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, textOf(message));
+    setAttr(span, OI_OUTPUT_VALUE, textOf(message));
   }
   if (message.stopReason === 'error' || message.stopReason === 'aborted') {
     span.setStatus({
@@ -291,14 +284,14 @@ export function openToolSpan(
     { kind: SpanKind.INTERNAL },
     parentCtx,
   );
-  setAttr(span, OI_ATTRIBUTES.SPAN_KIND, 'TOOL');
+  setAttr(span, OI_SPAN_KIND, 'TOOL');
   setAttr(span, GEN_AI_ATTRIBUTES.TOOL_NAME, toolName);
   setAttr(span, GEN_AI_ATTRIBUTES.TOOL_CALL_ID, toolCallId);
   if (captureToolIo) {
     try {
       const serializedArgs = stringifyToolIo(args);
       if (serializedArgs !== undefined) {
-        setAttr(span, OI_ATTRIBUTES.INPUT_VALUE, truncateJsonSafe(serializedArgs));
+        setAttr(span, OI_INPUT_VALUE, truncateJsonSafe(serializedArgs));
       }
     } catch {
       // args may contain circular refs or BigInt — skip rather than crash.
@@ -317,7 +310,7 @@ export function closeToolSpan(
     try {
       const serializedResult = stringifyToolIo(result);
       if (serializedResult !== undefined) {
-        setAttr(span, OI_ATTRIBUTES.OUTPUT_VALUE, truncateJsonSafe(serializedResult));
+        setAttr(span, OI_OUTPUT_VALUE, truncateJsonSafe(serializedResult));
       }
     } catch {
       // result may contain circular refs or BigInt — skip rather than crash.
