@@ -48,7 +48,7 @@
  */
 import { context, ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { Context, Span } from '@opentelemetry/api';
-import { resolveConfig, SDK_NAME } from './config';
+import { resolveConfig, TRACER_NAME } from './config';
 import type { PiInstrumentationConfig, ResolvedPiInstrumentationConfig } from './config';
 import { SDK_VERSION } from '../processor';
 import {
@@ -236,7 +236,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   // ever runs, so the tracer below can simply re-resolve that global provider
   // on every span-open (see createReresolvingTracer for why that indirection
   // still matters even with a guaranteed provider).
-  const tracer = createReresolvingTracer(SDK_NAME, SDK_VERSION);
+  const tracer = createReresolvingTracer(TRACER_NAME, SDK_VERSION);
 
   const subscribedSessions = new WeakSet<AgentSessionInstance>();
   // attachSpanListener() below creates one SessionSpanState per session and

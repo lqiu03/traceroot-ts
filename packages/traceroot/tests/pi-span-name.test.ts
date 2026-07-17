@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { describeToolCallSpan } from '../src/pi/span-name';
+import { describeToolCallSpan } from '../src/pi/spans';
 
 test('describeToolCallSpan uses the file basename for path-like args', () => {
   assert.equal(describeToolCallSpan('read', { path: '/a/b/app.py' }), 'read: app.py');
