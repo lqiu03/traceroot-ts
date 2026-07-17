@@ -1,8 +1,9 @@
 /**
  * Shared UTF-16 surrogate-pair-safe truncation boundary check.
  *
- * Both spans.ts (tool I/O JSON payloads) and span-name.ts (privacy-safe tool
- * span names) need to cap a string at a UTF-16 code-unit length without ever
+ * Both of spans.ts's callers — the tool I/O JSON payloads and the
+ * privacy-safe tool span names (describeToolCallSpan) — need to cap a string
+ * at a UTF-16 code-unit length without ever
  * splitting a surrogate pair — doing so would leave a lone high surrogate in
  * the output and corrupt the UTF-8 an OTLP/proto collector requires. This is
  * the single implementation of that boundary math; each caller appends
