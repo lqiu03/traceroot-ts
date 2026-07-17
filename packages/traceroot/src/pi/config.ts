@@ -11,9 +11,10 @@
 // OTel tracer scope name shipped in every exported Pi span — the tracer's
 // only remaining use (the old x-traceroot-sdk-name header use died with the
 // standalone package). Named distinctly from core's own SDK_NAME
-// (processor.ts, 'traceroot-ts') to avoid same-name shadowing between the
-// two; the emitted value itself is unchanged.
-export const TRACER_NAME = 'traceroot-pi';
+// (processor.ts, 'traceroot-ts') to avoid same-name shadowing between the two.
+// Value follows the same scoped convention as the Claude Agent SDK integration
+// (claude-agent-sdk.ts's '@traceroot-ai/claude-agent-sdk'), one style for both.
+export const TRACER_NAME = '@traceroot-ai/pi-coding-agent';
 
 export interface PiInstrumentationConfig {
   /** Capture prompt/response text as input.value/output.value on AGENT and LLM spans. Default true. */
