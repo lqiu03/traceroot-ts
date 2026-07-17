@@ -258,6 +258,46 @@ test('finalizeRootSpan records an exception and sets ERROR status when given an 
   );
 });
 
+// F9: instrumentation.ts's proto.prompt calls finalizeRootSpan from inside a
+// detached `.then(onResolve, onReject)` chain nobody awaits — a throw there
+// becomes an unhandledRejection capable of crashing the host. setAttribute/
+// setStatus/recordException are not otherwise guarded the way endSpanSafe
+// already guards span.end(), so a single misbehaving Span implementation
+// could throw out of finalizeRootSpan before ever reaching endSpanSafe. This
+// drives exactly that: a span whose setStatus() throws must not propagate
+// out of finalizeRootSpan, and the span must still be ended (so it still
+// exports) despite the mid-call failure.
+test('finalizeRootSpan never throws when the span misbehaves (setStatus throws), and still ends the span', () => {
+  const { tracer } = makeTracer();
+  const realSpan = tracer.startSpan('AgentSession.prompt');
+  let endCalled = false;
+  const misbehavingSpan = new Proxy(realSpan, {
+    get(target, prop, receiver) {
+      if (prop === 'setStatus') {
+        return () => {
+          throw new Error('injected setStatus failure');
+        };
+      }
+      if (prop === 'end') {
+        return (...args: Parameters<typeof realSpan.end>) => {
+          endCalled = true;
+          return target.end(...args);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    finalizeRootSpan(misbehavingSpan, 0, { code: SpanStatusCode.OK });
+  });
+  assert.equal(
+    endCalled,
+    true,
+    'the span must still be ended (so it still exports) despite setStatus throwing mid-call',
+  );
+});
+
 test('openRootSpan sets session id, does not self-stamp sdk identity, and gates input.value on captureContent', () => {
   const { tracer, spans } = makeTracer();
   const withContent = openRootSpan(tracer, ROOT_CONTEXT, {

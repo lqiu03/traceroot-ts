@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { ExportResultCode } from '@opentelemetry/core';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import {
@@ -81,6 +82,42 @@ test("makeFakeSessionClass()'s resolvePrompt() settles a pending call with no ag
   const done = session.prompt('a handled slash command');
   session.resolvePrompt();
   await assert.doesNotReject(() => done);
+});
+
+// F2: resolvePrompt() above was only ever self-tested for promise
+// resolution, with no assertion on what instrumentation.ts actually did to
+// the span tree — leaving boundary policy 2 (an early-return prompt() call
+// resolves with no agent_start/agent_end, so the root closes OK with no
+// children) without any real span-asserting coverage anywhere in the suite.
+// This closes that gap: drives the SAME early-return shape through a real,
+// instrumented rig (not just the raw fake) and asserts on the exported span.
+test('an early-return prompt() call (resolved via resolvePrompt(), no agent_start/agent_end) exports exactly one childless, OK-status AGENT root span', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  const done = session.prompt('a handled slash command');
+  session.resolvePrompt();
+  await assert.doesNotReject(() => done);
+
+  assert.equal(
+    capture.spans.length,
+    1,
+    'exactly one span: the root, with ZERO child spans (no agent_start ever fired to open any)',
+  );
+  const rootSpan = capture.spans[0]!;
+  assert.equal(rootSpan.name, 'AgentSession.prompt');
+  assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
+  assert.equal(
+    rootSpan.status.code,
+    SpanStatusCode.OK,
+    'finalize() explicitly stamps OK on a resolved call (a successfully-resolved promise, ' +
+      'even with zero children, is not merely "unset")',
+  );
+  assert.equal(
+    rootSpan.parentSpanId,
+    undefined,
+    'the root itself has no parent (it is the trace root)',
+  );
 });
 
 test("makeFakeSessionClass()'s rejectPrompt() rejects a pending call (the async-path failure mirror)", async () => {

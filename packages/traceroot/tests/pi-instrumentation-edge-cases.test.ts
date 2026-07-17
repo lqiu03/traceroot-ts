@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { trace } from '@opentelemetry/api';
+import { SpanStatusCode, trace } from '@opentelemetry/api';
 import type { ExportResult } from '@opentelemetry/core';
 import { ExportResultCode } from '@opentelemetry/core';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -454,6 +454,15 @@ test('tool args/result containing a circular reference do not crash span creatio
   );
 });
 
+// This fake's prompt() is declared `async`, so `throw` inside it is captured
+// into a REJECTED PROMISE — the call to session.prompt('hi') itself never
+// throws; only the promise it returns rejects. This exercises proto.prompt's
+// `result.then(onResolve, onReject)` branch. See the DEDICATED
+// synchronous-throw test directly below for the materially different case
+// (the call to session.prompt(...) itself throwing, before ever returning a
+// promise), which exercises proto.prompt's OTHER catch branch — the
+// `try { result = originalPrompt.call(...) } catch (err) { ... }` around the
+// call itself.
 test('a rejected prompt() (validation failure before agent_start) never creates a dangling root span, and finalizes the root as ERROR', async () => {
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
@@ -480,7 +489,42 @@ test('a rejected prompt() (validation failure before agent_start) never creates 
   );
 });
 
-test('a prompt() call whose run retries once (willRetry: true) keeps ONE root span open across the retry continuation, closing it exactly once with retry_count stamped', async () => {
+// F5: both of this suite's pre-existing "sync" fakes (the one above, and
+// pi-test-helpers.ts's shouldReject predicate) are ASYNC-function throws —
+// i.e. rejected promises, not genuine synchronous throws — so
+// instrumentation.ts's proto.prompt SYNCHRONOUS catch branch
+// (`try { result = originalPrompt.call(this, text, options); } catch (err)
+// { ...; throw err; }`) had zero real coverage anywhere in this suite. This
+// fake's prompt() is a plain (non-async) function that throws BEFORE ever
+// constructing or returning a promise, exercising that exact branch: the
+// wrapper must catch it, finalize the root as ERROR with the exception
+// recorded, and then RETHROW SYNCHRONOUSLY — the call to session.prompt(...)
+// itself must throw, not return a rejected promise.
+test('a prompt() that throws SYNCHRONOUSLY (before ever returning a promise) still finalizes the root as ERROR and rethrows synchronously, not as a rejected promise', () => {
+  const capture = new CapturingExporter();
+  const Session = makeFakeSessionClass();
+  Session.prototype.prompt = function (): never {
+    throw new Error('synchronous validation failure');
+  };
+  const sdk = { AgentSession: Session };
+  registerCapturingProvider(capture);
+  instrumentPiCodingAgent(sdk, {});
+  const session = new Session();
+
+  assert.throws(() => session.prompt('hi'), /synchronous validation failure/);
+
+  assert.equal(capture.spans.length, 1);
+  const rootSpan = capture.spans[0]!;
+  assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
+  assert.equal(rootSpan.status.code, 2 /* SpanStatusCode.ERROR */);
+  assert.equal(
+    rootSpan.events.some((e) => e.name === 'exception'),
+    true,
+    'the synchronously-thrown error must still be recorded as an exception on the root span',
+  );
+});
+
+test('a prompt() call whose run retries once (willRetry: true) keeps ONE root span open across the retry continuation, closing it exactly once with retry_count stamped, and both attempts’ LLM spans (ERROR then OK) parent under that single root', async () => {
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
   const sdk = { AgentSession: Session };
@@ -498,12 +542,31 @@ test('a prompt() call whose run retries once (willRetry: true) keeps ONE root sp
   // loop), so both attempts must land under the SAME still-open root, and
   // that root closes exactly once — when prompt()'s own promise settles —
   // carrying retry_count: 1 instead of a per-attempt will_retry flag.
+  //
+  // F4: extended beyond the bare root+retry_count assertion to also drive a
+  // real child LLM span through each attempt (attempt 1 fails at the
+  // provider with an error stopReason and triggers the retry; attempt 2
+  // succeeds), proving the retry's own child spans — not just the root —
+  // land under the single shared trace.
   const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'attempt-1-model' }) });
+  session.emit({
+    type: 'message_end',
+    message: assistantMessage({
+      model: 'attempt-1-model',
+      stopReason: 'error',
+      errorMessage: 'rate limited',
+    }),
+  });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: true });
   // A retry re-enters the loop and fires a fresh agent_start/agent_end pair
   // — no new prompt() call, same window.
   session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'attempt-2-model' }) });
+  session.emit({ type: 'message_end', message: assistantMessage({ model: 'attempt-2-model' }) });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
   await done;
 
@@ -513,8 +576,36 @@ test('a prompt() call whose run retries once (willRetry: true) keeps ONE root sp
     1,
     'the retry continuation shares ONE root span with its first attempt, not two',
   );
-  assert.equal(attrs(rootSpans[0]!)['traceroot.pi.retry_count'], 1);
-  assert.equal(attrs(rootSpans[0]!)['traceroot.pi.will_retry'], undefined, 'the flag is gone');
+  const root = rootSpans[0]!;
+  assert.equal(attrs(root)['traceroot.pi.retry_count'], 1);
+  assert.equal(attrs(root)['traceroot.pi.will_retry'], undefined, 'the flag is gone');
+
+  const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
+  assert.equal(llmSpans.length, 2, 'each attempt gets its own child LLM span, not a merged one');
+  const errorLlm = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'attempt-1-model');
+  const okLlm = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'attempt-2-model');
+  assert.ok(errorLlm, 'attempt 1’s LLM span must be present');
+  assert.ok(okLlm, 'attempt 2’s LLM span must be present');
+  assert.equal(
+    errorLlm!.status.code,
+    SpanStatusCode.ERROR,
+    'attempt 1’s LLM span must carry the ERROR status from its failing stopReason',
+  );
+  assert.equal(
+    okLlm!.status.code,
+    SpanStatusCode.UNSET,
+    'attempt 2’s LLM span must NOT be ERROR — it is the successful retry',
+  );
+  assert.equal(
+    errorLlm!.parentSpanId,
+    root.spanContext().spanId,
+    'attempt 1’s (failed) LLM span must parent under the single shared root, not a discarded one',
+  );
+  assert.equal(
+    okLlm!.parentSpanId,
+    root.spanContext().spanId,
+    'attempt 2’s (succeeded) LLM span must parent under the SAME single shared root as attempt 1',
+  );
 });
 
 test('a genuine second session.prompt() call after the first runs agent_end already fired cleanly produces a fully separate span tree, reusing the same subscribe() listener rather than re-subscribing', async () => {

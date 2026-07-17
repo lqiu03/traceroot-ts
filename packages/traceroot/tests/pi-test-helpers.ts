@@ -54,7 +54,7 @@ import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import type { PiInstrumentationConfig } from '../src/pi/config';
 import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/pi/types';
+import type { AgentEvent, AssistantMessage, PromptOptions } from '../src/pi/types';
 
 /**
  * Capturing exporter — wired into a real, freshly-registered global
@@ -78,15 +78,31 @@ export class CapturingExporter implements SpanExporter {
  * wrap layers onto the same prototype method. Call this once per rig/test.
  *
  * @param shouldReject - optional predicate; when it returns true for the
- *   text passed to prompt(), prompt() rejects SYNCHRONOUSLY (before ever
- *   returning a pending promise) instead of resolving. Used to reproduce a
- *   prompt() call that fails validation before agent_start ever fires — the
- *   real SDK's own early-return validation path.
+ *   text passed to prompt(), prompt()'s RETURNED PROMISE rejects instead of
+ *   resolving, before ever creating a pending settle-function entry. Because
+ *   this prompt() is declared `async`, a `throw` inside it is captured into
+ *   a REJECTED PROMISE, not a genuine synchronous throw — callers must
+ *   `await`/`.catch()` it, exactly like any other async-function throw; the
+ *   call to `session.prompt(text)` itself never throws. (A real synchronous
+ *   throw — where the call to `session.prompt(...)` itself throws, before
+ *   ever returning a promise at all — is a materially different case,
+ *   exercising a different catch branch in instrumentation.ts's proto.prompt;
+ *   see pi-instrumentation-edge-cases.test.ts's dedicated synchronous-throw
+ *   fake, which overrides prompt() with a plain non-async function instead of
+ *   using this predicate.) Used to reproduce a prompt() call that fails
+ *   validation before agent_start ever fires — the real SDK's own
+ *   early-return validation path.
  */
 export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
   return class FakeAgentSession {
     sessionId = 'sess-1';
     disposed = false;
+    // Mutable mirror of the real SDK's `AgentSession.prototype.isStreaming`
+    // getter (see types.ts's AgentSessionInstance doc comment) — false/idle
+    // by default. Tests that need to simulate a call arriving while a run is
+    // already active (instrumentation.ts's isQueueOnlySteer check) set this
+    // to true directly on the instance before calling prompt() again.
+    isStreaming = false;
     private listeners: Array<(event: AgentEvent) => void> = [];
     // The currently in-flight prompt() call's own settle functions, or
     // undefined when no prompt() call is awaiting its final agent_end (or an
@@ -94,9 +110,20 @@ export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
     // header for why prompt() does not resolve merely by being called.
     private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
 
-    async prompt(text: string, _options?: unknown): Promise<void> {
+    async prompt(text: string, options?: PromptOptions): Promise<void> {
       if (shouldReject?.(text)) {
         throw new Error(`validation failed for: ${text}`);
+      }
+      // Mirrors the real SDK's own queue-and-return shape (verified in
+      // instrumentation.ts's isQueueOnlySteer comment): while a run is
+      // already streaming, a caller-supplied streamingBehavior means this
+      // call queues into the ACTIVE run and resolves immediately instead of
+      // starting a new one. Deliberately does NOT touch `this.pending` here
+      // — that belongs to whichever earlier prompt() call is still awaiting
+      // the active run's own final agent_end; overwriting it would steal
+      // that call's settle functions out from under it.
+      if (this.isStreaming && options?.streamingBehavior) {
+        return;
       }
       return new Promise<void>((resolve, reject) => {
         this.pending = { resolve, reject };

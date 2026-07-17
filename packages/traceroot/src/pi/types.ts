@@ -138,8 +138,10 @@ export interface AgentSessionInstance {
    * prompt() itself (agent-session.js:812) to decide whether to queue via
    * steer()/followUp() (see PromptOptions.streamingBehavior) instead of
    * starting a fresh run. instrumentation.ts's proto.prompt wrapper reads
-   * this same getter to avoid queuing a pendingInput FIFO entry for a call
-   * that will never reach agent_start.
+   * this same getter (its own isQueueOnlySteer check) to detect that exact
+   * queue-and-return shape and skip root management entirely for it — opening
+   * a fresh root or running the overlap sweep for such a call would
+   * force-close the ACTIVE run's still-open root out from under it.
    */
   readonly isStreaming?: boolean;
   prompt(text: string, options?: PromptOptions): Promise<void>;

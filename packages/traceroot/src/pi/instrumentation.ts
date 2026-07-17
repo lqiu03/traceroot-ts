@@ -120,10 +120,15 @@ interface SessionSpanState {
   // call retried N times" on a single trace now that every attempt shares
   // one root.
   retryCount: number;
-  // True when dispose()'s force-close (or proto.prompt's own overlap sweep —
-  // see proto.prompt's OVERLAP SAFETY comment) swept this window's still-open
-  // root span, so agent_end can tell that apart from the root simply still
-  // being mid-flight. A host listener that calls session.dispose()
+  // True when dispose()'s force-close swept this window's still-open root
+  // span, so agent_end can tell that apart from the root simply still being
+  // mid-flight. Only dispose() ever sets this true (in its own
+  // `if (hadOpenRootSpan) state.rootForceClosedBySweep = true;` branch) —
+  // proto.prompt's OVERLAP SAFETY sweep never does, and proto.prompt
+  // unconditionally resets this to false the moment it opens a fresh root
+  // for a new window, so a stale true value can only ever be observed by
+  // THIS SAME window's own still-in-flight agent_end. A host listener that
+  // calls session.dispose()
   // synchronously while handling agent_end (dispose() reassigns the listener
   // array rather than mutating it, so pi's own agent_end handler still runs
   // afterward in the same dispatch) would otherwise leave pi silently
@@ -327,19 +332,56 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     const originalPrompt = proto.prompt;
     proto.prompt = function (this: AgentSessionInstance, text, options) {
       ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
+
+      // MID-STREAM STEER: verified directly against the real, installed
+      // @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.js,
+      // around its own
+      // `if (this.isStreaming) { if (!options?.streamingBehavior) throw ...;
+      // ... await this._queueSteer/_queueFollowUp(...); return; }` branch) —
+      // when a run is ALREADY streaming and the caller passes
+      // options.streamingBehavior ('steer' or 'followUp'), prompt() injects
+      // the text into the CURRENTLY-running run's queue and returns early.
+      // It does NOT start a new run and does NOT throw. This must be
+      // detected and delegated straight through BEFORE any root management
+      // below: opening a fresh root here (and running the OVERLAP SAFETY
+      // sweep further down) would force-close the ACTIVE run's still-open
+      // root mid-flight, orphaning its children and discarding whatever
+      // output it eventually produces — beheading a trace that is still
+      // legitimately in progress, not merely stale. This is the ONLY
+      // early-return path that skips root management entirely: the
+      // "/command" and extension-runner 'input'-hook early returns below
+      // happen on a fresh, non-streaming call, so their trivial, childless
+      // root (boundary policy 2) is correct and unaffected by this check.
+      const isQueueOnlySteer = this.isStreaming === true && !!options?.streamingBehavior;
+      if (isQueueOnlySteer) {
+        return originalPrompt.call(this, text, options);
+      }
+
       // Guaranteed non-undefined: ensureSubscribed() either found an existing
       // entry or attachSpanListener() just created one for `this` session.
       const state = sessionSpanState.get(this) as SessionSpanState;
 
-      // OVERLAP SAFETY: a previous prompt() window's root is still open here
-      // — rare, since the real SDK's own isStreaming guard throws for most
-      // overlapping prompt() calls on one session, but not verified to cover
-      // every path. Force-close that stale window (root included) rather
-      // than silently overwriting state.rootSpan and leaking it unended
-      // forever (a span that never has .end() called on it is never
-      // exported at all).
+      // OVERLAP SAFETY: a previous prompt() window's root is still open here.
+      // This is deliberately NOT the mid-stream steer case above — that is
+      // detected and returned before this point is ever reached. The real
+      // SDK's isStreaming guard only throws when the caller omits
+      // streamingBehavior; this sweep is a last-resort safety net for a
+      // genuinely-new, non-streaming prompt() call that races a still-open
+      // prior window (e.g. a caller-side bug, or an SDK internal state
+      // transition not verified to be covered here). Force-close that stale
+      // window (root included) rather than silently overwriting
+      // state.rootSpan and leaking it unended forever (a span that never has
+      // .end() called on it is never exported at all).
       if (state.rootSpan) {
         sweepDanglingSpans(state, { includeRoot: true });
+        // Matches every other sweep site's cleanup (agent_start, turn_end,
+        // agent_end): sweepDanglingSpans() only clears state.llmSpan, not
+        // the parenting context that goes with it. Left stale, a
+        // tool_execution_start racing in right after this sweep would
+        // wrongly parent under the now-force-closed LLM span's context
+        // instead of falling back to the fresh root about to be opened
+        // below.
+        state.llmCtx = undefined;
       }
 
       // parentCtx = context.active(), matching both the pre-existing root
@@ -368,6 +410,18 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         if (state.rootSpan !== rootSpan) return;
         state.rootSpan = undefined;
         state.rootCtx = undefined;
+        // claude-agent-sdk.ts parity (see its own endInFlight(), called from
+        // wrapQuery's finish()): a rejection (or an early settle racing a
+        // crashed attempt) can leave a tool/LLM span from the in-flight
+        // attempt never closed by its own normal event — agent_end's own
+        // defensive sweep never got a chance to run for that attempt.
+        // Force-close those BEFORE ending the root so they still export
+        // instead of being silently dropped forever (a span that never has
+        // .end() called on it is never exported at all). includeRoot is
+        // deliberately omitted: finalizeRootSpan below is THIS window's own,
+        // correct root close.
+        sweepDanglingSpans(state);
+        state.llmCtx = undefined;
         finalizeRootSpan(rootSpan, state.retryCount, status, error);
       };
 
@@ -393,17 +447,26 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       // the caller's own await/.then on the returned `result` still observes
       // the real rejection.
       //
-      // Three DECIDED boundary policies, all implemented by this single
-      // finalize() call reached via either branch:
+      // Four DECIDED boundary policies:
       //  1. A run that bypasses prompt() entirely (e.g.
       //     sendCustomMessage({triggerTurn:true})) never opens a root at
       //     all — see agent_start below — so it is unaffected by this block.
-      //  2. An early-return prompt() call (a handled "/command", a
-      //     queue-only steer/followUp early return) resolves without
-      //     agent_start ever firing: onResolve below still fires, so the
-      //     root closes OK with no children — a trivial, childless span.
+      //  2. An early-return prompt() call handled synchronously within a
+      //     single prompt() invocation (a handled "/command", an
+      //     extension-runner 'input' hook that fully handles the call)
+      //     resolves without agent_start ever firing: onResolve below still
+      //     fires, so the root closes OK with no children — a trivial,
+      //     childless span.
       //  3. A rejection (or the sync-throw path above) always finalizes the
       //     root ERROR, with the rejection reason recorded as an exception.
+      //  4. A queue-only mid-stream steer/followUp call (isStreaming===true
+      //     AND options.streamingBehavior set) is detected and returned
+      //     BEFORE this point in the function is ever reached at all — see
+      //     isQueueOnlySteer above — so it never opens a root, never reaches
+      //     this finalize() closure, and never touches the ACTIVE run's own
+      //     still-open root.
+      // Policies 2 and 3 are both implemented by this single finalize() call
+      // reached via either the try/catch above or the .then below.
       result.then(
         () => finalize({ code: SpanStatusCode.OK }),
         (err: unknown) => {
@@ -737,15 +800,19 @@ function handleEvent(
         // rather than an intermediate attempt's.
         stampRootOutput(state.rootSpan, event.messages, config.captureContent);
       } else if (state.rootForceClosedBySweep) {
-        // This attempt's root span is gone not because it was never open,
-        // but because a reentrant dispose() (a host's own earlier-registered
-        // agent_end listener disposing the session synchronously) — or,
-        // under the new model, a later OVERLAP SAFETY sweep from a second
-        // prompt() call racing this one — force-closed it before this
-        // handler got to run for the same event. The real stamp can no
-        // longer happen (the root span is already ended), so the exported
-        // AGENT span is a FORCE_CLOSED one missing this attempt's output.
-        // Surface that rather than silently dropping the completion data.
+        // This attempt's root span is gone because a reentrant dispose() (a
+        // host's own earlier-registered agent_end listener disposing the
+        // session synchronously — see session-dispose.test.ts) force-closed
+        // it before this handler got to run for the same event. This is the
+        // ONLY reachable cause: proto.prompt's own OVERLAP SAFETY sweep
+        // never sets this flag (see SessionSpanState.rootForceClosedBySweep
+        // above), and proto.prompt always clears it back to false the
+        // instant it opens a new window's root — so a second prompt() call
+        // racing this one can never be the source of a true value seen here.
+        // The real stamp can no longer happen (the root span is already
+        // ended), so the exported AGENT span is a FORCE_CLOSED one missing
+        // this attempt's output. Surface that rather than silently dropping
+        // the completion data.
         console.warn(
           "[traceroot-pi] agent_end arrived after this run's root span was already force-closed " +
             'by a reentrant dispose(); the exported AGENT span is missing its final output/retry ' +

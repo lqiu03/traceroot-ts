@@ -287,3 +287,133 @@ test('a second prompt() call while the first window’s root is still open force
     'the two overlapping windows must live in genuinely separate traces',
   );
 });
+
+// F1 follow-up: a mid-stream steer/followUp call must NOT be treated as an
+// overlap. Verified against the real, installed
+// @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.js, its own
+// `if (this.isStreaming) { if (!options?.streamingBehavior) throw ...; ...
+// return; }` branch): when isStreaming is true AND the caller passes
+// streamingBehavior, prompt() queues into the ACTIVE run and returns early —
+// it never starts a new run and never throws. Before this fix, proto.prompt
+// had no way to distinguish that shape from a genuinely-new overlapping
+// prompt() call, so it force-closed the still-open ACTIVE root (and its
+// live LLM span) out from under the run that was still legitimately in
+// progress. This test drives exactly that scenario and asserts the active
+// trace survives intact.
+test('a mid-stream steer (isStreaming===true, streamingBehavior set) never opens a fresh root or sweeps the active run’s still-open root — the active trace stays intact', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  const done = session.prompt('first task, still running');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'active-llm' }) });
+
+  // The run is now actively streaming (mirrors the real SDK's own
+  // isStreaming getter). A mid-stream steer call in this state must be
+  // detected and delegated straight through — no new root, no overlap sweep.
+  session.isStreaming = true;
+  await session.prompt('steer text', { streamingBehavior: 'steer' });
+
+  assert.equal(
+    capture.spans.length,
+    0,
+    'the mid-stream steer call must not force-close or export anything — the active run’s root ' +
+      'and LLM span are still genuinely open',
+  );
+
+  // The active run continues and finishes normally afterward.
+  session.isStreaming = false;
+  session.emit({
+    type: 'message_end',
+    message: assistantMessage({
+      model: 'active-llm',
+      content: [{ type: 'text', text: 'steered result' }],
+    }),
+  });
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
+  session.emit({
+    type: 'agent_end',
+    messages: [assistantMessage({ content: [{ type: 'text', text: 'steered result' }] })],
+    willRetry: false,
+  });
+  await done;
+
+  const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+  assert.equal(
+    rootSpans.length,
+    1,
+    'exactly one intact root for the whole run — the steer call never opened a second one',
+  );
+  const root = rootSpans[0]!;
+  assert.notEqual(
+    attrs(root)['traceroot.pi.force_closed'],
+    true,
+    'the active root must NOT be force-closed by the mid-stream steer',
+  );
+  assert.equal(attrs(root)['output.value'], 'steered result');
+
+  const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
+  assert.ok(llmSpan, 'the active run’s LLM span must still export normally');
+  assert.notEqual(
+    attrs(llmSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the active LLM span must not have been swept by the steer call',
+  );
+  assert.equal(
+    llmSpan!.parentSpanId,
+    root.spanContext().spanId,
+    'the LLM span must remain a child of the single intact root',
+  );
+});
+
+// F3 follow-up: claude-agent-sdk.ts parity (see its own endInFlight(),
+// called from wrapQuery's finish()). Before this fix, finalize (the settle
+// path that ends the root when prompt()'s own promise resolves/rejects) only
+// ended the root span — a mid-run rejection with a tool/LLM span still open
+// left that span never .end()ed, and a span that never has .end() called on
+// it is never exported at all: silently dropped, not merely "left open".
+test('a prompt() call that REJECTS mid-run force-closes a still-open tool span before finalizing the root as ERROR (claude-agent-sdk.ts endInFlight parity)', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  const done = session.prompt('a run whose internal loop rejects while a tool call is still open');
+  session.emit({ type: 'agent_start' });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'reject-tool',
+    toolName: 'bash',
+    args: { command: 'sleep 999' },
+  });
+  assert.equal(capture.spans.length, 0, 'nothing exports while the run is still open');
+
+  session.rejectPrompt(new Error('internal agent loop failure'));
+  await assert.rejects(() => done, /internal agent loop failure/);
+
+  assert.equal(
+    capture.spans.length,
+    2,
+    'the still-open tool span AND the root must both export once the rejection settles ' +
+      `(found ${capture.spans.length})`,
+  );
+  const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
+  const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'reject-tool');
+  assert.ok(rootSpan);
+  assert.ok(toolSpan, 'the dangling tool span must still export, not be dropped forever');
+  assert.equal(
+    attrs(toolSpan!)['traceroot.pi.force_closed'],
+    true,
+    'the tool span must be force-closed by finalize’s pre-close sweep',
+  );
+  assert.equal(
+    toolSpan!.parentSpanId,
+    rootSpan!.spanContext().spanId,
+    'the force-closed tool span must still be parented under the root',
+  );
+
+  assert.equal(rootSpan!.status.code, 2 /* SpanStatusCode.ERROR */);
+  assert.equal(
+    rootSpan!.events.some((e) => e.name === 'exception'),
+    true,
+    'the rejection reason must be recorded as an exception on the root span',
+  );
+});

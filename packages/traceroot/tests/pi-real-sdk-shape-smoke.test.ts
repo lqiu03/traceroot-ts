@@ -11,15 +11,21 @@
  * them) with zero failures anywhere else in the suite, because every other
  * test mocks a hand-rolled FakeAgentSession.
  *
- * The `isStreaming`/`extensionRunner` getters, `hasExtensionHandlers()`, and
+ * The `extensionRunner` getter, `hasExtensionHandlers()`, and
  * ExtensionRunner's `getCommand()` were previously verified here too --
  * proto.prompt's now-deleted prompt-queue "should this call skip the FIFO"
  * heuristic (shouldSkipQueue, prompt-queue.ts) was the only reader of any of
  * them. Now that the root span is anchored on prompt()'s own promise window
  * instead of a per-session input-attribution queue (see instrumentation.ts's
- * module header), instrumentation.ts no longer reads any of those four, so
+ * module header), instrumentation.ts no longer reads any of those three, so
  * asserting their shape here no longer protects anything this package
  * depends on.
+ *
+ * `isStreaming` is the one exception: proto.prompt's isQueueOnlySteer check
+ * (see instrumentation.ts) reads it live on every prompt() call to detect a
+ * mid-stream queue-only steer/followUp and skip root management for it, so
+ * its shape is asserted below just like prompt/subscribe/steer/followUp/
+ * dispose.
  *
  * This is the ONLY test that imports the REAL package, so a future SDK bump
  * that changes any of these shapes fails loudly here instead of silently
@@ -86,6 +92,19 @@ test('the real AgentSession still exposes every prototype method instrumentPiCod
     typeof proto.dispose,
     'function',
     'AgentSession.prototype.dispose must exist -- patched to force-close in-flight spans on teardown',
+  );
+
+  // isStreaming is a getter, not a plain data property -- instrumentation.ts's
+  // proto.prompt reads it live on every prompt() call (isQueueOnlySteer) to
+  // detect a mid-stream queue-only steer/followUp. A future SDK bump that
+  // renames or drops this getter would not throw -- isQueueOnlySteer would
+  // just silently and permanently evaluate to false, reintroducing the
+  // mid-stream-steer trace-beheading bug that check exists to prevent -- so
+  // assert its shape here rather than let that regression ship silently.
+  assert.equal(
+    typeof Object.getOwnPropertyDescriptor(proto, 'isStreaming')?.get,
+    'function',
+    'AgentSession.prototype.isStreaming must still be a getter -- proto.prompt reads it to detect a mid-stream queue-only steer/followUp call',
   );
 });
 

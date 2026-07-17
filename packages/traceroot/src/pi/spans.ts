@@ -256,10 +256,23 @@ export function finalizeRootSpan(
   status: { code: SpanStatusCode; message?: string },
   error?: unknown,
 ): void {
-  setAttr(span, TR_ATTRIBUTES.RETRY_COUNT, retryCount);
-  span.setStatus(status);
-  if (error !== undefined) {
-    span.recordException(error instanceof Error ? error : new Error(String(error)));
+  // instrumentation.ts's proto.prompt calls this from inside a detached
+  // `.then(onResolve, onReject)` chain that nobody awaits — a throw here
+  // would surface as an unhandledRejection capable of crashing the host,
+  // exactly the failure mode endSpanSafe (below) already guards span.end()
+  // against. setAttribute/setStatus/recordException are NOT otherwise
+  // wrapped, so a single misbehaving Span implementation could still throw
+  // out of this function before ever reaching endSpanSafe. Same best-effort
+  // idiom as endSpanSafe and safeCloseDanglingSpan (instrumentation.ts): a
+  // tracing failure must never destabilize the host app.
+  try {
+    setAttr(span, TR_ATTRIBUTES.RETRY_COUNT, retryCount);
+    span.setStatus(status);
+    if (error !== undefined) {
+      span.recordException(error instanceof Error ? error : new Error(String(error)));
+    }
+  } catch {
+    // Never let a misbehaving OTel exporter/processor crash the host app.
   }
   endSpanSafe(span);
 }
