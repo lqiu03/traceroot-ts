@@ -215,13 +215,15 @@ test('a session reused after dispose() re-subscribes and resumes tracing on its 
 });
 
 test('dispose() force-closes the OTHER open spans even when one span throws while being force-closed', async () => {
-  // spans.ts's closeDanglingSpan() calls setAttr() (span.setAttribute(),
-  // NOT wrapped in try/catch, unlike endSpanSafe()) before span.end(). If
-  // one open span's setAttribute() throws — a misbehaving Span
+  // spans.ts's closeDanglingSpan() guards its own setAttr(FORCE_CLOSED) call
+  // in a try/catch (warn-and-continue) precisely so a throwing
+  // span.setAttribute() can never prevent endSpanSafe()/span.end() from
+  // running for THAT span — let alone abort the rest of dispose()'s sweep.
+  // If one open span's setAttribute() throws — a misbehaving Span
   // implementation, or a bug triggered by that span's own attribute values —
-  // that must not abort the rest of dispose()'s sweep: the other still-open
-  // spans must still be force-closed and exported, not silently discarded
-  // just because a span with no .end() call is never exported.
+  // it still gets force-closed and exported (just without the force_closed
+  // marker, since the attribute write itself failed), and the other
+  // still-open spans must likewise still be force-closed and exported.
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
   const sdk = { AgentSession: Session };
@@ -279,25 +281,33 @@ test('dispose() force-closes the OTHER open spans even when one span throws whil
     return originalSetAttribute.call(this, key, value);
   } as SetAttributeFn;
 
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]): void => {
+    warnings.push(args.map((a) => String(a)).join(' '));
+  };
+
   try {
     assert.doesNotThrow(() => {
       session.dispose();
     }, 'dispose() must not throw even though force-closing one span (call-2) failed internally');
   } finally {
     Span.prototype.setAttribute = originalSetAttribute;
+    console.warn = originalWarn;
   }
   assert.equal(session.disposed, true);
 
-  // call-2's own force-close threw partway through (setAttribute, before
-  // .end() is ever reached for it) — it is legitimately never exported. But
-  // that one failure must not have aborted the rest of the sweep: the root
-  // span, the LLM span, call-1, and call-3 must all still be force-closed
-  // and exported despite it.
+  // call-2's setAttribute(FORCE_CLOSED) throw is caught INSIDE
+  // closeDanglingSpan() (spans.ts) — endSpanSafe() still runs unconditionally
+  // afterward, so call-2 is force-closed and exported too, just without the
+  // force_closed marker (the attribute write itself failed). All 5 spans
+  // (root, LLM, call-1, call-2, call-3) must still be force-closed and
+  // exported despite the injected failure.
   assert.equal(
     capture.spans.length,
-    4,
-    'the 4 non-poisoned spans (root, LLM, call-1, call-3) must still export even though ' +
-      'force-closing call-2 threw partway through the sweep',
+    5,
+    'all 5 spans (root, LLM, call-1, call-2, call-3) must still export — a setAttribute failure ' +
+      'on the force_closed marker must never prevent the span itself from being ended',
   );
   const exportedToolCallIds = capture.spans
     .map((s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'])
@@ -305,16 +315,29 @@ test('dispose() force-closes the OTHER open spans even when one span throws whil
     .sort();
   assert.deepEqual(
     exportedToolCallIds,
-    ['call-1', 'call-3'],
-    'call-1 and call-3 must still be exported; call-2 (poisoned) is legitimately dropped, ' +
-      'but must not have taken the others down with it',
+    ['call-1', 'call-2', 'call-3'],
+    'call-1, call-2, and call-3 must all be exported; call-2 (poisoned) still ends normally, ' +
+      'it just never got its force_closed attribute set',
   );
   const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
   const llmSpan = capture.spans.find(
     (s) => (s.attributes as Record<string, unknown>)['gen_ai.request.model'] === 'sweep-test-model',
   );
+  const call2Span = capture.spans.find(
+    (s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'] === 'call-2',
+  );
   assert.ok(rootSpan, 'the root span must still be exported despite call-2 throwing mid-sweep');
   assert.ok(llmSpan, 'the LLM span must still be exported despite call-2 throwing mid-sweep');
+  assert.ok(call2Span, 'call-2 must still be exported despite its own setAttribute failure');
+  assert.equal(
+    (call2Span!.attributes as Record<string, unknown>)['traceroot.pi.force_closed'],
+    undefined,
+    'call-2 never got its force_closed attribute set, since setAttribute threw on that call',
+  );
+  assert.ok(
+    warnings.some((w) => w.includes('failed to mark a dangling span force_closed')),
+    'the injected setAttribute failure on call-2 must still be surfaced via console.warn',
+  );
 });
 
 // Lens: a host listener that disposes the session synchronously while

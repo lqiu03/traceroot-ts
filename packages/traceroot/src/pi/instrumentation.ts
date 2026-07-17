@@ -138,69 +138,6 @@ interface SessionSpanState {
   rootForceClosedBySweep: boolean;
 }
 
-// Rate-limit for the dangling-span close-failure warning below. A Span
-// implementation whose force-close throws on EVERY attempt (a broken exporter/
-// processor, or a Span whose setAttribute always throws) would otherwise emit
-// one console.warn for every dangling span, on every sweep, indefinitely —
-// flooding the host's logs and burying the very first, genuinely-useful
-// warning. After MAX_DANGLING_SPAN_WARNINGS failures inside a rolling
-// DANGLING_SPAN_WARNING_WINDOW_MS window, one "further warnings suppressed"
-// notice is emitted and the rest go quiet until the window rolls over — so an
-// isolated, genuine failure is still surfaced, while a pathological one can no
-// longer drown out the logs. Deliberately a small per-process counter, not a
-// redesign: this is a defensive nicety on an already best-effort cleanup path.
-const MAX_DANGLING_SPAN_WARNINGS = 10;
-const DANGLING_SPAN_WARNING_WINDOW_MS = 60 * 1000;
-let danglingSpanWarningCount = 0;
-let danglingSpanWarningWindowStart = 0;
-
-function warnDanglingSpanCloseFailure(label: string, err: unknown): void {
-  const now = Date.now();
-  if (now - danglingSpanWarningWindowStart > DANGLING_SPAN_WARNING_WINDOW_MS) {
-    // First failure ever, or the previous burst's window has fully elapsed —
-    // open a fresh window so a later, unrelated failure is never permanently
-    // muted by an earlier burst that already hit the cap.
-    danglingSpanWarningCount = 0;
-    danglingSpanWarningWindowStart = now;
-  }
-  danglingSpanWarningCount += 1;
-  if (danglingSpanWarningCount <= MAX_DANGLING_SPAN_WARNINGS) {
-    console.warn(
-      `[traceroot-pi] failed to force-close a dangling ${label} span during sweep (it may leak):`,
-      err,
-    );
-  } else if (danglingSpanWarningCount === MAX_DANGLING_SPAN_WARNINGS + 1) {
-    console.warn(
-      `[traceroot-pi] more than ${MAX_DANGLING_SPAN_WARNINGS} dangling-span close failures in ` +
-        `${DANGLING_SPAN_WARNING_WINDOW_MS / 1000}s — further such warnings suppressed until the ` +
-        'failures stop.',
-    );
-  }
-}
-
-// closeDanglingSpan() (spans.ts) calls setAttr() before endSpanSafe() —
-// setAttr()'s underlying span.setAttribute() is NOT wrapped in try/catch the
-// way endSpanSafe() explicitly is ("Never let a misbehaving OTel exporter/
-// processor crash the host app"), so a single misbehaving Span implementation
-// can still throw out of closeDanglingSpan() itself. Catching per-span here —
-// rather than only around the sweep as a whole, as dispose()'s own outer
-// try/catch does — means one bad span can never prevent the sweep from
-// reaching every OTHER span still queued up to close: without this, a throw
-// on (say) the 2nd of 5 open tool spans would abort the loop and leave the
-// remaining 3 tool spans, the LLM span, and (when includeRoot) the root span
-// never closed — and a span with no .end() call is never exported at all,
-// not merely "left open". `label` is logged so a real failure is traceable to
-// the specific span kind (and, for tool spans, call id) that misbehaved; the
-// warning itself is rate-limited (see warnDanglingSpanCloseFailure) so a
-// systematically-failing span can't turn this into unbounded log spam.
-function safeCloseDanglingSpan(span: Span | undefined, label: string): void {
-  try {
-    closeDanglingSpan(span);
-  } catch (err) {
-    warnDanglingSpanCloseFailure(label, err);
-  }
-}
-
 // Force-closes every span left open by an abandoned run: every open tool
 // span, then the LLM span, and — only when explicitly requested — the root
 // span. Shared by every call site that needs this exact "abandon whatever
@@ -209,25 +146,24 @@ function safeCloseDanglingSpan(span: Span | undefined, label: string): void {
 // ending with an abandoned LLM/tool span), agent_end (defensive cleanup
 // before stamping this attempt's output), proto.prompt (the OVERLAP SAFETY
 // sweep — see its own comment), and dispose() (mid-run teardown).
-// closeDanglingSpan() is already a no-op on `undefined`, and iterating +
-// .clear()-ing an already-empty Map is already a no-op, so callers never need
-// their own `if (span)` / `if (size > 0)` guard before calling this — a
-// future change to sweep order or a new span type added to SessionSpanState
-// only has to be made here, once. Each individual close goes through
-// safeCloseDanglingSpan() (above), so one span's close throwing never aborts
-// the rest of the sweep.
+// closeDanglingSpan() (spans.ts) is already a no-op on `undefined`, already
+// guards its own setAttr(FORCE_CLOSED) call so one misbehaving span can never
+// stop it from reaching endSpanSafe(), and iterating + .clear()-ing an
+// already-empty Map is already a no-op — so callers never need their own
+// `if (span)` / `if (size > 0)` guard before calling this, and one span's
+// close failure never aborts the rest of the sweep.
 function sweepDanglingSpans(
   state: SessionSpanState,
   options: { includeRoot?: boolean } = {},
 ): void {
-  for (const [toolCallId, span] of state.toolSpans) {
-    safeCloseDanglingSpan(span, `tool (toolCallId=${toolCallId})`);
+  for (const [, span] of state.toolSpans) {
+    closeDanglingSpan(span);
   }
   state.toolSpans.clear();
-  safeCloseDanglingSpan(state.llmSpan, 'LLM');
+  closeDanglingSpan(state.llmSpan);
   state.llmSpan = undefined;
   if (options.includeRoot) {
-    safeCloseDanglingSpan(state.rootSpan, 'root');
+    closeDanglingSpan(state.rootSpan);
     state.rootSpan = undefined;
   }
 }
@@ -540,9 +476,9 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // open rootSpan/llmSpan/toolSpans that will now never see their
         // normal close. Force-close them here first, exactly like
         // agent_start's own dangling-span sweep, so they still export
-        // instead of leaking silently (see safeCloseDanglingSpan on why a
-        // never-.end()ed span is never exported) — then delegate to the real
-        // dispose().
+        // instead of leaking silently (see closeDanglingSpan in spans.ts on
+        // why a never-.end()ed span is never exported) — then delegate to
+        // the real dispose().
         const state = sessionSpanState.get(this);
         if (state) {
           // Whether this dispose() force-closed a still-open root span. If a
@@ -693,7 +629,7 @@ function handleEvent(
       // Without sweeping each one unconditionally, that orphan would either
       // stay open forever (tool span) or have its reference silently
       // overwritten below without ever calling .end() on it (LLM span) — see
-      // safeCloseDanglingSpan on why a never-.end()ed span is never
+      // closeDanglingSpan in spans.ts on why a never-.end()ed span is never
       // exported.
       sweepDanglingSpans(state);
       state.llmSpan = undefined;
@@ -715,7 +651,7 @@ function handleEvent(
       // still exports instead of having its state.llmSpan slot silently
       // overwritten below, mirroring tool_execution_start's identical
       // duplicate-open handling further down in this switch.
-      safeCloseDanglingSpan(state.llmSpan, 'LLM');
+      closeDanglingSpan(state.llmSpan);
       // Falls back to ROOT_CONTEXT, never context.active(): the latter is
       // whatever the host process's own OTel context manager happens to have
       // ambiently active right now, which has nothing to do with this Pi
@@ -761,7 +697,7 @@ function handleEvent(
       // matching the same never-leak-silently philosophy applied to dangling
       // spans everywhere else in this handler (agent_start, turn_end, agent_end).
       const existing = state.toolSpans.get(event.toolCallId);
-      safeCloseDanglingSpan(existing, `tool (toolCallId=${event.toolCallId})`);
+      closeDanglingSpan(existing);
       // See message_start's comment: fall back to ROOT_CONTEXT, never the
       // ambient context.active(), to avoid parenting a stray event under
       // whatever unrelated span the host process happens to have active.

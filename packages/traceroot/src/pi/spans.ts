@@ -76,112 +76,43 @@ function endSpanSafe(span: Span | undefined): void {
 // pair, which would corrupt the UTF-8 an OTLP/proto collector requires.
 const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 
-// Appended by both the mid-serialization budget (makeBudgetedReplacer) and the
-// post-hoc backstop (truncateJsonSafe) whenever tool I/O had to be cut, so a
-// truncated payload is always distinguishable from one that merely happened to
-// end this way. Single source of truth for the marker text.
+// Appended by the post-hoc backstop (truncateJsonSafe) whenever tool I/O had
+// to be cut, so a truncated payload is always distinguishable from one that
+// merely happened to end this way. Single source of truth for the marker
+// text.
 const TRUNCATION_MARKER = '…[truncated]';
 
 // sliceSurrogateSafe (./surrogate-safe) is the shared boundary-detection cut,
 // no marker appended — callers that need the TRUNCATION_MARKER suffix
-// (truncateJsonSafe) or a bare cap (makeBudgetedReplacer, used
-// mid-serialization) each append what they need on top of it.
+// (truncateJsonSafe) or a bare cap (capFieldReplacer, used mid-serialization)
+// each append what they need on top of it.
 function truncateJsonSafe(json: string): string {
   if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
   return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}${TRUNCATION_MARKER}`;
 }
 
-// Returns a JSON.stringify replacer that enforces a running output-length
-// budget as the tree is walked, capping tool I/O *during* serialization rather
-// than after the full payload has already been built. Each call gets its own
-// fresh closure — the budget is per-serialization, never shared across calls.
+// Returns a JSON.stringify replacer that caps each individually-oversized
+// STRING field as the tree is walked, so one huge field (full file content,
+// long command stdout — the dominant real-world shape of oversized tool I/O)
+// is never fully materialized before truncateJsonSafe's post-hoc backstop
+// runs. Non-string values (numbers, booleans, arrays, objects) pass through
+// untouched — there is no running budget across the whole payload, only a
+// per-field cap.
 //
-// Two distinct oversize shapes both have to be deflected before JSON.stringify
-// materializes them:
-//   - ONE huge field (full file content, long command stdout — the dominant
-//     real-world case): capped to at most MAX_TOOL_IO_JSON_CHARS on its own.
-//   - MANY small fields (a large grep/find result: an array of thousands of
-//     short lines, none individually oversized): the per-field cap alone never
-//     fires for any single element, so without a *running* budget the whole
-//     multi-hundred-KB payload is built out in full before truncateJsonSafe's
-//     post-hoc slice ever runs — O(N) work and memory on the exact input this
-//     is most likely to see.
-// A single running `remaining` budget covers both: each visited string is
-// first capped to the per-field bound, then charged against `remaining`; once
-// `remaining` is spent, every subsequent string is cut to '' (sliceSurrogateSafe
-// with a zero/negative bound returns ''), so neither shape can push the
-// intermediate serialized output past the budget. truncateJsonSafe remains the
-// final backstop that appends the marker and enforces the hard length bound.
-//
-// The budget cannot be strings-only, though: a tool result that is a large
-// array of NON-string primitives (thousands of numbers or booleans — a numeric
-// grep/find result, a big matrix) has no oversized string for the per-field cap
-// to catch, so a strings-only replacer returned every element untouched and
-// JSON.stringify materialized the whole payload before truncateJsonSafe's
-// post-hoc slice ran — the exact O(N) blowup a running budget exists to
-// prevent. So numbers and booleans are charged against `remaining` too (by
-// their serialized width), and — critically — a large ARRAY is proactively
-// sliced when the replacer first reaches it, BEFORE JSON.stringify walks its
-// elements: one element serializes to at least one JSON char, so more than
-// `remaining` elements can never fit the budget regardless of content, and
-// slicing there (not merely collapsing each scalar one-by-one, which still
-// requires enumerating every element) is what keeps a huge array O(budget)
-// rather than O(N) to serialize. Once the budget is fully spent, every
-// remaining value collapses to its cheapest valid-JSON form so no further
-// content is embedded and no large container is walked deeper.
-function makeBudgetedReplacer(): (key: string, value: unknown) => unknown {
-  let remaining = MAX_TOOL_IO_JSON_CHARS;
-  return function budgetedReplacer(_key: string, value: unknown): unknown {
-    // Budget spent: collapse every remaining value to the cheapest valid JSON so
-    // JSON.stringify neither embeds more content nor keeps walking a large
-    // container. null passes through (already the cheapest literal).
-    if (remaining <= 0) {
-      if (typeof value === 'string') return '';
-      if (typeof value === 'number') return 0;
-      if (typeof value === 'boolean') return false;
-      if (Array.isArray(value)) return [];
-      if (value !== null && typeof value === 'object') return {};
-      return value;
-    }
-    if (typeof value === 'string') {
-      const capped =
-        value.length > MAX_TOOL_IO_JSON_CHARS
-          ? sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS)
-          : value;
-      if (capped.length <= remaining) {
-        remaining -= capped.length;
-        return capped;
-      }
-      // Crosses the running budget: emit only what's left (surrogate-safe) and
-      // spend the rest, so every subsequent value is likewise collapsed above.
-      const fit = sliceSurrogateSafe(capped, remaining);
-      remaining = 0;
-      return fit;
-    }
-    if (typeof value === 'number' || typeof value === 'boolean') {
-      // Charge the scalar's serialized width (e.g. "12345", "true") so a large
-      // array of non-string primitives drains the budget instead of slipping
-      // through uncounted the way it used to.
-      remaining -= String(value).length;
-      if (remaining < 0) remaining = 0;
-      return value;
-    }
-    if (Array.isArray(value)) {
-      if (value.length > remaining) {
-        // Cap the array to at most `remaining` elements up front, then append a
-        // truncation marker so the cut is self-evident in the payload.
-        // JSON.stringify only walks the sliced copy, so a million-element array
-        // costs O(budget), not O(N). truncateJsonSafe still enforces the final
-        // hard char bound on top.
-        return [...value.slice(0, remaining), TRUNCATION_MARKER];
-      }
-      return value;
-    }
-    // Plain object (or null): pass through while budget remains — its scalar
-    // leaves are charged as the walk reaches them, and any nested array is
-    // sliced when the replacer reaches it in turn.
-    return value;
-  };
+// Accepted trade-off (see this file's header comment history / the Ask 3a
+// simplification): a large ARRAY of many individually-small values (a big
+// grep/find result, none of whose elements exceed the cap on their own) now
+// transiently serializes in full before truncateJsonSafe slices the final
+// string — O(N) work on data that is already fully materialized in memory by
+// the time a tool result reaches this function, which is the right trade for
+// a coding agent's tool results. The one catastrophic case — a single huge
+// string — is still capped up front, before it is embedded in the growing
+// output.
+function capFieldReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'string' && value.length > MAX_TOOL_IO_JSON_CHARS) {
+    return sliceSurrogateSafe(value, MAX_TOOL_IO_JSON_CHARS);
+  }
+  return value;
 }
 
 // JSON.stringify's real runtime return type is `string | undefined`, not the
@@ -195,7 +126,7 @@ function makeBudgetedReplacer(): (key: string, value: unknown) => unknown {
 // packages/traceroot/src/claude-agent-sdk.ts's tryStringify.
 function stringifyToolIo(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  return JSON.stringify(value, makeBudgetedReplacer());
+  return JSON.stringify(value, capFieldReplacer);
 }
 
 function textOf(message: AgentMessage | undefined): string | undefined {
@@ -263,8 +194,8 @@ export function finalizeRootSpan(
   // against. setAttribute/setStatus/recordException are NOT otherwise
   // wrapped, so a single misbehaving Span implementation could still throw
   // out of this function before ever reaching endSpanSafe. Same best-effort
-  // idiom as endSpanSafe and safeCloseDanglingSpan (instrumentation.ts): a
-  // tracing failure must never destabilize the host app.
+  // idiom as endSpanSafe and closeDanglingSpan above: a tracing failure must
+  // never destabilize the host app.
   try {
     setAttr(span, TR_ATTRIBUTES.RETRY_COUNT, retryCount);
     span.setStatus(status);
@@ -364,8 +295,24 @@ export function closeToolSpan(
 // spans on a fresh agent_start, or a turn_end that never saw its message_end).
 // Marks it so an abnormal trace is distinguishable from a clean one in the
 // backend, rather than looking identical to a span that closed normally.
+//
+// Only the setAttr(FORCE_CLOSED) call is guarded here: a misbehaving Span
+// implementation whose setAttribute() throws must not prevent endSpanSafe()
+// below from running. Wrapping the whole function body (or omitting the
+// try/catch entirely) would let that throw escape before endSpanSafe() is
+// ever reached, so the span would never have .end() called on it — and a
+// span with no .end() call is never exported at all, not merely "left open".
+// endSpanSafe() itself is already best-effort (see its own comment), so the
+// span is guaranteed to at least attempt a close either way.
 export function closeDanglingSpan(span: Span | undefined): void {
   if (!span) return;
-  setAttr(span, TR_ATTRIBUTES.FORCE_CLOSED, true);
+  try {
+    setAttr(span, TR_ATTRIBUTES.FORCE_CLOSED, true);
+  } catch (err) {
+    console.warn(
+      '[traceroot-pi] failed to mark a dangling span force_closed (still ending it):',
+      err,
+    );
+  }
   endSpanSafe(span);
 }

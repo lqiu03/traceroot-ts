@@ -1,25 +1,25 @@
 /**
- * Lens: the running serialization budget and boundary logic in src/spans.ts's
- * stringifyToolIo / truncateJsonSafe, exercised through the real
- * openToolSpan/closeToolSpan call path rather than as a standalone unit test
- * of the helpers — a future refactor that stops calling truncateJsonSafe from
- * either function must fail these tests, not just a test of the helper in
- * isolation. Mirrors span-name.test.ts's surrogate-pair truncation test in
- * spirit (see 'does not split a surrogate pair at the truncation boundary'
- * there) but drives it via the tool span attributes.
+ * Lens: src/spans.ts's stringifyToolIo (capFieldReplacer) / truncateJsonSafe
+ * boundary logic, exercised through the real openToolSpan/closeToolSpan call
+ * path rather than as a standalone unit test of the helpers — a future
+ * refactor that stops calling truncateJsonSafe from either function must fail
+ * these tests, not just a test of the helper in isolation. Mirrors
+ * span-name.test.ts's surrogate-pair truncation test in spirit (see 'does not
+ * split a surrogate pair at the truncation boundary' there) but drives it via
+ * the tool span attributes.
  *
- * Beyond truncateJsonSafe's final-length boundary logic, this file also
- * covers the mid-walk running budget that stringifyToolIo applies while
- * JSON.stringify is still serializing: a single huge string field is the
- * dominant real-world shape (a big file read, long command stdout), but a
- * large ARRAY of many individually-small strings (a big grep/find output) or
- * of non-string primitives (numbers, booleans — a numeric grep result, a big
- * matrix) are shapes a naive per-string-only cap misses entirely, since no
- * single element exceeds the cap on its own. Asserting on the final
- * attribute alone cannot tell a fixed implementation from a broken one for
- * any of these — truncateJsonSafe bounds the FINAL string either way — so
- * these tests spy on the global JSON.stringify to observe HOW serialization
- * happened, not just its final output.
+ * capFieldReplacer only caps an individually-oversized STRING field as
+ * JSON.stringify visits it — a single huge string field (a big file read,
+ * long command stdout, the dominant real-world shape) is capped mid-walk,
+ * before it is embedded in the growing output. It deliberately carries no
+ * running budget across the whole payload (that machinery — mid-serialization
+ * array slicing and scalar-width charging — was removed as part of the Ask 3a
+ * simplification): a large ARRAY of many individually-small values (a big
+ * grep/find output, or a numeric/boolean array) now transiently serializes in
+ * full before truncateJsonSafe's post-hoc backstop slices the final string —
+ * an accepted O(N) trade on already-materialized data. The tests below for
+ * that shape assert the surviving final char-cap/marker invariant rather than
+ * the removed mid-walk behavior; see each test's own comment.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -424,193 +424,108 @@ test('undefined args/result (parameterless tool call / void-returning tool) neve
   }
 });
 
-// A large ARRAY of many individually-small strings (e.g. a big grep/find
-// output) is the shape the per-string cap misses entirely: no single element
-// exceeds MAX_TOOL_IO_JSON_CHARS, so a naive per-string-only replacer leaves
-// every one of them untouched and JSON.stringify materializes the whole
-// multi-hundred-KB payload before truncateJsonSafe's post-hoc slice ever
-// runs. Like the single-huge-string test above, this spies on JSON.stringify
-// to observe HOW serialization happened: it sums the bytes of the array's
-// line strings that the replacer actually embeds. A fixed implementation
-// stops embedding once its running budget is spent; a broken one embeds all
-// of them before any cap applies.
-test('a large array of many small strings is capped by a running serialization budget, not fully materialized then sliced', async () => {
+// REPHRASED for Ask 3a (was: 'a large array of many small strings is capped
+// by a running serialization budget, not fully materialized then sliced').
+// That assertion pinned the now-intentionally-dropped mid-serialization
+// budget (proactive array slicing / scalar-width charging) — capFieldReplacer
+// only caps individually-oversized strings, so a large array of many
+// individually-small strings is now fully materialized by JSON.stringify
+// before truncateJsonSafe's post-hoc backstop slices the final string (the
+// accepted O(N) trade documented in this file's header). What must still hold
+// is the final char-cap/marker invariant, and that the truncated body is a
+// verbatim prefix of the real serialization (not corrupted or re-derived).
+test('a large array of many small strings still exports a bounded, marked-truncated input.value', async () => {
   const LINE_LEN = 512;
   // 200 * 512 = ~100 KB total, far past the 32 KB cap — yet each individual
-  // line (512 chars) is well under the cap, so the per-string cap never fires
-  // for any of them. This is exactly the grep/find shape the old post-hoc
-  // slice let through fully materialized.
+  // line (512 chars) is well under the cap, so the per-field cap never fires
+  // for any of them.
   const LINE_COUNT = 200;
   const line = 'x'.repeat(LINE_LEN);
   const args = { matches: Array.from({ length: LINE_COUNT }, () => line) };
+  const rawJson = JSON.stringify(args);
+  assert.ok(
+    rawJson.length > MAX_TOOL_IO_JSON_CHARS,
+    'sanity check: the raw payload dwarfs the cap',
+  );
 
-  const originalStringify = JSON.stringify;
-  let embeddedLineChars = 0;
+  const toolSpan = await runToolCall(args, {});
+  const inputValue = attrs(toolSpan)['input.value'] as string;
 
-  type Replacer = (this: unknown, key: string, value: unknown) => unknown;
-  JSON.stringify = ((
-    value: unknown,
-    replacer?: Replacer | (string | number)[] | null,
-    space?: string | number,
-  ) => {
-    if (typeof replacer === 'function') {
-      const wrapped: Replacer = function wrapped(key, val) {
-        const out = replacer.call(this, key, val);
-        // Count only the bytes of OUR line strings that the replacer actually
-        // embeds (returns as a non-empty string). The bug embeds all
-        // LINE_COUNT of them; the fix stops once the running budget is spent
-        // and returns '' (or a capped remainder) for the rest.
-        if (val === line && typeof out === 'string') embeddedLineChars += out.length;
-        return out;
-      };
-      return originalStringify(value, wrapped, space);
-    }
-    return originalStringify(value, replacer as (string | number)[] | null | undefined, space);
-  }) as typeof JSON.stringify;
-
-  try {
-    const toolSpan = await runToolCall(args, {});
-    const inputValue = attrs(toolSpan)['input.value'] as string;
-
-    assert.ok(
-      embeddedLineChars <= MAX_TOOL_IO_JSON_CHARS + LINE_LEN,
-      `serialization must stop embedding line content once the ${MAX_TOOL_IO_JSON_CHARS}-char ` +
-        `budget is spent (embedded ${embeddedLineChars} of ${LINE_LEN * LINE_COUNT} total chars) — ` +
-        'the old per-string cap left every small element untouched, letting JSON.stringify fully ' +
-        'materialize the whole payload before truncateJsonSafe sliced it',
-    );
-    // The final attribute must still be a bounded, marked-as-truncated string.
-    assert.ok(
-      inputValue.endsWith(TRUNCATION_MARKER),
-      'the oversized array result must still be marked truncated',
-    );
-    assert.ok(
-      inputValue.length <= MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length,
-      'the exported input.value must stay within the MAX + marker bound',
-    );
-  } finally {
-    JSON.stringify = originalStringify;
-  }
+  assert.ok(
+    inputValue.endsWith(TRUNCATION_MARKER),
+    'the oversized array result must still be marked truncated',
+  );
+  assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
+  assert.equal(
+    inputValue,
+    rawJson.slice(0, MAX_TOOL_IO_JSON_CHARS) + TRUNCATION_MARKER,
+    'the truncated body must be a verbatim prefix of the full serialization',
+  );
 });
 
-// The running budget must cap non-string primitives too, not just strings. A
-// large array of NUMBERS (or booleans) — a numeric grep/find result, a big
-// matrix — has no string elements, so a strings-only replacer would return
-// every element untouched and JSON.stringify would materialize the entire
-// multi-hundred-KB payload before truncateJsonSafe's post-hoc slice runs: the
-// exact O(N) blowup the mid-walk budget exists to prevent. This spies on
-// JSON.stringify to count how many numeric/boolean elements the replacer is
-// actually invoked with — a fixed implementation slices the huge array up
-// front and walks only ~budget elements; a broken one walks every one of them
-// before any cap applies.
-test('a large array of numbers is bounded by a running budget, not fully walked then sliced', async () => {
-  // 500_000 numbers: far past the 32 KB char budget, yet no element is a
-  // string, so the old per-string cap never fired for any of them. This is
-  // the numeric grep/find shape the old post-hoc slice let through fully
-  // materialized.
+// REPHRASED for Ask 3a (was: 'a large array of numbers is bounded by a
+// running budget, not fully walked then sliced'). Same reasoning as the
+// small-strings test above: a large array of numbers has no oversized string
+// element, so capFieldReplacer leaves it untouched and it is fully walked by
+// JSON.stringify before truncateJsonSafe's post-hoc backstop slices the final
+// string. The surviving requirement is the final char-cap/marker invariant.
+test('a large array of numbers still exports a bounded, marked-truncated input.value', async () => {
   const ELEMENT_COUNT = 500_000;
   const args = { values: Array.from({ length: ELEMENT_COUNT }, (_v, i) => i) };
+  const rawJson = JSON.stringify(args);
+  assert.ok(
+    rawJson.length > MAX_TOOL_IO_JSON_CHARS,
+    'sanity check: the raw payload dwarfs the cap',
+  );
 
-  const originalStringify = JSON.stringify;
-  let numericElementVisits = 0;
+  const toolSpan = await runToolCall(args, {});
+  const inputValue = attrs(toolSpan)['input.value'] as string;
 
-  type Replacer = (this: unknown, key: string, value: unknown) => unknown;
-  JSON.stringify = ((
-    value: unknown,
-    replacer?: Replacer | (string | number)[] | null,
-    space?: string | number,
-  ) => {
-    if (typeof replacer === 'function') {
-      const wrapped: Replacer = function wrapped(key, val) {
-        // Count every numeric element the replacer is actually invoked with.
-        // The bug walks all ELEMENT_COUNT of them; the fix slices the array up
-        // front so only ~budget elements are ever visited.
-        if (typeof val === 'number') numericElementVisits += 1;
-        return replacer.call(this, key, val);
-      };
-      return originalStringify(value, wrapped, space);
-    }
-    return originalStringify(value, replacer as (string | number)[] | null | undefined, space);
-  }) as typeof JSON.stringify;
-
-  try {
-    const toolSpan = await runToolCall(args, {});
-    const inputValue = attrs(toolSpan)['input.value'] as string;
-
-    // The core proof: serialization must NOT visit every one of the 500k
-    // elements. A fixed replacer slices the array to at most `remaining`
-    // elements before JSON.stringify walks it, so the visit count is bounded by
-    // the budget (plus a small slack), independent of the input size.
-    assert.ok(
-      numericElementVisits <= MAX_TOOL_IO_JSON_CHARS + 2,
-      `serialization must bound the number of array elements it walks to ~the ` +
-        `${MAX_TOOL_IO_JSON_CHARS}-char budget (visited ${numericElementVisits} of ${ELEMENT_COUNT}) — ` +
-        'the old strings-only replacer left every numeric element untouched, letting JSON.stringify ' +
-        'fully materialize the whole payload before truncateJsonSafe sliced it',
-    );
-    // The final attribute must still be a bounded, marked-as-truncated string.
-    assert.ok(
-      inputValue.endsWith(TRUNCATION_MARKER),
-      'the oversized numeric array result must still be marked truncated',
-    );
-    assert.ok(
-      inputValue.length <= MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length,
-      'the exported input.value must stay within the MAX + marker bound',
-    );
-  } finally {
-    JSON.stringify = originalStringify;
-  }
+  assert.ok(
+    inputValue.endsWith(TRUNCATION_MARKER),
+    'the oversized numeric array result must still be marked truncated',
+  );
+  assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
+  assert.equal(
+    inputValue,
+    rawJson.slice(0, MAX_TOOL_IO_JSON_CHARS) + TRUNCATION_MARKER,
+    'the truncated body must be a verbatim prefix of the full serialization',
+  );
 });
 
-test('a large array of booleans is likewise bounded by the running budget', async () => {
+// REPHRASED for Ask 3a (was: 'a large array of booleans is likewise bounded
+// by the running budget'). Same reasoning as the two tests above.
+test('a large array of booleans still exports a bounded, marked-truncated input.value', async () => {
   const ELEMENT_COUNT = 500_000;
   const args = { flags: Array.from({ length: ELEMENT_COUNT }, (_v, i) => i % 2 === 0) };
+  const rawJson = JSON.stringify(args);
+  assert.ok(
+    rawJson.length > MAX_TOOL_IO_JSON_CHARS,
+    'sanity check: the raw payload dwarfs the cap',
+  );
 
-  const originalStringify = JSON.stringify;
-  let booleanElementVisits = 0;
+  const toolSpan = await runToolCall(args, {});
+  const inputValue = attrs(toolSpan)['input.value'] as string;
 
-  type Replacer = (this: unknown, key: string, value: unknown) => unknown;
-  JSON.stringify = ((
-    value: unknown,
-    replacer?: Replacer | (string | number)[] | null,
-    space?: string | number,
-  ) => {
-    if (typeof replacer === 'function') {
-      const wrapped: Replacer = function wrapped(key, val) {
-        if (typeof val === 'boolean') booleanElementVisits += 1;
-        return replacer.call(this, key, val);
-      };
-      return originalStringify(value, wrapped, space);
-    }
-    return originalStringify(value, replacer as (string | number)[] | null | undefined, space);
-  }) as typeof JSON.stringify;
-
-  try {
-    const toolSpan = await runToolCall(args, {});
-    const inputValue = attrs(toolSpan)['input.value'] as string;
-
-    assert.ok(
-      booleanElementVisits <= MAX_TOOL_IO_JSON_CHARS + 2,
-      `serialization must bound boolean-element walking to ~the budget (visited ` +
-        `${booleanElementVisits} of ${ELEMENT_COUNT})`,
-    );
-    assert.ok(
-      inputValue.length <= MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length,
-      'the exported input.value must stay within the MAX + marker bound',
-    );
-  } finally {
-    JSON.stringify = originalStringify;
-  }
+  assert.ok(
+    inputValue.endsWith(TRUNCATION_MARKER),
+    'the oversized boolean array result must still be marked truncated',
+  );
+  assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
+  assert.equal(
+    inputValue,
+    rawJson.slice(0, MAX_TOOL_IO_JSON_CHARS) + TRUNCATION_MARKER,
+    'the truncated body must be a verbatim prefix of the full serialization',
+  );
 });
 
-test('a flat object with a huge number of SHORT-valued keys still exports a bounded input.value (keys are not charged against the running budget, so the backstop must hold the line)', async () => {
-  // The budgeted replacer charges string/number/boolean VALUES against the
-  // running budget and slices large ARRAYS proactively, but object KEYS are
-  // never charged — a many-keyed object (a word-count map, a file->stat
-  // dictionary) therefore drains the budget on its tiny values while every
-  // key name still lands in the intermediate JSON. The exported attribute
-  // must nevertheless respect the hard MAX + marker bound via
-  // truncateJsonSafe's post-hoc backstop.
+test('a flat object with a huge number of SHORT-valued keys still exports a bounded input.value (the post-hoc backstop must hold the line)', async () => {
+  // capFieldReplacer only caps individually-oversized STRING values — none of
+  // this object's values are oversized, and its keys are never inspected at
+  // all, so a many-keyed object (a word-count map, a file->stat dictionary)
+  // is fully materialized by JSON.stringify. The exported attribute must
+  // nevertheless respect the hard MAX + marker bound via truncateJsonSafe's
+  // post-hoc backstop.
   const KEY_COUNT = 50_000;
   const args: Record<string, string> = {};
   for (let i = 0; i < KEY_COUNT; i++) {
