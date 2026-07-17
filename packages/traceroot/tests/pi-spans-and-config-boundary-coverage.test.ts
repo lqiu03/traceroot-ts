@@ -22,7 +22,8 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { ROOT_CONTEXT } from '@opentelemetry/api';
 import {
   openRootSpan,
-  closeRootSpan,
+  stampRootOutput,
+  finalizeRootSpan,
   openLlmSpan,
   closeLlmSpan,
   openToolSpan,
@@ -220,15 +221,41 @@ test('closeLlmSpan omits output.value when the assistant message has no text par
 
 // --- spans.ts: root span ------------------------------------------------
 
-test('closeRootSpan records will_retry=false when willRetry is undefined (Boolean coercion)', () => {
+// Rephrased from a pre-fix test of the now-removed TR_ATTRIBUTES.WILL_RETRY
+// flag (closeRootSpan used to stamp will_retry unconditionally, coercing
+// undefined to false). Under the new prompt()-anchored root model, the root
+// closes once via finalizeRootSpan — called by instrumentation.ts's
+// proto.prompt when the enclosing prompt() call's own promise settles — and
+// stamps the observable per-window retry ATTEMPT COUNT instead of a
+// per-attempt boolean flag (see spans.ts's own header comment on the split).
+test('finalizeRootSpan stamps retry_count and sets the given status', () => {
   const { tracer, spans } = makeTracer();
   const span = openRootSpan(tracer, ROOT_CONTEXT, {
     text: 'hi',
     sessionId: 's1',
     captureContent: true,
   });
-  closeRootSpan(span, [assistantMessage()], undefined, true);
-  assert.equal(attrs(spans[0]!)['traceroot.pi.will_retry'], false);
+  stampRootOutput(span, [assistantMessage()], true);
+  finalizeRootSpan(span, 2, { code: SpanStatusCode.OK });
+  assert.equal(attrs(spans[0]!)['traceroot.pi.retry_count'], 2);
+  assert.equal(attrs(spans[0]!)['traceroot.pi.will_retry'], undefined, 'the old flag is gone');
+  assert.equal(spans[0]!.status.code, SpanStatusCode.OK);
+});
+
+test('finalizeRootSpan records an exception and sets ERROR status when given an error', () => {
+  const { tracer, spans } = makeTracer();
+  const span = openRootSpan(tracer, ROOT_CONTEXT, {
+    text: 'hi',
+    sessionId: 's1',
+    captureContent: true,
+  });
+  finalizeRootSpan(span, 0, { code: SpanStatusCode.ERROR, message: 'boom' }, new Error('boom'));
+  assert.equal(spans[0]!.status.code, SpanStatusCode.ERROR);
+  assert.equal(spans[0]!.status.message, 'boom');
+  assert.ok(
+    spans[0]!.events.some((e) => e.name === 'exception'),
+    'a recorded exception must appear as a span event',
+  );
 });
 
 test('openRootSpan sets session id, does not self-stamp sdk identity, and gates input.value on captureContent', () => {
@@ -238,7 +265,7 @@ test('openRootSpan sets session id, does not self-stamp sdk identity, and gates 
     sessionId: 'sess-9',
     captureContent: true,
   });
-  closeRootSpan(withContent, [], false, false);
+  finalizeRootSpan(withContent, 0, { code: SpanStatusCode.OK });
   const a = attrs(spans[0]!);
   assert.equal(a['openinference.span.kind'], 'AGENT');
   assert.equal(a['session.id'], 'sess-9');
@@ -254,12 +281,12 @@ test('openRootSpan sets session id, does not self-stamp sdk identity, and gates 
     sessionId: undefined,
     captureContent: false,
   });
-  closeRootSpan(noContent, [], false, false);
+  finalizeRootSpan(noContent, 0, { code: SpanStatusCode.OK });
   assert.equal(attrs(s2[0]!)['input.value'], undefined);
   assert.equal(attrs(s2[0]!)['session.id'], undefined);
 });
 
-test('closeRootSpan omits output.value when the final history has no assistant message', () => {
+test('stampRootOutput omits output.value when the final history has no assistant message', () => {
   const { tracer, spans } = makeTracer();
   const span = openRootSpan(tracer, ROOT_CONTEXT, {
     text: 'hi',
@@ -277,7 +304,8 @@ test('closeRootSpan omits output.value when the final history has no assistant m
       timestamp: 0,
     },
   ];
-  closeRootSpan(span, history, false, true);
+  stampRootOutput(span, history, true);
+  finalizeRootSpan(span, 0, { code: SpanStatusCode.OK });
   assert.equal(attrs(spans[0]!)['output.value'], undefined);
 });
 

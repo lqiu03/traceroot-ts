@@ -33,7 +33,16 @@ function makePiModule() {
   class FakeAgentSession {
     sessionId = 'integration-sess';
     private listeners: Array<(event: FakeAgentEvent) => void> = [];
-    async prompt(_text: string): Promise<void> {}
+    // prompt()'s returned promise settles only once its final agent_end
+    // fires (willRetry !== true) — mirrors the real SDK, where prompt()
+    // awaits its whole internal retry/compaction/follow-up loop; see
+    // pi-test-helpers.ts's module header for the full rationale.
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+    async prompt(_text: string): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
+    }
     subscribe(listener: (event: FakeAgentEvent) => void): () => void {
       this.listeners.push(listener);
       return () => {
@@ -42,6 +51,11 @@ function makePiModule() {
     }
     emit(event: FakeAgentEvent): void {
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
     }
     dispose(): void {
       this.listeners = [];
@@ -122,7 +136,7 @@ test('the real in-tree pi instrumentation wired through TraceRoot.initialize exp
   // Full prompt() -> agent_start -> (LLM turn) -> agent_end cycle, through the
   // REAL pi instrumentation initialize() just installed on Session.prototype.
   const session = new Session();
-  await session.prompt('summarize the repository');
+  const done = session.prompt('summarize the repository');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'turn_start' });
   session.emit({ type: 'message_start', message: assistantMessage('working on it') });
@@ -133,6 +147,7 @@ test('the real in-tree pi instrumentation wired through TraceRoot.initialize exp
     messages: [assistantMessage('the repository has three packages')],
     willRetry: false,
   });
+  await done;
 
   const spans = captured.getFinishedSpans();
   const rootSpan = spans.find((s) => spanKind(s) === 'AGENT');

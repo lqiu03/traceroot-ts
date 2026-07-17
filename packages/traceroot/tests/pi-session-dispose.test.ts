@@ -51,9 +51,10 @@ test('session.dispose() does not throw and requires no extra cleanup call from i
   // Drive one full, cleanly-closed turn so instrumentPiCodingAgent()'s
   // subscribe() listener is actually registered and has produced a span,
   // matching real usage instead of disposing an untouched session.
-  await session.prompt('do something');
+  const done = session.prompt('do something');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
   assert.equal(capture.spans.length, 1, 'the normal run must still produce its span');
 
   assert.doesNotThrow(() => {
@@ -99,11 +100,13 @@ test('dispose() mid-run (before agent_end) force-closes and exports any still-op
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  // Open a run and leave it mid-flight: agent_start opens the AGENT
-  // (root) span, message_start opens an LLM span, tool_execution_start
-  // opens a TOOL span — and crucially agent_end never fires, exactly the
-  // "host disposes while a run is in progress" scenario.
-  await session.prompt('long-running task');
+  // Open a run and leave it mid-flight: prompt() opens the AGENT (root)
+  // span, message_start opens an LLM span, tool_execution_start opens a
+  // TOOL span — and crucially agent_end never fires, exactly the "host
+  // disposes while a run is in progress" scenario. Not awaited: prompt()'s
+  // promise never settles on its own here (see pi-test-helpers.ts's module
+  // header) since this run is deliberately abandoned mid-flight.
+  session.prompt('long-running task');
   session.emit({ type: 'agent_start' });
   session.emit({
     type: 'message_start',
@@ -186,9 +189,10 @@ test('a session reused after dispose() re-subscribes and resumes tracing on its 
   const session = new Session();
 
   // First run: clean prompt/agent_start/agent_end cycle.
-  await session.prompt('first run');
+  const done1 = session.prompt('first run');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done1;
   assert.equal(capture.spans.length, 1, 'the first run must export its span');
 
   session.dispose();
@@ -197,9 +201,10 @@ test('a session reused after dispose() re-subscribes and resumes tracing on its 
   // Second run on the SAME session instance, after dispose(). A real host
   // reusing a session (or a test harness that calls dispose() defensively
   // between runs) must still get tracing on this next run.
-  await session.prompt('second run, after dispose()');
+  const done2 = session.prompt('second run, after dispose()');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done2;
 
   assert.equal(
     capture.spans.length,
@@ -224,7 +229,7 @@ test('dispose() force-closes the OTHER open spans even when one span throws whil
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('multi-tool run');
+  session.prompt('multi-tool run');
   session.emit({ type: 'agent_start' });
   session.emit({
     type: 'message_start',
@@ -348,13 +353,18 @@ test('agent_end after a reentrant dispose() force-closed the root span is surfac
     warnings.push(args.map((a) => String(a)).join(' '));
   };
   try {
-    await session.prompt('do the work'); // pi subscribes here, after the host
+    const done = session.prompt('do the work'); // pi subscribes here, after the host
     session.emit({ type: 'agent_start' });
     session.emit({
       type: 'agent_end',
       messages: [assistantMessage({ content: [{ type: 'text', text: 'the final answer' }] })],
       willRetry: false,
     });
+    // The reentrant dispose() already force-closed the root before pi's own
+    // agent_end handler ran (see below) — its identity guard means
+    // proto.prompt's own finalize() becomes a no-op once this settles, so
+    // awaiting it is still safe (it never re-ends the already-closed span).
+    await done;
   } finally {
     console.warn = originalWarn;
   }

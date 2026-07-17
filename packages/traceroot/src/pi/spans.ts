@@ -23,7 +23,7 @@ import type { SpanFactory } from '../reresolving-tracer';
 // Span path keys intentionally omitted — see file header. Everything else
 // mirrors packages/mastra/src/exporter.ts's attribute constant shape.
 const TR_ATTRIBUTES = {
-  WILL_RETRY: 'traceroot.pi.will_retry',
+  RETRY_COUNT: 'traceroot.pi.retry_count',
   FORCE_CLOSED: 'traceroot.pi.force_closed',
 } as const;
 
@@ -226,16 +226,40 @@ export function openRootSpan(
   return span;
 }
 
-export function closeRootSpan(
+// Stamps the run's output onto the root span WITHOUT ending it — called by
+// agent_end, once per attempt (retry/compaction/follow-up continuations all
+// share one still-open root under the new prompt()-anchored model; see
+// instrumentation.ts's module header). The LAST attempt's call wins, since
+// each subsequent agent_end simply overwrites OI_OUTPUT_VALUE with its own
+// final assistant message. Ending the span is finalizeRootSpan's job, called
+// once when the wrapping prompt() call's own promise settles.
+export function stampRootOutput(
   span: Span,
   finalMessages: AgentMessage[],
-  willRetry: boolean | undefined,
   captureContent: boolean,
 ): void {
-  setAttr(span, TR_ATTRIBUTES.WILL_RETRY, Boolean(willRetry));
-  if (captureContent) {
-    const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-    setAttr(span, OI_OUTPUT_VALUE, textOf(lastAssistant));
+  if (!captureContent) return;
+  const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
+  setAttr(span, OI_OUTPUT_VALUE, textOf(lastAssistant));
+}
+
+// Ends the root span exactly once, when the wrapping prompt() call's own
+// returned promise settles (resolve or reject) — see instrumentation.ts's
+// proto.prompt wrap. Stamps the observable retry-attempt count (superseding
+// the old per-attempt will_retry flag, which could not represent "this
+// prompt() call retried N times" across a single trace) and the final OTel
+// status, records an exception on failure, then ends the span via
+// endSpanSafe so a misbehaving exporter/processor can never crash the host.
+export function finalizeRootSpan(
+  span: Span,
+  retryCount: number,
+  status: { code: SpanStatusCode; message?: string },
+  error?: unknown,
+): void {
+  setAttr(span, TR_ATTRIBUTES.RETRY_COUNT, retryCount);
+  span.setStatus(status);
+  if (error !== undefined) {
+    span.recordException(error instanceof Error ? error : new Error(String(error)));
   }
   endSpanSafe(span);
 }

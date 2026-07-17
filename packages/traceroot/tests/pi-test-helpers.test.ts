@@ -58,30 +58,59 @@ test("attrs() reads a span's attributes as a plain record", () => {
   assert.deepEqual(attrs(span), { foo: 'bar' });
 });
 
-test('makeFakeSessionClass() returns a fresh class each call, and prompt() resolves by default', async () => {
+test('makeFakeSessionClass() returns a fresh class each call, and prompt() resolves once its final agent_end fires', async () => {
   const SessionA = makeFakeSessionClass();
   const SessionB = makeFakeSessionClass();
   assert.notEqual(SessionA, SessionB, 'each call must return an independent class');
 
+  // prompt() no longer resolves merely by being called (see this file's
+  // module header): it stays pending until an agent_end with willRetry !==
+  // true fires, mirroring the real SDK's prompt() awaiting its whole
+  // internal loop.
   const session = new SessionA();
-  await assert.doesNotReject(() => session.prompt('anything'));
+  const done = session.prompt('anything');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'agent_end', messages: [], willRetry: false });
+  await assert.doesNotReject(() => done);
 });
 
-test('makeFakeSessionClass(shouldReject) rejects prompt() only for matching text', async () => {
+test("makeFakeSessionClass()'s resolvePrompt() settles a pending call with no agent_end at all (the early-return mirror)", async () => {
+  const Session = makeFakeSessionClass();
+  const session = new Session();
+
+  const done = session.prompt('a handled slash command');
+  session.resolvePrompt();
+  await assert.doesNotReject(() => done);
+});
+
+test("makeFakeSessionClass()'s rejectPrompt() rejects a pending call (the async-path failure mirror)", async () => {
+  const Session = makeFakeSessionClass();
+  const session = new Session();
+
+  const done = session.prompt('a run that fails internally');
+  session.emit({ type: 'agent_start' });
+  session.rejectPrompt(new Error('internal failure'));
+  await assert.rejects(() => done, /internal failure/);
+});
+
+test('makeFakeSessionClass(shouldReject) rejects prompt() SYNCHRONOUSLY only for matching text', async () => {
   const Session = makeFakeSessionClass((text) => text === 'bad');
   const session = new Session();
 
   await assert.rejects(() => session.prompt('bad'));
-  await assert.doesNotReject(() => session.prompt('good'));
+  const done = session.prompt('good');
+  session.resolvePrompt();
+  await assert.doesNotReject(() => done);
 });
 
 test('makeRig() wires a fresh CapturingExporter and FakeAgentSession through instrumentPiCodingAgent', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('hello');
+  const done = session.prompt('hello');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(capture.spans.length, 1);
   assert.equal(attrs(capture.spans[0]!)['openinference.span.kind'], 'AGENT');
@@ -91,9 +120,10 @@ test('makeRig(config) forwards captureContent/captureToolIo through to instrumen
   const { capture, Session } = makeRig({ captureContent: false });
   const session = new Session();
 
-  await session.prompt('sensitive text');
+  const done = session.prompt('sensitive text');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(attrs(capture.spans[0]!)['input.value'], undefined);
 });

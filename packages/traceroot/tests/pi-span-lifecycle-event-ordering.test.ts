@@ -12,15 +12,17 @@
  *  - a second message_start firing back-to-back with no message_end/turn_end
  *    between them, WITHIN the same run (originally
  *    confirmed-bugfix-regressions.test.ts's Bug 2);
- *  - a stray message_start firing AFTER a clean agent_end already tore the
- *    run down, with no message_end ever following it, discovered only when
- *    the NEXT run's agent_start fires (originally
+ *  - a stray message_start/tool_execution_start firing AFTER a clean
+ *    prompt() call already settled and tore the run down, with no matching
+ *    close event ever following it, discovered only when the NEXT prompt()
+ *    call's own agent_start fires (originally
  *    agent-start-orphaned-llm-span.test.ts);
  *  - turn_end firing without a preceding message_end;
  *  - tool_execution_start with no prior message_start/message_end at all;
- *  - agent_end with zero prior events (no agent_start ever fired);
- *  - agent_start firing twice with no intervening agent_end;
- *  - a stray tool_execution_start firing after agent_end;
+ *  - agent_end with zero prior events (no agent_start ever fired, but a root
+ *    already exists — opened by prompt() itself under the new model);
+ *  - agent_start firing twice with no intervening agent_end, no new prompt()
+ *    call between them — the retry/compaction continuation shape;
  *  - a duplicate tool_execution_start for a toolCallId that is already open
  *    (originally adversarial-concurrency-and-state-lifecycle.test.ts's first
  *    test) — the same duplicate-open-event concern as the message_start
@@ -42,7 +44,9 @@ test('a second message_start with no intervening message_end/turn_end force-clos
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('two message_start events fire back to back, no message_end between them');
+  const done = session.prompt(
+    'two message_start events fire back to back, no message_end between them',
+  );
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'first-model' }) });
   // No message_end for the first message — a second message_start fires
@@ -53,6 +57,7 @@ test('a second message_start with no intervening message_end/turn_end force-clos
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'second-model' }) });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.equal(
@@ -80,32 +85,45 @@ test('a second message_start with no intervening message_end/turn_end force-clos
   );
 });
 
-test('a stray message_start firing after a clean agent_end (no matching message_end) is force-closed on the next agent_start instead of being silently dropped', async () => {
+test('a stray message_start firing after a clean prompt() call already settled (no matching message_end) is force-closed on the NEXT prompt() call’s agent_start instead of being silently dropped', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('run 1 finishes cleanly with no LLM turn at all');
+  // Reworked for the new model: run 1 must be a COMPLETE, AWAITED prompt()
+  // call (root opened and closed) before the stray event fires, so the
+  // stray message_start genuinely has no root open — under the old
+  // agent_start-anchored model, agent_end alone cleared rootCtx; under the
+  // new model the root only clears once THIS prompt() call's own promise
+  // settles.
+  const done1 = session.prompt('run 1 finishes cleanly with no LLM turn at all');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done1;
 
   assert.equal(capture.spans.length, 1, 'only run 1s root span has exported so far');
 
-  // A straggler assistant message_start arrives after agent_end already
-  // tore the run down (e.g. a late stream event) — with rootCtx cleared,
-  // it opens an LLM span parented under ROOT_CONTEXT. Its message_end never
-  // arrives (the stream is already abandoned).
+  // A straggler assistant message_start arrives after run 1s prompt() call
+  // already settled and tore the run down (e.g. a late stream event) — with
+  // rootCtx cleared, it opens an LLM span parented under ROOT_CONTEXT. Its
+  // message_end never arrives (the stream is already abandoned).
   session.emit({
     type: 'message_start',
     message: assistantMessage({ model: 'stray-orphaned-model' }),
   });
 
-  // Run 2 starts fresh. This is the moment the orphaned llmSpan from the
-  // straggler above must be force-closed and exported — mirroring exactly
-  // how a stray tool_execution_start in the same position is already swept.
+  // Run 2 starts fresh via a genuinely NEW prompt() call — agent_start alone
+  // no longer fabricates a root under the new model (see instrumentation.ts's
+  // rootless-bypass boundary policy), so "run 2 starts fresh" now requires
+  // its own prompt() call, not just another agent_start. This is the moment
+  // the orphaned llmSpan from the straggler above must be force-closed and
+  // exported — mirroring exactly how a stray tool_execution_start in the
+  // same position is already swept.
+  const done2 = session.prompt('run 2 prompt text');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'run-2-model' }) });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done2;
 
   const strayLlmSpan = capture.spans.find(
     (s) => attrs(s)['gen_ai.request.model'] === 'stray-orphaned-model',
@@ -130,7 +148,7 @@ test('turn_end firing without a preceding message_end force-closes the LLM span 
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a stream error truncates turn 1 before message_end fires');
+  const done = session.prompt('a stream error truncates turn 1 before message_end fires');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-1-model' }) });
   // No message_end for turn 1 — simulates a stream/abort cutting the turn
@@ -141,6 +159,7 @@ test('turn_end firing without a preceding message_end force-closes the LLM span 
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-2-model' }) });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.equal(
@@ -161,7 +180,9 @@ test('tool_execution_start with no prior message_start/message_end at all parent
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('agent invokes a tool with no assistant message event in front of it');
+  const done = session.prompt(
+    'agent invokes a tool with no assistant message event in front of it',
+  );
   session.emit({ type: 'agent_start' });
   session.emit({
     type: 'tool_execution_start',
@@ -177,6 +198,7 @@ test('tool_execution_start with no prior message_start/message_end at all parent
     isError: false,
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(capture.spans.length, 2, 'root + tool span only — no LLM span was ever opened');
   const rootSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
@@ -194,7 +216,7 @@ test('a duplicate tool_execution_start for a toolCallId that is already open for
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a buggy tool runner fires two starts for the same call id');
+  const done = session.prompt('a buggy tool runner fires two starts for the same call id');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -225,6 +247,7 @@ test('a duplicate tool_execution_start for a toolCallId that is already open for
     isError: false,
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.call.id'] === 't1');
   assert.equal(
@@ -254,92 +277,122 @@ test('a duplicate tool_execution_start for a toolCallId that is already open for
   );
 });
 
-test('agent_end with zero prior events (no agent_start ever fired) does not throw and produces no spans', async () => {
+test('agent_end with zero prior agent_start events still stamps the root that prompt() already opened, and does not throw', async () => {
+  // FLIPPED for the new model: under the old agent_start-anchored root, a
+  // session with no agent_start ever fired had no root to close, so this
+  // event produced zero spans. Under the new prompt()-anchored root, the
+  // wrapped prompt() call itself already opened a root the instant it was
+  // called — agent_end simply stamps output onto that still-open root
+  // (agent_start is not required first; it never was a strict precondition
+  // for the handler itself, only for the LLM/tool span machinery).
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('nothing has happened yet on this session');
+  const done = session.prompt('nothing has happened yet on this session');
   assert.doesNotThrow(() => {
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
   });
+  await done;
 
-  assert.equal(capture.spans.length, 0, 'there was no root span to close, so nothing is exported');
+  const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
+  assert.equal(
+    rootSpans.length,
+    1,
+    'the root prompt() opened is still stamped and exported once its promise settles',
+  );
 });
 
-test('agent_start firing twice with no intervening agent_end force-closes the abandoned run instead of leaking its spans or its context into the new run', async () => {
+test('agent_start firing twice with no intervening agent_end, and no new prompt() call between them, shares ONE root and does not leak a stale LLM context into the continuation', async () => {
+  // FLIPPED for the new model: under the old agent_start-anchored root, this
+  // exact event shape (two agent_starts, no agent_end, no new prompt() call)
+  // was indistinguishable from "run 1 abandoned, run 2 started cold" — so
+  // agent_start force-closed run 1's root and opened a genuinely NEW one for
+  // run 2. Under the new model this shape IS the retry/compaction
+  // continuation (see instrumentation.ts's module header): both attempts
+  // belong to the SAME prompt() call and must share the SAME still-open
+  // root, with only the dangling LLM/TOOL spans from the abandoned first
+  // attempt swept — never the root itself.
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('run 1 gets abandoned mid-flight (e.g. loop restart), run 2 starts cold');
-  session.emit({ type: 'agent_start' }); // run 1
-  session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-1-model' }) });
-  // Run 1 never reaches message_end/turn_end/agent_end — the loop is
-  // restarted and immediately emits a second agent_start.
-  session.emit({ type: 'agent_start' }); // run 2, no agent_end for run 1 in between
+  const done = session.prompt(
+    'attempt one gets abandoned mid-flight (e.g. loop restart), attempt two starts cold',
+  );
+  session.emit({ type: 'agent_start' }); // attempt one
+  session.emit({ type: 'message_start', message: assistantMessage({ model: 'attempt-1-model' }) });
+  // Attempt one never reaches message_end/turn_end/agent_end — the loop is
+  // restarted and immediately emits a second agent_start (no new prompt()).
+  session.emit({ type: 'agent_start' }); // attempt two, no agent_end for attempt one in between
   session.emit({
     type: 'tool_execution_start',
-    toolCallId: 'run2-tool',
+    toolCallId: 'attempt2-tool',
     toolName: 'bash',
-    args: { command: 'echo run2' },
+    args: { command: 'echo attempt2' },
   });
   session.emit({
     type: 'tool_execution_end',
-    toolCallId: 'run2-tool',
+    toolCallId: 'attempt2-tool',
     toolName: 'bash',
     result: {},
     isError: false,
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   assert.equal(
     rootSpans.length,
-    2,
-    'run 1s abandoned root span must be force-closed and exported, not leaked forever unclosed',
+    1,
+    'both attempts share exactly ONE root span — agent_start must never force-close it under the ' +
+      'new model, since it belongs to the whole prompt() window, not to one attempt',
   );
 
-  const run1LlmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'run-1-model');
-  assert.ok(run1LlmSpan, 'run 1s dangling LLM span must also be force-closed, not leaked');
+  const attempt1LlmSpan = capture.spans.find(
+    (s) => attrs(s)['gen_ai.request.model'] === 'attempt-1-model',
+  );
+  assert.ok(
+    attempt1LlmSpan,
+    'attempt ones dangling LLM span must still be force-closed, not leaked',
+  );
+  assert.equal(attrs(attempt1LlmSpan!)['traceroot.pi.force_closed'], true);
 
-  const run2Tool = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'run2-tool');
-  assert.ok(run2Tool);
-  // Identify run 1's (force-closed) root unambiguously: it's whichever root
-  // span is the parent of run 1's LLM span.
-  const run1Root = rootSpans.find((s) => s.spanContext().spanId === run1LlmSpan!.parentSpanId);
-  assert.ok(run1Root, 'run 1s LLM span must be parented under run 1s (force-closed) root span');
-  const run2Root = rootSpans.find((s) => s !== run1Root);
-  assert.ok(run2Root);
-  // The critical assertion: run 2's tool call must parent under run 2's own
-  // root span. If run 1's stale llmCtx were not cleared when run 2 started,
-  // this tool span would incorrectly parent under run 1's already-abandoned
-  // LLM span — a stale-context leak forward into the new run.
+  const attempt2Tool = capture.spans.find(
+    (s) => attrs(s)['gen_ai.tool.call.id'] === 'attempt2-tool',
+  );
+  assert.ok(attempt2Tool);
+  // The critical assertion under the new model: attempt two's tool span must
+  // parent under the SAME shared root as attempt one's abandoned LLM span —
+  // proving the continuation correctly reuses rootCtx rather than losing it.
   assert.equal(
-    run2Tool!.parentSpanId,
-    run2Root!.spanContext().spanId,
-    "run 2's tool span must parent under run 2's root, never under run 1's stale/abandoned context",
+    attempt2Tool!.parentSpanId,
+    rootSpans[0]!.spanContext().spanId,
+    'attempt twos tool span must parent under the one shared root',
   );
-  assert.notEqual(
-    run2Tool!.spanContext().traceId,
-    run1Root!.spanContext().traceId,
-    "run 2's tool span must live in a different trace than the abandoned run 1",
+  assert.equal(
+    attempt1LlmSpan!.spanContext().traceId,
+    attempt2Tool!.spanContext().traceId,
+    'both attempts must live in the SAME trace — the whole point of anchoring the root on ' +
+      'prompt() rather than on each individual attempt',
   );
 });
 
-test('a stray tool_execution_start firing after agent_end does not corrupt the next runs span tree', async () => {
+test('a stray tool_execution_start firing after a clean prompt() call already settled does not corrupt the NEXT prompt() call’s span tree', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('run 1 finishes cleanly');
+  const done1 = session.prompt('run 1 finishes cleanly');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done1;
   // run 1's root span is the only span exported so far — capture its id
   // before run 2 starts so we can unambiguously tell the two roots apart
   // (both carry identical attributes otherwise).
   assert.equal(capture.spans.length, 1);
   const run1RootSpanId = capture.spans[0]!.spanContext().spanId;
 
-  // A straggler event arrives after agent_end — e.g. an async tool runner's
-  // callback that resolves after the agent loop already tore the run down.
+  // A straggler event arrives after run 1's prompt() call already settled —
+  // e.g. an async tool runner's callback that resolves after the agent loop
+  // already tore the run down.
   assert.doesNotThrow(() => {
     session.emit({
       type: 'tool_execution_start',
@@ -349,11 +402,15 @@ test('a stray tool_execution_start firing after agent_end does not corrupt the n
     });
   });
 
-  // Run 2 starts fresh.
+  // Run 2 starts fresh via a genuinely NEW prompt() call (see the earlier
+  // stray-message_start test's comment on why agent_start alone no longer
+  // suffices under the new model).
+  const done2 = session.prompt('run 2 prompt text');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done2;
 
   const run2LlmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.ok(run2LlmSpan, 'run 2 must still produce a normal LLM span');
@@ -369,7 +426,7 @@ test('a stray tool_execution_start firing after agent_end does not corrupt the n
   );
 
   // The straggler tool span is eventually swept up (force-closed) by run 2's
-  // agent_end cleanup since it was never explicitly ended — but it must not
+  // agent_start cleanup since it was never explicitly ended — but it must not
   // be mistaken for a child of either run's root: it opened while no root
   // context was active, so it has no parent at all.
   const stragglerSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'straggler');
@@ -382,7 +439,7 @@ test('a message_end (assistant) whose message_start never arrived is ignored —
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a stream resumes mid-message: only the end event is ever delivered');
+  const done = session.prompt('a stream resumes mid-message: only the end event is ever delivered');
   session.emit({ type: 'agent_start' });
   // No message_start — the close event arrives with nothing open. The handler
   // must take the `if (state.llmSpan)` no-op path rather than throwing or
@@ -393,6 +450,7 @@ test('a message_end (assistant) whose message_start never arrived is ignored —
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'real-model' }) });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.equal(
@@ -406,6 +464,6 @@ test('a message_end (assistant) whose message_start never arrived is ignored —
   assert.notEqual(
     attrs(rootSpans[0])['traceroot.pi.force_closed'],
     true,
-    'the root span closed via the normal agent_end path, not a force-close sweep',
+    'the root span closed via the normal prompt()-settle path, not a force-close sweep',
   );
 });

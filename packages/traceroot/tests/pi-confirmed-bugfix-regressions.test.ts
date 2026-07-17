@@ -8,8 +8,15 @@
  *  - Bug 1 (beforeExit forceFlush) -> provider-shared-mode-behavior.test.ts
  *  - Bug 2 (second message_start force-closes the abandoned first LLM span)
  *    -> span-lifecycle-event-ordering.test.ts
- *  - Bug 3 (overlapping prompt() calls, FIFO) -> prompt-queue.test.ts
- *  - Bug 4 (retried run reuses the same input text) -> prompt-queue.test.ts
+ *  - Bug 3 (overlapping prompt() calls, FIFO) and Bug 4 (retried run reuses
+ *    the same input text) both exercised the now-deleted per-session
+ *    PromptQueue (prompt-queue.ts and its dedicated prompt-queue.test.ts are
+ *    both removed — see this change's root span re-anchoring). Their real
+ *    intent lives on in different, still-relevant forms: overlapping
+ *    prompt() calls are now covered by
+ *    dangling-span-sweep-deduplication.test.ts's overlap-safety test, and a
+ *    retried run sharing one root/input.value is covered by
+ *    instrumentation-edge-cases.test.ts's retry test.
  *  - Bug 5 (stray events never parent under an ambient active span, both
  *    variants) -> span-context-parenting.test.ts
  * Bugs 6-8 don't share a subject with any other file, so they stay here.
@@ -26,12 +33,18 @@ test('agent_start force-closes an orphaned tool span left over from a stray even
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('run 1 finishes cleanly');
+  const done1 = session.prompt('run 1 finishes cleanly');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  // Reworked for the new model: run 1's prompt() call must actually SETTLE
+  // (awaited here) before the stray event, so its root is genuinely gone —
+  // under the old agent_start-anchored root, agent_end alone cleared
+  // rootSpan; under the new prompt()-anchored root it only clears once this
+  // call's own promise settles (see instrumentation.ts's module header).
+  await done1;
 
-  // Stray tool_execution_start after agent_end — rootSpan is already
-  // undefined here, so the old "if (state.rootSpan)" gate would skip
+  // Stray tool_execution_start after run 1 fully settled — rootSpan is
+  // already undefined here, so the old "if (state.rootSpan)" gate would skip
   // sweeping this orphan at the NEXT agent_start entirely.
   session.emit({
     type: 'tool_execution_start',
@@ -40,6 +53,11 @@ test('agent_start force-closes an orphaned tool span left over from a stray even
     args: { command: 'echo orphan' },
   });
 
+  // Run 2 starts via a genuinely NEW prompt() call: agent_start alone no
+  // longer fabricates a root under the new model's rootless-bypass boundary
+  // policy (see instrumentation.ts's module header), so "run 2" must be a
+  // real second prompt() call here, not just another bare agent_start.
+  const done2 = session.prompt('run 2 prompt text');
   session.emit({ type: 'agent_start' });
   // A real ~30ms gap before run 2 does its own work. If the orphan is only
   // swept at run 2's agent_end (the bug), message_start/message_end/agent_end
@@ -58,6 +76,7 @@ test('agent_start force-closes an orphaned tool span left over from a stray even
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done2;
 
   const orphanSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'orphan');
   const run2Llm = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
@@ -95,7 +114,7 @@ test('turn_end force-closes any tool spans still open at the end of the turn ins
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a tool call never gets its tool_execution_end before the turn ends');
+  const done = session.prompt('a tool call never gets its tool_execution_end before the turn ends');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -118,6 +137,7 @@ test('turn_end force-closes any tool spans still open at the end of the turn ins
   assert.equal(attrs(toolSpanAtTurnEnd!)['traceroot.pi.force_closed'], true);
 
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
   const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.call.id'] === 'never-closes');
   assert.equal(
     toolSpans.length,

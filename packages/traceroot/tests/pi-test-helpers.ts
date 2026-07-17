@@ -11,6 +11,40 @@
  * OTel provider per rig and lets instrumentPiCodingAgent() re-resolve the
  * tracer through the global `trace` facade, exactly like core wiring does
  * in production.
+ *
+ * ── prompt()'s returned promise settles on the FINAL agent_end, not eagerly ──
+ * The root AGENT span is now anchored on the wrapped prompt() call's own
+ * promise window (see src/pi/instrumentation.ts's module header) — verified
+ * against the real SDK, prompt() awaits its whole internal retry/compaction/
+ * follow-up loop, so every attempt's agent_end fires before prompt() itself
+ * resolves. FakeAgentSession mirrors that here: prompt()'s returned promise
+ * does NOT resolve just because it was called — it stays pending until
+ * emit() observes an agent_end whose willRetry is not true (the attempt that
+ * ends the whole call, not a mid-loop continuation), and rejects only via the
+ * synchronous shouldReject path (a pre-flight validation failure, exactly
+ * like the real SDK's early-return validation) or the explicit
+ * rejectPrompt() escape hatch below (an async-path failure, e.g. an
+ * unexpected internal error the agent loop surfaces as a rejection instead
+ * of an agent_end).
+ *
+ * Because of this, tests MUST NOT `await session.prompt(text)` before
+ * emitting the events that make up that call's run — doing so would
+ * deadlock (or, for an early-return call, would need an explicit
+ * resolvePrompt()/rejectPrompt() call with no agent_start ever emitted). The
+ * established pattern across this suite is:
+ *
+ *   const done = session.prompt('text');   // NOT awaited yet
+ *   session.emit({ type: 'agent_start' });
+ *   ...
+ *   session.emit({ type: 'agent_end', ..., willRetry: false });
+ *   await done;                            // now resolves; root is finalized
+ *
+ * `await done` is required before asserting on `capture.spans` for the root
+ * span: instrumentation.ts's proto.prompt finalizes (stamps retry_count,
+ * sets status, ends) the root span in a `.then()` callback registered on the
+ * SAME promise BEFORE it is returned to the caller, so that callback is
+ * guaranteed to run (and, via SimpleSpanProcessor, export the ended span)
+ * strictly before `await done`'s own continuation resumes.
  */
 import { trace } from '@opentelemetry/api';
 import type { ExportResult } from '@opentelemetry/core';
@@ -44,19 +78,29 @@ export class CapturingExporter implements SpanExporter {
  * wrap layers onto the same prototype method. Call this once per rig/test.
  *
  * @param shouldReject - optional predicate; when it returns true for the
- *   text passed to prompt(), prompt() rejects instead of resolving. Used to
- *   reproduce a prompt() call that fails validation before agent_start
- *   ever fires.
+ *   text passed to prompt(), prompt() rejects SYNCHRONOUSLY (before ever
+ *   returning a pending promise) instead of resolving. Used to reproduce a
+ *   prompt() call that fails validation before agent_start ever fires — the
+ *   real SDK's own early-return validation path.
  */
 export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
   return class FakeAgentSession {
     sessionId = 'sess-1';
     disposed = false;
     private listeners: Array<(event: AgentEvent) => void> = [];
+    // The currently in-flight prompt() call's own settle functions, or
+    // undefined when no prompt() call is awaiting its final agent_end (or an
+    // explicit resolvePrompt()/rejectPrompt()). See this file's module
+    // header for why prompt() does not resolve merely by being called.
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+
     async prompt(text: string, _options?: unknown): Promise<void> {
       if (shouldReject?.(text)) {
         throw new Error(`validation failed for: ${text}`);
       }
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
     }
     subscribe(listener: (event: AgentEvent) => void): () => void {
       this.listeners.push(listener);
@@ -65,7 +109,39 @@ export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
       };
     }
     emit(event: AgentEvent): void {
+      // Every registered listener (instrumentation's own, plus any
+      // test-installed one) runs FIRST, synchronously — exactly mirroring
+      // the real SDK, where every attempt's agent_end handler completes
+      // before prompt()'s own promise resolves. Only after that do we check
+      // whether this event is the one that ends the whole prompt() call.
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
+    }
+    // Manually settles the current prompt() call's promise as a SUCCESS with
+    // no agent_end ever having fired — the async-path mirror of an
+    // early-return prompt() call (a handled "/command", a queue-only
+    // steer/followUp early return): the real SDK resolves without ever
+    // reaching _runAgentPrompt, so no agent_start/agent_end follows.
+    resolvePrompt(): void {
+      if (!this.pending) return;
+      const { resolve } = this.pending;
+      this.pending = undefined;
+      resolve();
+    }
+    // Manually rejects the current prompt() call's promise — the async-path
+    // mirror of an unexpected internal error the agent loop surfaces as a
+    // rejection rather than an agent_end. Distinct from the constructor's
+    // shouldReject, which models a SYNCHRONOUS pre-flight validation failure
+    // before the agent loop (and this pending promise) ever exists.
+    rejectPrompt(err: unknown): void {
+      if (!this.pending) return;
+      const { reject } = this.pending;
+      this.pending = undefined;
+      reject(err);
     }
     // dispose() mirrors the real, verified SDK mechanism (see
     // session-dispose.test.ts's module header): it reassigns the session's

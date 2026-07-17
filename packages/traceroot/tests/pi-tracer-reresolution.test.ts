@@ -62,13 +62,14 @@ test('an already-instrumented AgentSession keeps exporting across a shutdown()/i
 
     // First run lands in A.
     const s1 = new Session();
-    await s1.prompt('first run');
+    const done1 = s1.prompt('first run');
     s1.emit({ type: 'agent_start' });
     s1.emit({
       type: 'agent_end',
       messages: [assistantMessage({ content: [{ type: 'text', text: 'done A' }] })],
       willRetry: false,
     });
+    await done1;
     assert.ok(
       a.exporter.getFinishedSpans().some((s) => attrs(s)['openinference.span.kind'] === 'AGENT'),
       'sanity: the first run must export through provider A',
@@ -81,13 +82,14 @@ test('an already-instrumented AgentSession keeps exporting across a shutdown()/i
     b = registerProvider();
 
     const s2 = new Session();
-    await s2.prompt('second run');
+    const done2 = s2.prompt('second run');
     s2.emit({ type: 'agent_start' });
     s2.emit({
       type: 'agent_end',
       messages: [assistantMessage({ content: [{ type: 'text', text: 'done B' }] })],
       willRetry: false,
     });
+    await done2;
 
     const rootB = b.exporter
       .getFinishedSpans()

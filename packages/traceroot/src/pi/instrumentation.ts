@@ -9,6 +9,23 @@
  * sufficient to correlate events — matching the CLI extension's own
  * "explicit state, never ambient context" convention.
  *
+ * ── One trace per prompt() call ───────────────────────────────────────────
+ * The root AGENT span is anchored on the wrapped prompt() call's own promise
+ * window — opened at entry, closed when that promise settles — mirroring
+ * claude-agent-sdk.ts's one-root-per-query() idiom. This is deliberately NOT
+ * anchored on agent_start/agent_end: verified against the real, installed
+ * @earendil-works/pi-coding-agent@0.80.6 (dist/core/agent-session.js),
+ * AgentSession.prompt() awaits _runAgentPrompt(), whose
+ * `while (await this._handlePostAgentRun()) { await this.agent.continue(); }`
+ * loop performs EVERY retry/compaction/follow-up continuation inside the
+ * awaited promise, and each attempt's own agent_end handler completes before
+ * prompt() resolves. So a single root spanning the whole prompt() promise
+ * captures every continuation attempt as a child LLM/tool span (an ERROR
+ * attempt followed by an OK attempt, for example) instead of pi's internal
+ * retry/compaction/follow-up control flow leaking into trace *structure* as
+ * multiple sibling traces with identical input.value. See proto.prompt below
+ * for the open/close mechanics and the three DECIDED boundary policies.
+ *
  * Cleanup: instrumentPiCodingAgent() never unsubscribes its own listener.
  * This is verified, not assumed — read directly from the real, installed
  * @earendil-works/pi-coding-agent@0.80.6 (node_modules/.../dist/core/
@@ -29,20 +46,20 @@
  * elsewhere, so this holds unconditionally. There is no separate "session
  * ended" event to hook for cleanup, and none is needed.
  */
-import { context, ROOT_CONTEXT, trace } from '@opentelemetry/api';
+import { context, ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { Context, Span } from '@opentelemetry/api';
 import { resolveConfig, SDK_NAME } from './config';
 import type { PiInstrumentationConfig, ResolvedPiInstrumentationConfig } from './config';
 import { SDK_VERSION } from '../processor';
-import { PromptQueue, getPromptQueue, shouldSkipQueue } from './prompt-queue';
 import {
   closeDanglingSpan,
   closeLlmSpan,
-  closeRootSpan,
   closeToolSpan,
+  finalizeRootSpan,
   openLlmSpan,
   openRootSpan,
   openToolSpan,
+  stampRootOutput,
 } from './spans';
 import { createReresolvingTracer } from '../reresolving-tracer';
 import type { SpanFactory } from '../reresolving-tracer';
@@ -94,15 +111,25 @@ interface SessionSpanState {
   llmSpan: Span | undefined;
   llmCtx: Context | undefined;
   toolSpans: Map<string, Span>;
-  // True when dispose()'s force-close swept this run's still-open root span,
-  // so agent_end can tell that apart from having already closed it normally
-  // itself. A host listener that calls session.dispose() synchronously while
-  // handling agent_end (dispose() reassigns the listener array rather than
-  // mutating it, so pi's own agent_end handler still runs afterward in the
-  // same dispatch) would otherwise leave pi silently skipping the real close
-  // purely because state.rootSpan is already undefined — producing an
-  // incomplete trace with no signal. This flag lets agent_end detect and
-  // surface that instead.
+  // Observable retry-attempt count for the CURRENT prompt() window, reset to
+  // 0 when proto.prompt opens a fresh root and incremented once per
+  // agent_end{willRetry:true}. Stamped onto the root as
+  // traceroot.pi.retry_count when the window's prompt() promise settles (see
+  // finalizeRootSpan in spans.ts) — supersedes the old per-attempt
+  // traceroot.pi.will_retry flag, which could not represent "this prompt()
+  // call retried N times" on a single trace now that every attempt shares
+  // one root.
+  retryCount: number;
+  // True when dispose()'s force-close (or proto.prompt's own overlap sweep —
+  // see proto.prompt's OVERLAP SAFETY comment) swept this window's still-open
+  // root span, so agent_end can tell that apart from the root simply still
+  // being mid-flight. A host listener that calls session.dispose()
+  // synchronously while handling agent_end (dispose() reassigns the listener
+  // array rather than mutating it, so pi's own agent_end handler still runs
+  // afterward in the same dispatch) would otherwise leave pi silently
+  // skipping the real close purely because state.rootSpan is already
+  // undefined — producing an incomplete trace with no signal. This flag lets
+  // agent_end detect and surface that instead.
   rootForceClosedBySweep: boolean;
 }
 
@@ -171,17 +198,19 @@ function safeCloseDanglingSpan(span: Span | undefined, label: string): void {
 
 // Force-closes every span left open by an abandoned run: every open tool
 // span, then the LLM span, and — only when explicitly requested — the root
-// span. Shared by all 4 places that need this exact "abandon whatever state
-// was left dangling" sweep: agent_start (a previous run's agent_end never
-// fired), turn_end (a turn ending with an abandoned LLM/tool span), agent_end
-// (defensive cleanup before its own proper closeRootSpan() call), and
-// dispose() (mid-run teardown). closeDanglingSpan() is already a no-op on
-// `undefined`, and iterating + .clear()-ing an already-empty Map is already
-// a no-op, so callers never need their own `if (span)` / `if (size > 0)`
-// guard before calling this — a future change to sweep order or a new span
-// type added to SessionSpanState only has to be made here, once. Each
-// individual close goes through safeCloseDanglingSpan() (above), so one
-// span's close throwing never aborts the rest of the sweep.
+// span. Shared by every call site that needs this exact "abandon whatever
+// state was left dangling" sweep: agent_start (a previous ATTEMPT within the
+// same prompt() window crashed before its own agent_end), turn_end (a turn
+// ending with an abandoned LLM/tool span), agent_end (defensive cleanup
+// before stamping this attempt's output), proto.prompt (the OVERLAP SAFETY
+// sweep — see its own comment), and dispose() (mid-run teardown).
+// closeDanglingSpan() is already a no-op on `undefined`, and iterating +
+// .clear()-ing an already-empty Map is already a no-op, so callers never need
+// their own `if (span)` / `if (size > 0)` guard before calling this — a
+// future change to sweep order or a new span type added to SessionSpanState
+// only has to be made here, once. Each individual close goes through
+// safeCloseDanglingSpan() (above), so one span's close throwing never aborts
+// the rest of the sweep.
 function sweepDanglingSpans(
   state: SessionSpanState,
   options: { includeRoot?: boolean } = {},
@@ -206,19 +235,24 @@ function sweepDanglingSpans(
 // has()/add()/attachSpanListener() sequence; extracted here so future
 // changes to the guard (or to attachSpanListener's argument list) only need
 // to be made once. Pure structural extraction — no behavior change: the
-// three call sites always passed session, tracer, resolved, promptQueues,
-// sessionSpanState (all closed over here identically) to attachSpanListener.
+// three call sites always passed session, tracer, resolved, sessionSpanState
+// (all closed over here identically) to attachSpanListener.
+//
+// Guarantees a SessionSpanState exists for `session` once this returns:
+// either it already did (subscribedSessions.has(session) was true), or
+// attachSpanListener() below just created and stored one. proto.prompt relies
+// on this — `sessionSpanState.get(this)` immediately after calling this
+// function is guaranteed non-undefined.
 function ensureSubscribed(
   session: AgentSessionInstance,
   tracer: SpanFactory,
   config: ResolvedPiInstrumentationConfig,
-  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   subscribedSessions: WeakSet<AgentSessionInstance>,
   sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
 ): void {
   if (subscribedSessions.has(session)) return;
   subscribedSessions.add(session);
-  attachSpanListener(session, tracer, config, promptQueues, sessionSpanState);
+  attachSpanListener(session, tracer, config, sessionSpanState);
 }
 
 export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentationConfig): unknown {
@@ -263,16 +297,12 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
   // still matters even with a guaranteed provider).
   const tracer = createReresolvingTracer(SDK_NAME, SDK_VERSION);
 
-  // Per-session input-attribution state (the FIFO prompt queue plus its
-  // remembered-text/retry-reservation fields) — see prompt-queue.ts for why
-  // it is per-session and how a run's agent_start claims the right text.
-  const promptQueues = new WeakMap<AgentSessionInstance, PromptQueue>();
   const subscribedSessions = new WeakSet<AgentSessionInstance>();
-  // Mirrors promptQueues: attachSpanListener() below creates one
-  // SessionSpanState per session and closes over it for its own subscribe()
-  // callback, but AgentSession.prototype.dispose (patched once, below) has
-  // no closure over any particular session — it needs this out-of-band map
-  // to reach whichever session's SessionSpanState (if any) it was called on.
+  // attachSpanListener() below creates one SessionSpanState per session and
+  // closes over it for its own subscribe() callback, but
+  // AgentSession.prototype.dispose (patched once, below) has no closure over
+  // any particular session — it needs this out-of-band map to reach
+  // whichever session's SessionSpanState (if any) it was called on.
   const sessionSpanState = new WeakMap<AgentSessionInstance, SessionSpanState>();
 
   // Install everything below (every prototype method patch), then — and only
@@ -296,28 +326,91 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
 
     const originalPrompt = proto.prompt;
     proto.prompt = function (this: AgentSessionInstance, text, options) {
-      // Queue this call's text for its own agent_start to claim — unless it is
-      // a call that will never reach agent_start (shouldSkipQueue enumerates
-      // those early-return paths from public SDK surface). See prompt-queue.ts
-      // for the enqueue/claim contract and the proactive-vs-reactive rationale.
-      const promptQueue = getPromptQueue(promptQueues, this);
-      const entry =
-        typeof text === 'string' && !shouldSkipQueue(this, text, options)
-          ? promptQueue.enqueue(text)
-          : undefined;
-      ensureSubscribed(this, tracer, resolved, promptQueues, subscribedSessions, sessionSpanState);
-      // If this call throws synchronously or its promise rejects, it never
-      // reached agent_start, so its queued entry must be removed by reference
-      // identity before a LATER call mis-claims it (rejection only, not
-      // .finally() — see PromptQueue.removeIfStillQueued).
+      ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
+      // Guaranteed non-undefined: ensureSubscribed() either found an existing
+      // entry or attachSpanListener() just created one for `this` session.
+      const state = sessionSpanState.get(this) as SessionSpanState;
+
+      // OVERLAP SAFETY: a previous prompt() window's root is still open here
+      // — rare, since the real SDK's own isStreaming guard throws for most
+      // overlapping prompt() calls on one session, but not verified to cover
+      // every path. Force-close that stale window (root included) rather
+      // than silently overwriting state.rootSpan and leaking it unended
+      // forever (a span that never has .end() called on it is never
+      // exported at all).
+      if (state.rootSpan) {
+        sweepDanglingSpans(state, { includeRoot: true });
+      }
+
+      // parentCtx = context.active(), matching both the pre-existing root
+      // parent here and claude-agent-sdk.ts's own query() span — lets a host
+      // that wraps prompt() in its own span nest this trace under it.
+      const parentCtx = context.active();
+      const rootSpan = openRootSpan(tracer, parentCtx, {
+        text: typeof text === 'string' ? text : undefined,
+        sessionId: this.sessionId,
+        captureContent: resolved.captureContent,
+      });
+      state.rootSpan = rootSpan;
+      state.rootCtx = trace.setSpan(parentCtx, rootSpan);
+      state.rootForceClosedBySweep = false;
+      state.retryCount = 0;
+
+      // Ends and clears THIS window's root exactly once, guarded by identity
+      // (state.rootSpan === rootSpan) so a mid-run dispose() or a later
+      // overlapping prompt() call's own OVERLAP SAFETY sweep — either of
+      // which may already have force-closed and cleared it — is never
+      // double-ended or clobbers a DIFFERENT, newer window's root.
+      const finalize = (
+        status: { code: SpanStatusCode; message?: string },
+        error?: unknown,
+      ): void => {
+        if (state.rootSpan !== rootSpan) return;
+        state.rootSpan = undefined;
+        state.rootCtx = undefined;
+        finalizeRootSpan(rootSpan, state.retryCount, status, error);
+      };
+
+      // If this call throws synchronously (before ever returning a promise —
+      // e.g. a validation failure inside pi's own prompt() before the agent
+      // loop starts), it never reached agent_start: finalize the root as
+      // ERROR right here and rethrow, matching claude-agent-sdk.ts's own
+      // sync-throw handling in wrapQuery.
       let result: Promise<void>;
       try {
         result = originalPrompt.call(this, text, options);
       } catch (err) {
-        promptQueue.removeIfStillQueued(entry);
+        const message = err instanceof Error ? err.message : String(err);
+        finalize({ code: SpanStatusCode.ERROR, message }, err);
         throw err;
       }
-      result.catch(() => promptQueue.removeIfStillQueued(entry));
+      // A SEPARATE .then chain (not a replacement of `result`) so the host
+      // still sees the original resolution/rejection unmodified — mirrors
+      // the pre-existing pattern of using `result.catch(() => ...)` and
+      // still returning `result` unchanged. Re-throwing from onReject is not
+      // needed: attaching this handler is enough to mark `result`'s
+      // rejection as handled for Node's unhandledRejection detection, and
+      // the caller's own await/.then on the returned `result` still observes
+      // the real rejection.
+      //
+      // Three DECIDED boundary policies, all implemented by this single
+      // finalize() call reached via either branch:
+      //  1. A run that bypasses prompt() entirely (e.g.
+      //     sendCustomMessage({triggerTurn:true})) never opens a root at
+      //     all — see agent_start below — so it is unaffected by this block.
+      //  2. An early-return prompt() call (a handled "/command", a
+      //     queue-only steer/followUp early return) resolves without
+      //     agent_start ever firing: onResolve below still fires, so the
+      //     root closes OK with no children — a trivial, childless span.
+      //  3. A rejection (or the sync-throw path above) always finalizes the
+      //     root ERROR, with the rejection reason recorded as an exception.
+      result.then(
+        () => finalize({ code: SpanStatusCode.OK }),
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          finalize({ code: SpanStatusCode.ERROR, message }, err);
+        },
+      );
       return result;
     };
     rollback.push(() => {
@@ -335,29 +428,17 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     // subsequent AgentEvent (agent_start through agent_end) silently produced
     // zero spans for the entire lifetime of that session.
     //
-    // Deliberately NOT enqueuing steer()/followUp() text into the prompt queue
-    // the way prompt() does above: verified against the real, installed
-    // @earendil-works/pi-agent-core@0.80.6 (dist/agent.js:169-176),
-    // Agent.steer()/Agent.followUp() only ever push onto an internal queue —
-    // neither one ever itself triggers a fresh run (only Agent.prompt()/
-    // continue() do, via runPromptMessages()). Because the prompt queue is a
-    // FIFO consumed exclusively by agent_start, queuing steer()/followUp() text
-    // into it would misattribute that text to whatever LATER, unrelated run's
-    // agent_start happens to fire next — a worse bug than the "no tracing at
-    // all" defect this patch fixes. Only patched when present as a function —
-    // defensive, like the dispose() patch below, so a minimal/partial double
-    // never disables prompt instrumentation over a missing, unrelated method.
+    // steer()/followUp() never open a root span themselves — only
+    // proto.prompt does. A run triggered purely by steer()/followUp() (no
+    // enclosing prompt() call ever made) is therefore a BYPASS run under the
+    // rootless boundary policy: see agent_start below. Only patched when
+    // present as a function — defensive, like the dispose() patch below, so
+    // a minimal/partial double never disables prompt instrumentation over a
+    // missing, unrelated method.
     if (typeof proto.steer === 'function') {
       const originalSteer = proto.steer;
       proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-        ensureSubscribed(
-          this,
-          tracer,
-          resolved,
-          promptQueues,
-          subscribedSessions,
-          sessionSpanState,
-        );
+        ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
         return originalSteer.call(this, text, images);
       };
       rollback.push(() => {
@@ -367,14 +448,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
     if (typeof proto.followUp === 'function') {
       const originalFollowUp = proto.followUp;
       proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-        ensureSubscribed(
-          this,
-          tracer,
-          resolved,
-          promptQueues,
-          subscribedSessions,
-          sessionSpanState,
-        );
+        ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
         return originalFollowUp.call(this, text, images);
       };
       rollback.push(() => {
@@ -397,13 +471,15 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // _eventListeners array, which stops our subscribe() callback from
         // ever firing again but does nothing to whatever spans that callback
         // had already opened. If a host calls dispose() mid-run — after
-        // agent_start but before agent_end — this session's SessionSpanState
-        // (if it was ever subscribed) can still have an open rootSpan/llmSpan/
-        // toolSpans that will now never see their normal close event. Force-
-        // close them here first, exactly like agent_start's own dangling-span
-        // sweep, so they still export instead of leaking silently (see
-        // safeCloseDanglingSpan on why a never-.end()ed span is never exported)
-        // — then delegate to the real dispose().
+        // agent_start but before agent_end, or even after agent_end but
+        // before this window's prompt() promise has settled — this session's
+        // SessionSpanState (if it was ever subscribed) can still have an
+        // open rootSpan/llmSpan/toolSpans that will now never see their
+        // normal close. Force-close them here first, exactly like
+        // agent_start's own dangling-span sweep, so they still export
+        // instead of leaking silently (see safeCloseDanglingSpan on why a
+        // never-.end()ed span is never exported) — then delegate to the real
+        // dispose().
         const state = sessionSpanState.get(this);
         if (state) {
           // Whether this dispose() force-closed a still-open root span. If a
@@ -432,7 +508,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
             // called twice on the same session; a second call now takes the
             // same no-op path as a session with no SessionSpanState at all.
             sessionSpanState.delete(this);
-            promptQueues.delete(this);
             // subscribedSessions gates every "already subscribed?" check at
             // the top of proto.prompt/steer/followUp above. Nothing in the
             // real SDK stops a host from calling prompt()/steer()/followUp()
@@ -453,10 +528,11 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // A session that was never subscribed (no prompt() call ever reached
         // the attachSpanListener() branch above) or that has no open spans
         // left (the common, already-idle case — e.g. dispose() called after
-        // agent_end already closed everything normally) hits nothing but the
-        // `if (state)` check above, so this call into the real dispose() is
-        // unchanged: same arguments, same return value, same timing as before
-        // this patch existed.
+        // this window's prompt() promise already settled and closed
+        // everything normally) hits nothing but the `if (state)` check
+        // above, so this call into the real dispose() is unchanged: same
+        // arguments, same return value, same timing as before this patch
+        // existed.
         return originalDispose.call(this);
       };
       rollback.push(() => {
@@ -499,7 +575,6 @@ function attachSpanListener(
   session: AgentSessionInstance,
   tracer: SpanFactory,
   config: ResolvedPiInstrumentationConfig,
-  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   sessionSpanState: WeakMap<AgentSessionInstance, SessionSpanState>,
 ): void {
   const state: SessionSpanState = {
@@ -508,6 +583,7 @@ function attachSpanListener(
     llmSpan: undefined,
     llmCtx: undefined,
     toolSpans: new Map(),
+    retryCount: 0,
     rootForceClosedBySweep: false,
   };
   // Reachable from AgentSession.prototype.dispose (patched once, in
@@ -517,7 +593,7 @@ function attachSpanListener(
 
   session.subscribe((event: AgentEvent) => {
     try {
-      handleEvent(event, session, tracer, config, promptQueues, state);
+      handleEvent(event, tracer, config, state);
     } catch (err) {
       // A handler throw must never reach Pi's event dispatcher — that would
       // crash or destabilize the host app's agent loop over a tracing bug.
@@ -531,52 +607,41 @@ function attachSpanListener(
 
 function handleEvent(
   event: AgentEvent,
-  session: AgentSessionInstance,
   tracer: SpanFactory,
   config: ResolvedPiInstrumentationConfig,
-  promptQueues: WeakMap<AgentSessionInstance, PromptQueue>,
   state: SessionSpanState,
 ): void {
   switch (event.type) {
     case 'agent_start': {
-      // A fresh agent_start while a previous run's root span is still open
-      // means that run's agent_end never fired (e.g. the loop crashed and
-      // restarted rather than cleanly finishing) — force-close everything
-      // left open from it instead of silently leaking those spans, and
-      // instead of leaving their now-stale context around to be picked up
-      // as the parent of this new run's spans.
+      // Sweep dangling LLM/tool spans from a crashed prior ATTEMPT within
+      // the same prompt() window (e.g. the loop restarted a retry/
+      // compaction/follow-up continuation without its own agent_end ever
+      // firing for the previous attempt). Deliberately WITHOUT includeRoot:
+      // the root now belongs to the enclosing prompt() call's promise
+      // window, not to any one attempt, so agent_start must never close it —
+      // doing so would end the trace early and orphan every later
+      // continuation attempt's spans onto a fresh, disconnected root.
       //
-      // sweepDanglingSpans() force-closes the tool spans, the LLM span, and
-      // (with includeRoot: true here) the root span unconditionally — it
-      // never needs to gate on state.rootSpan first. That matters because a
-      // stray tool_execution_start OR a stray message_start (with no
-      // matching message_end) can arrive AFTER a prior run's agent_end
-      // already cleared rootSpan (e.g. an async tool callback resolving
-      // late, or a straggler stream event), leaving an orphaned entry with
-      // no rootSpan to gate on. Without sweeping each one unconditionally,
-      // that orphan would never be swept here and would either stay open
-      // forever (tool span) or have its reference silently overwritten below
-      // without ever calling .end() on it (LLM span) — see safeCloseDanglingSpan
-      // on why a never-.end()ed span is never exported, not merely "left open".
-      sweepDanglingSpans(state, { includeRoot: true });
-      const parentCtx = context.active();
-      // Resolve this run's input text from its per-session PromptQueue: the
-      // oldest queued prompt() text, a retry reservation, or the remembered
-      // continuation text — the entire decision (and its rationale) lives in
-      // PromptQueue.claimForRun (see prompt-queue.ts).
-      const inputText = getPromptQueue(promptQueues, session).claimForRun();
-      state.rootSpan = openRootSpan(tracer, parentCtx, {
-        text: inputText,
-        sessionId: session.sessionId,
-        captureContent: config.captureContent,
-      });
-      state.rootCtx = trace.setSpan(parentCtx, state.rootSpan);
+      // sweepDanglingSpans() force-closes the tool spans and the LLM span
+      // unconditionally — it never needs to gate on anything first. That
+      // matters because a stray tool_execution_start OR a stray
+      // message_start (with no matching message_end) can arrive from a
+      // prior attempt with no clean handoff, leaving an orphaned entry.
+      // Without sweeping each one unconditionally, that orphan would either
+      // stay open forever (tool span) or have its reference silently
+      // overwritten below without ever calling .end() on it (LLM span) — see
+      // safeCloseDanglingSpan on why a never-.end()ed span is never
+      // exported.
+      sweepDanglingSpans(state);
       state.llmSpan = undefined;
       state.llmCtx = undefined;
-      // Fresh run: clear any close-disposition left over from a prior run on
-      // this reused state object, so agent_end's reentrant-dispose detection
-      // can never fire on a stale flag.
-      state.rootForceClosedBySweep = false;
+      // Boundary policy 1 (rootless bypass): if state.rootSpan is undefined
+      // here, this run never went through the wrapped prompt() call at all
+      // (e.g. sendCustomMessage({triggerTurn:true}), or a steer()/followUp()-
+      // only session with no enclosing prompt()). Do NOT synthesize a root
+      // for it — its LLM/tool children fall back to ROOT_CONTEXT below
+      // (message_start / tool_execution_start's own fallback) and form a
+      // parentless mini-trace instead of a fabricated, input-less AGENT span.
       break;
     }
     case 'message_start': {
@@ -618,7 +683,8 @@ function handleEvent(
       // calls are turn-scoped too: any tool span still open when the turn
       // ends (its tool_execution_end never arrived) must be force-closed
       // here as well, instead of staying open until agent_end. Root span is
-      // deliberately left untouched — turn_end isn't session end.
+      // deliberately left untouched — turn_end isn't session end (nor even
+      // attempt end).
       sweepDanglingSpans(state);
       state.llmCtx = undefined;
       break;
@@ -655,54 +721,43 @@ function handleEvent(
       break;
     }
     case 'agent_end': {
-      // Defensive cleanup for any tool/LLM span this run left dangling,
+      // Defensive cleanup for any tool/LLM span this attempt left dangling,
       // mirroring turn_end's identical sweep — normally both are already
       // empty by the time agent_end fires. The root span is NOT part of this
-      // sweep: it gets its own proper closeRootSpan() below rather than a
-      // force-close, since agent_end is the real, expected end of a run.
+      // sweep: agent_end no longer owns closing the root at all (that is
+      // now proto.prompt's job, on the enclosing promise settling) — it only
+      // stamps this attempt's output onto whatever root is currently open.
       sweepDanglingSpans(state);
       state.llmCtx = undefined;
       if (state.rootSpan) {
-        closeRootSpan(state.rootSpan, event.messages, event.willRetry, config.captureContent);
+        // The LAST attempt's call wins: a retry/compaction/follow-up
+        // continuation's own later agent_end simply overwrites
+        // OI_OUTPUT_VALUE with ITS final assistant message, so the trace's
+        // output always reflects the prompt() call's true final result
+        // rather than an intermediate attempt's.
+        stampRootOutput(state.rootSpan, event.messages, config.captureContent);
       } else if (state.rootForceClosedBySweep) {
-        // This run's root span is gone not because agent_end already ran, but
-        // because a reentrant dispose() (a host's own earlier-registered
-        // agent_end listener disposing the session synchronously) force-closed
-        // it before this handler got to run for the same event. The real close
-        // — which stamps output.value and the retry flag — can no longer
-        // happen (the root span is already ended), so the exported AGENT span
-        // is a FORCE_CLOSED one missing this run's final output. Surface that
-        // rather than silently dropping the completion data.
+        // This attempt's root span is gone not because it was never open,
+        // but because a reentrant dispose() (a host's own earlier-registered
+        // agent_end listener disposing the session synchronously) — or,
+        // under the new model, a later OVERLAP SAFETY sweep from a second
+        // prompt() call racing this one — force-closed it before this
+        // handler got to run for the same event. The real stamp can no
+        // longer happen (the root span is already ended), so the exported
+        // AGENT span is a FORCE_CLOSED one missing this attempt's output.
+        // Surface that rather than silently dropping the completion data.
         console.warn(
           "[traceroot-pi] agent_end arrived after this run's root span was already force-closed " +
             'by a reentrant dispose(); the exported AGENT span is missing its final output/retry ' +
             'attributes.',
         );
       }
-      state.rootSpan = undefined;
-      state.rootCtx = undefined;
-      // Arm the one-shot retry reservation when — and only when — Pi's own
-      // auto-retry heuristic says this run will retry (event.willRetry). The
-      // remembered input text is never cleared here (regardless of willRetry)
-      // so compaction/follow-up continuations still get the empty-queue
-      // fallback; retry alone is explicitly observable, so it alone gets the
-      // stronger reservation. See prompt-queue.ts for the full asymmetry.
+      // Observable retry attempts, superseding the old per-attempt
+      // traceroot.pi.will_retry flag: stamped onto the root as
+      // traceroot.pi.retry_count once the enclosing prompt() call's own
+      // promise settles (see finalizeRootSpan in spans.ts).
       if (event.willRetry) {
-        getPromptQueue(promptQueues, session).reserveForRetry();
-      }
-      break;
-    }
-    case 'auto_retry_end': {
-      // The SDK cancelled the retry (session.abort() -> abortRetry() aborts
-      // _prepareRetry's backoff sleep, which returns false so NO continuation
-      // agent_start fires) or exhausted it. Either way the reservation armed by
-      // agent_end{willRetry:true} above will never be consumed by a retry
-      // continuation; clear it so a LATER, genuinely-new prompt() call's
-      // agent_start can't mis-consume it. Clearing on the retries-exhausted
-      // path is harmless: willRetry is false at maxRetries so the reservation
-      // was never armed there.
-      if (event.success === false) {
-        getPromptQueue(promptQueues, session).clearReservation();
+        state.retryCount += 1;
       }
       break;
     }

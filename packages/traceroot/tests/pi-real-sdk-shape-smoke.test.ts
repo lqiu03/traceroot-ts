@@ -3,15 +3,23 @@
  * src/instrumentation.ts and src/types.ts document by hand.
  *
  * Those files cite specific fields and methods of the real, installed SDK --
- * the private `_eventListeners` listener array, the standalone
- * steer()/followUp()/dispose() entry points, the `isStreaming` and
- * `extensionRunner` getters, `hasExtensionHandlers()`, and ExtensionRunner's
- * `getCommand()` -- all read straight out of the installed source, none of
- * them part of a stable public contract. The peer range (>=0.79.0 <1) permits
- * a patch bump that could silently rename or drop any of them, invalidating
- * those comments (and the behavior that depends on them) with zero failures
- * anywhere else in the suite, because every other test mocks a hand-rolled
- * FakeAgentSession.
+ * the private `_eventListeners` listener array and the standalone
+ * steer()/followUp()/dispose() entry points -- all read straight out of the
+ * installed source, none of them part of a stable public contract. The peer
+ * range (>=0.79.0 <1) permits a patch bump that could silently rename or drop
+ * any of them, invalidating those comments (and the behavior that depends on
+ * them) with zero failures anywhere else in the suite, because every other
+ * test mocks a hand-rolled FakeAgentSession.
+ *
+ * The `isStreaming`/`extensionRunner` getters, `hasExtensionHandlers()`, and
+ * ExtensionRunner's `getCommand()` were previously verified here too --
+ * proto.prompt's now-deleted prompt-queue "should this call skip the FIFO"
+ * heuristic (shouldSkipQueue, prompt-queue.ts) was the only reader of any of
+ * them. Now that the root span is anchored on prompt()'s own promise window
+ * instead of a per-session input-attribution queue (see instrumentation.ts's
+ * module header), instrumentation.ts no longer reads any of those four, so
+ * asserting their shape here no longer protects anything this package
+ * depends on.
  *
  * This is the ONLY test that imports the REAL package, so a future SDK bump
  * that changes any of these shapes fails loudly here instead of silently
@@ -32,7 +40,6 @@ import { test } from 'node:test';
 // failure below, not an opaque module-link error.
 type RealSdk = {
   AgentSession?: { prototype: Record<string, unknown> };
-  ExtensionRunner?: { prototype: Record<string, unknown> };
 };
 let cachedSdk: Promise<RealSdk> | undefined;
 function loadRealSdk(): Promise<RealSdk> {
@@ -61,10 +68,10 @@ test('the real AgentSession still exposes every prototype method instrumentPiCod
     'AgentSession.prototype.subscribe must exist -- the entire span tree is built from one subscribe() listener',
   );
 
-  // steer/followUp/dispose/hasExtensionHandlers are optional-guarded in the
-  // patch layer, but instrumentation.ts's comments assert they ARE present on
-  // the real SDK; if that stops being true the comments (and the behavior they
-  // justify) are stale.
+  // steer/followUp/dispose are optional-guarded in the patch layer, but
+  // instrumentation.ts's comments assert they ARE present on the real SDK; if
+  // that stops being true the comments (and the behavior they justify) are
+  // stale.
   assert.equal(
     typeof proto.steer,
     'function',
@@ -79,43 +86,6 @@ test('the real AgentSession still exposes every prototype method instrumentPiCod
     typeof proto.dispose,
     'function',
     'AgentSession.prototype.dispose must exist -- patched to force-close in-flight spans on teardown',
-  );
-  assert.equal(
-    typeof proto.hasExtensionHandlers,
-    'function',
-    "AgentSession.prototype.hasExtensionHandlers must exist -- proto.prompt calls hasExtensionHandlers('input')",
-  );
-});
-
-test('the real AgentSession still exposes the isStreaming and extensionRunner getters proto.prompt reads', async () => {
-  const sdk = await loadRealSdk();
-  const proto = sdk.AgentSession!.prototype;
-  const isStreaming = Object.getOwnPropertyDescriptor(proto, 'isStreaming');
-  const extensionRunner = Object.getOwnPropertyDescriptor(proto, 'extensionRunner');
-  assert.equal(
-    typeof isStreaming?.get,
-    'function',
-    'AgentSession.prototype.isStreaming must remain a getter -- proto.prompt reads session.isStreaming to skip queuing a streamed-only call',
-  );
-  assert.equal(
-    typeof extensionRunner?.get,
-    'function',
-    'AgentSession.prototype.extensionRunner must remain a getter -- proto.prompt reads session.extensionRunner.getCommand(...)',
-  );
-});
-
-test('the real ExtensionRunner still exposes getCommand, which proto.prompt uses to detect a slash-command match', async () => {
-  const sdk = await loadRealSdk();
-  const ExtensionRunner = sdk.ExtensionRunner;
-  assert.equal(
-    typeof ExtensionRunner,
-    'function',
-    'ExtensionRunner must still be an exported class',
-  );
-  assert.equal(
-    typeof ExtensionRunner!.prototype.getCommand,
-    'function',
-    'ExtensionRunner.prototype.getCommand must exist -- proto.prompt calls session.extensionRunner.getCommand(name)',
   );
 });
 

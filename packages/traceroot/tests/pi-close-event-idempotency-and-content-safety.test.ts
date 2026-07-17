@@ -6,9 +6,11 @@
  *    ones;
  *  - 3+ concurrent tool calls with out-of-order ends (only 2 concurrent tested
  *    elsewhere);
- *  - cross-session isolation of the willRetry input reservation flag;
- *  - agent_end firing twice (double-close of the root span);
- *  - malformed message content (not an array) reaching closeRootSpan /
+ *  - cross-session isolation of the retry-attempt count;
+ *  - agent_end firing twice for one attempt (idempotent output stamping,
+ *    since agent_end no longer owns closing the root — see
+ *    instrumentation.ts's module header on the prompt()-anchored model);
+ *  - malformed message content (not an array) reaching stampRootOutput /
  *    closeLlmSpan while captureContent is on — regression coverage for a bug
  *    where the content-extraction step could throw before endSpanSafe() ran,
  *    silently dropping the span instead of exporting it.
@@ -21,7 +23,7 @@ test('tool_execution_end firing twice for the same toolCallId exports exactly on
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a buggy tool runner emits two end events for one call id');
+  const done = session.prompt('a buggy tool runner emits two end events for one call id');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -50,6 +52,7 @@ test('tool_execution_end firing twice for the same toolCallId exports exactly on
     });
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.call.id'] === 't1');
   assert.equal(toolSpans.length, 1, 'exactly one tool span despite two end events');
@@ -64,7 +67,7 @@ test('message_end (assistant) firing twice exports exactly one LLM span and the 
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a duplicated message_end arrives for one assistant turn');
+  const done = session.prompt('a duplicated message_end arrives for one assistant turn');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'm1' }) });
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'm1' }) });
@@ -72,6 +75,7 @@ test('message_end (assistant) firing twice exports exactly one LLM span and the 
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'm1' }) });
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.equal(
@@ -85,7 +89,7 @@ test('a late tool_execution_end arriving after agent_end already force-closed th
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a tool never closes before agent_end, then its end arrives late');
+  const done = session.prompt('a tool never closes before agent_end, then its end arrives late');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -97,6 +101,7 @@ test('a late tool_execution_end arriving after agent_end already force-closed th
   });
   // agent_end force-closes the dangling tool span (marks it force_closed).
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
   // The real tool_execution_end lands late, after the sweep already cleared
   // state.toolSpans — must be a no-op, not a second export or a crash.
   assert.doesNotThrow(() => {
@@ -118,7 +123,7 @@ test('three concurrent tool calls in one turn with out-of-order ends each get th
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('three tools run concurrently and finish out of order');
+  const done = session.prompt('three tools run concurrently and finish out of order');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -154,6 +159,7 @@ test('three concurrent tool calls in one turn with out-of-order ends each get th
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'TOOL');
   assert.equal(toolSpans.length, 3, 'exactly three distinct tool spans');
@@ -177,23 +183,33 @@ test('three concurrent tool calls in one turn with out-of-order ends each get th
   }
 });
 
-test('the willRetry input reservation is per-session: one session arming it must not make another session reuse the wrong input text', async () => {
+// Rephrased from a pre-fix test of the now-deleted per-session PromptQueue's
+// willRetry reservation (that mechanism no longer exists — see
+// prompt-queue.ts's removal in this change). The underlying concern —
+// per-session state must never leak across sessions — still applies to its
+// replacement, SessionSpanState.retryCount: session A retrying must not
+// bleed its retry_count into an unrelated session B's own root span.
+test('the retry-attempt count is per-session: one session incrementing it must not make another session inherit it', async () => {
   const { capture, Session } = makeRig();
   const sessionA = new Session();
   const sessionB = new Session();
   (sessionA as { sessionId: string }).sessionId = 'A';
   (sessionB as { sessionId: string }).sessionId = 'B';
 
-  // Session A runs and arms its retry reservation (willRetry: true), but its
-  // retry continuation has NOT fired yet.
-  await sessionA.prompt('input-A');
+  // Session A retries once (its own root stays open across the continuation
+  // — see instrumentation-edge-cases.test.ts's retry test).
+  const doneA = sessionA.prompt('input-A');
   sessionA.emit({ type: 'agent_start' });
   sessionA.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: true });
+  sessionA.emit({ type: 'agent_start' });
+  sessionA.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await doneA;
 
-  // Session B, a completely independent session, now starts its own run.
-  await sessionB.prompt('input-B');
+  // Session B, a completely independent session, runs cleanly with no retry.
+  const doneB = sessionB.prompt('input-B');
   sessionB.emit({ type: 'agent_start' });
   sessionB.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await doneB;
 
   const bRoot = capture.spans.find(
     (s) => attrs(s)['openinference.span.kind'] === 'AGENT' && attrs(s)['session.id'] === 'B',
@@ -202,11 +218,23 @@ test('the willRetry input reservation is per-session: one session arming it must
   assert.equal(
     attrs(bRoot!)['input.value'],
     'input-B',
-    "session B's root span must carry its own input, never session A's reserved retry text",
+    "session B's root span must carry its own input, never session A's",
+  );
+  assert.equal(
+    attrs(bRoot!)['traceroot.pi.retry_count'],
+    0,
+    "session B's retry_count must not inherit session A's retry",
   );
 });
 
-test('agent_end firing twice in a row closes the root span exactly once and does not emit a spurious reentrant-dispose warning on the second', async () => {
+test('agent_end firing twice for one attempt before prompt() settles stamps output idempotently and does not emit a spurious reentrant-dispose warning', async () => {
+  // Under the pre-fix (agent_end-anchored) model, agent_end closed the root
+  // itself, so a duplicate agent_end risked a double-close. Flipped here:
+  // agent_end no longer closes the root at all (see instrumentation.ts's
+  // module header) — it only stamps output onto the still-open root, so a
+  // duplicate agent_end is now just a harmless repeated stamp. The root
+  // still closes exactly once, when the enclosing prompt() call's own
+  // promise settles.
   const { capture, Session } = makeRig();
   const session = new Session();
 
@@ -216,12 +244,13 @@ test('agent_end firing twice in a row closes the root span exactly once and does
     warnings.push(args);
   };
   try {
-    await session.prompt('a duplicate agent_end fires for one run');
+    const done = session.prompt('a duplicate agent_end fires for one run');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     assert.doesNotThrow(() => {
       session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     });
+    await done;
   } finally {
     console.warn = originalWarn;
   }
@@ -231,12 +260,12 @@ test('agent_end firing twice in a row closes the root span exactly once and does
   assert.equal(
     attrs(rootSpans[0]!)['traceroot.pi.force_closed'],
     undefined,
-    'the root span closed normally on the first agent_end',
+    'the root span closed normally when prompt() settled',
   );
   assert.ok(
     !warnings.some((args) => typeof args[0] === 'string' && args[0].includes('reentrant dispose')),
-    'a second agent_end (root span already normally closed, closedBy=normal) must not be ' +
-      'mistaken for a reentrant-dispose force-close',
+    'a second agent_end (root span still open, never force-closed) must not be mistaken for a ' +
+      'reentrant-dispose force-close',
   );
 });
 
@@ -245,16 +274,17 @@ test('agent_end firing twice in a row closes the root span exactly once and does
 // step while captureContent is on (the default). See report.
 // ---------------------------------------------------------------------------
 
-test('agent_end with a malformed final assistant message (content is not an array) still ends and exports the AGENT span instead of leaking it unended', async () => {
+test('agent_end with a malformed final assistant message (content is not an array) does not throw, and the AGENT span still exports once prompt() settles', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('agent_end delivers a malformed final message');
+  const done = session.prompt('agent_end delivers a malformed final message');
   session.emit({ type: 'agent_start' });
   // role passes the `=== 'assistant'` narrowing, but content is not an array,
-  // so spans.ts textOf()'s `message.content.filter(...)` throws. closeRootSpan()
-  // now wraps that extraction in try/catch so span.end() still runs — this is
-  // the last event of the run, so nothing later would sweep it otherwise.
+  // so spans.ts textOf()'s `message.content.filter(...)` throws. spans.ts's
+  // stampRootOutput() now wraps that extraction so it can never crash the
+  // event handler — and the span isn't even ended here (agent_end no longer
+  // owns closing the root), so there is nothing to leak unended either way.
   assert.doesNotThrow(() => {
     session.emit({
       type: 'agent_end',
@@ -263,13 +293,14 @@ test('agent_end with a malformed final assistant message (content is not an arra
       willRetry: false,
     });
   });
+  await done;
 
   const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   assert.equal(
     rootSpans.length,
     1,
-    'the AGENT span must still be ended and exported even when output extraction throws — ' +
-      'span.end() must not be skipped just because reading output.value failed',
+    'the AGENT span must still be ended and exported once prompt() settles, even though output ' +
+      'extraction threw while stamping it',
   );
 });
 
@@ -277,7 +308,7 @@ test('message_end with a malformed assistant message (content is not an array) s
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('message_end delivers a malformed assistant message');
+  const done = session.prompt('message_end delivers a malformed assistant message');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'the-model' }) });
   // Malformed content on message_end: textOf() throws inside closeLlmSpan, but
@@ -300,6 +331,7 @@ test('message_end with a malformed assistant message (content is not an array) s
   // by this later turn_end — proving message_end itself already ended it above.
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.equal(llmSpans.length, 1, 'the LLM span must still be exported');
@@ -311,15 +343,16 @@ test('message_end with a malformed assistant message (content is not an array) s
   );
 });
 
-test('agent_end with an empty messages array (valid) exports the AGENT span with no output.value and never throws', async () => {
+test('agent_end with an empty messages array (valid) does not throw, and the AGENT span exports with no output.value once prompt() settles', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('agent_end with no messages at all');
+  const done = session.prompt('agent_end with no messages at all');
   session.emit({ type: 'agent_start' });
   assert.doesNotThrow(() => {
     session.emit({ type: 'agent_end', messages: [], willRetry: false });
   });
+  await done;
 
   const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   assert.equal(rootSpans.length, 1);

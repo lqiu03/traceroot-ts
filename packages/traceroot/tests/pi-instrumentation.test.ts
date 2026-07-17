@@ -26,7 +26,10 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('list files in /tmp');
+  // The root AGENT span is now anchored on prompt()'s own promise window
+  // (see pi-test-helpers.ts's module header) — NOT awaited yet, so the
+  // events below drive the run while the root is still open.
+  const done = session.prompt('list files in /tmp');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'turn_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
@@ -62,6 +65,7 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
     messages: [assistantMessage({ content: [{ type: 'text', text: 'listed the files' }] })],
     willRetry: false,
   });
+  await done;
 
   assert.equal(capture.spans.length, 3, 'expected exactly root, LLM, and tool spans');
 
@@ -76,7 +80,10 @@ test('a full turn with one tool call produces a correctly nested AGENT -> LLM ->
   assert.equal(attrs(rootSpan)['traceroot.sdk.name'], undefined);
   assert.equal(attrs(rootSpan)['input.value'], 'list files in /tmp');
   assert.equal(attrs(rootSpan)['output.value'], 'listed the files');
-  assert.equal(attrs(rootSpan)['traceroot.pi.will_retry'], false);
+  // traceroot.pi.will_retry is gone (removed along with agent_end owning the
+  // close); traceroot.pi.retry_count replaces it, now stamped once when the
+  // enclosing prompt() call settles. No retry happened in this run, so it is 0.
+  assert.equal(attrs(rootSpan)['traceroot.pi.retry_count'], 0);
 
   assert.equal(attrs(llmSpan)['openinference.span.kind'], 'LLM');
   assert.equal(attrs(llmSpan)['gen_ai.system'], 'anthropic');
@@ -109,7 +116,7 @@ test('two concurrent tool calls in one turn each get their own correctly-keyed s
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('do two things');
+  const done = session.prompt('do two things');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -141,6 +148,7 @@ test('two concurrent tool calls in one turn each get their own correctly-keyed s
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpans = capture.spans.filter(
     (s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'],
@@ -158,7 +166,7 @@ test('a failed LLM turn (stopReason error) marks the LLM span as ERROR', async (
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('trigger a provider error');
+  const done = session.prompt('trigger a provider error');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({
@@ -167,6 +175,7 @@ test('a failed LLM turn (stopReason error) marks the LLM span as ERROR', async (
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpan = capture.spans.find(
     (s) => (s.attributes as Record<string, unknown>)['openinference.span.kind'] === 'LLM',
@@ -180,7 +189,7 @@ test('a failed tool call (isError) marks the TOOL span as ERROR', async () => {
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('run a failing command');
+  const done = session.prompt('run a failing command');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -199,6 +208,7 @@ test('a failed tool call (isError) marks the TOOL span as ERROR', async () => {
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpan = capture.spans.find(
     (s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'] === 't1',
@@ -211,7 +221,7 @@ test('captureContent: false suppresses input.value/output.value but keeps other 
   const { capture, Session } = makeRig({ captureContent: false });
   const session = new Session();
 
-  await session.prompt('sensitive prompt text');
+  const done = session.prompt('sensitive prompt text');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({
@@ -224,6 +234,7 @@ test('captureContent: false suppresses input.value/output.value but keeps other 
     messages: [assistantMessage({ content: [{ type: 'text', text: 'sensitive reply' }] })],
     willRetry: false,
   });
+  await done;
 
   const [llmSpan, rootSpan] = capture.spans;
   assert.equal(attrs(rootSpan!)['input.value'], undefined);
@@ -243,7 +254,7 @@ test('captureToolIo: false suppresses tool input.value/output.value but keeps th
   const { capture, Session } = makeRig({ captureToolIo: false });
   const session = new Session();
 
-  await session.prompt('run a tool');
+  const done = session.prompt('run a tool');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -268,6 +279,7 @@ test('captureToolIo: false suppresses tool input.value/output.value but keeps th
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpan = capture.spans.find(
     (s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'] === 't1',
@@ -290,14 +302,15 @@ test('captureContent:false suppresses input.value on the ROOT span for an empty-
   ): Promise<{ hasKey: boolean; value: unknown }> {
     const { capture, Session } = makeRig({ captureContent });
     const session = new Session();
-    // Calling prompt() with a non-string bypasses the pendingInput.set() typeof
-    // guard in instrumentation.ts, simulating a caller whose prompt text is
-    // genuinely absent (as opposed to the empty-string case below) while still
-    // registering the subscribe() listener that instrumentPiCodingAgent wires
-    // up inside the wrapped prompt() call itself.
-    await session.prompt(promptText as unknown as string);
+    // Calling prompt() with a non-string bypasses proto.prompt's own
+    // `typeof text === 'string'` guard, simulating a caller whose prompt
+    // text is genuinely absent (as opposed to the empty-string case below)
+    // while still registering the subscribe() listener that
+    // instrumentPiCodingAgent wires up inside the wrapped prompt() call itself.
+    const done = session.prompt(promptText as unknown as string);
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [], willRetry: false });
+    await done;
     const root = capture.spans[0]!;
     return {
       hasKey: Object.prototype.hasOwnProperty.call(attrs(root), 'input.value'),

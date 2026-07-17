@@ -42,7 +42,15 @@ function makeFakeSessionClass() {
   return class FakeAgentSession {
     sessionId = 'sess-1';
     private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
+    // prompt()'s returned promise settles only once its final agent_end
+    // fires (willRetry !== true) — mirrors the real SDK; see
+    // pi-test-helpers.ts's module header for the full rationale.
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+    async prompt(_text: string, _options?: unknown): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
+    }
     subscribe(listener: (event: AgentEvent) => void): () => void {
       this.listeners.push(listener);
       return () => {
@@ -51,6 +59,11 @@ function makeFakeSessionClass() {
     }
     emit(event: AgentEvent): void {
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
     }
   };
 }
@@ -130,13 +143,14 @@ test('instrumentPiCodingAgent() snapshots the config object at call time — mut
   config.captureContent = false;
 
   const session = new Session();
-  await session.prompt('sensitive prompt text');
+  const done = session.prompt('sensitive prompt text');
   session.emit({ type: 'agent_start' });
   session.emit({
     type: 'agent_end',
     messages: [assistantMessage({ content: [{ type: 'text', text: 'sensitive reply' }] })],
     willRetry: false,
   });
+  await done;
 
   assert.equal(capture.spans.length, 1);
   const [rootSpan] = capture.spans;

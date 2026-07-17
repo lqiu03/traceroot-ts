@@ -1,16 +1,22 @@
 /**
- * Lens: closeRootSpan's search for the last assistant message (src/spans.ts)
- * — it must scan backward directly rather than copying the whole
- * finalMessages array and reversing it before find() ever runs. Mirrors
- * spans-truncation.test.ts's last test in spirit ('a single huge string tool
- * argument is capped during serialization, not only after the fact'): the
- * *final output* of a copy+reverse+find and a backward for-loop is
- * byte-identical, so asserting only on the exported attribute can't tell a
- * fixed implementation apart from the wasteful one. Instead this spies on
+ * Lens: stampRootOutput's search for the last assistant message
+ * (src/spans.ts) — it must scan backward directly rather than copying the
+ * whole finalMessages array and reversing it before find() ever runs.
+ * Mirrors spans-truncation.test.ts's last test in spirit ('a single huge
+ * string tool argument is capped during serialization, not only after the
+ * fact'): the *final output* of a copy+reverse+find and a backward for-loop
+ * is byte-identical, so asserting only on the exported attribute can't tell
+ * a fixed implementation apart from the wasteful one. Instead this spies on
  * Array.prototype.reverse to observe *how* the search happened — a
  * full-length reverse() call is exactly the bug: it means the entire history
  * was copied and reversed up front, even in the common case where the very
  * last message already is the assistant reply.
+ *
+ * stampRootOutput() only stamps output.value; it does not end the span (that
+ * is finalizeRootSpan's job, called once when the enclosing prompt() call's
+ * own promise settles — see instrumentation.ts's module header for the split
+ * rationale), so each test below ends the span explicitly to make it visible
+ * to the capturing exporter.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -19,7 +25,7 @@ import type { ExportResult } from '@opentelemetry/core';
 import { ExportResultCode } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { closeRootSpan } from '../src/pi/spans';
+import { stampRootOutput } from '../src/pi/spans';
 import type { AgentMessage, AssistantMessage, UserMessage } from '../src/pi/types';
 
 // Copied locally — no shared state across test files, matching every other
@@ -74,7 +80,7 @@ function attrs(span: ReadableSpan): Record<string, unknown> {
   return span.attributes as Record<string, unknown>;
 }
 
-test('closeRootSpan finds the last assistant message without copying+reversing the full history', () => {
+test('stampRootOutput finds the last assistant message without copying+reversing the full history', () => {
   const { tracer, capture } = makeTracer();
   const span = tracer.startSpan('AgentSession.prompt');
 
@@ -98,15 +104,16 @@ test('closeRootSpan finds the last assistant message without copying+reversing t
   };
 
   try {
-    closeRootSpan(span, finalMessages, false, true);
+    stampRootOutput(span, finalMessages, true);
   } finally {
     Array.prototype.reverse = originalReverse;
   }
+  span.end();
 
   assert.equal(
     reverseCalledOnFullHistory,
     false,
-    'closeRootSpan must not copy and reverse the entire finalMessages array to find the last assistant message',
+    'stampRootOutput must not copy and reverse the entire finalMessages array to find the last assistant message',
   );
 
   const exported = capture.spans[0];
@@ -114,7 +121,7 @@ test('closeRootSpan finds the last assistant message without copying+reversing t
   assert.equal(attrs(exported)['output.value'], 'final answer');
 });
 
-test('closeRootSpan still finds the last assistant message when later messages are not assistant messages', () => {
+test('stampRootOutput still finds the last assistant message when later messages are not assistant messages', () => {
   const { tracer, capture } = makeTracer();
   const span = tracer.startSpan('AgentSession.prompt');
 
@@ -134,7 +141,8 @@ test('closeRootSpan still finds the last assistant message when later messages a
     },
   ];
 
-  closeRootSpan(span, finalMessages, false, true);
+  stampRootOutput(span, finalMessages, true);
+  span.end();
 
   const exported = capture.spans[0];
   assert.ok(exported, 'expected the root span to have been exported');

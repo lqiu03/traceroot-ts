@@ -51,7 +51,21 @@ function makeRig() {
   class FakeAgentSession {
     sessionId = 'sess-1';
     private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
+    // prompt()'s returned promise settles only once its final agent_end
+    // fires (willRetry !== true) — mirrors the real SDK; see
+    // pi-test-helpers.ts's module header for the full rationale.
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+    async prompt(_text: string, _options?: unknown): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
+    }
+    // A standalone entry point distinct from prompt() — used by the two
+    // "stray event with no root open at all" tests below to attach the span
+    // listener WITHOUT opening a root span (steer()/followUp() never do;
+    // only prompt() does — see instrumentation.ts's module header on the
+    // rootless bypass boundary policy).
+    async steer(_text: string): Promise<void> {}
     subscribe(listener: (event: AgentEvent) => void): () => void {
       this.listeners.push(listener);
       return () => {
@@ -60,6 +74,11 @@ function makeRig() {
     }
     emit(event: AgentEvent): void {
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
     }
   }
 
@@ -151,7 +170,7 @@ test('two back-to-back turns in one agent run each get their own LLM span parent
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('do two turns');
+  const done = session.prompt('do two turns');
   session.emit({ type: 'agent_start' });
 
   // Turn 1.
@@ -181,6 +200,7 @@ test('two back-to-back turns in one agent run each get their own LLM span parent
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
 
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const rootSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
@@ -224,7 +244,7 @@ test('a tool span opened during turn 1 keeps its parent bound to turn 1s LLM spa
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('turn 1s tool call resolves late, after turn 2 already started');
+  const done = session.prompt('turn 1s tool call resolves late, after turn 2 already started');
   session.emit({ type: 'agent_start' });
 
   // Turn 1: message_end already closed the LLM span content-wise, but
@@ -262,6 +282,7 @@ test('a tool span opened during turn 1 keeps its parent bound to turn 1s LLM spa
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-2-model' }) });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   const turn1Llm = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'turn-1-model');
@@ -289,7 +310,7 @@ test('tool_execution_start firing after turn_end cleared llmCtx but before the n
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a tool fires in the gap between two turns');
+  const done = session.prompt('a tool fires in the gap between two turns');
   session.emit({ type: 'agent_start' });
 
   // Turn 1 completes fully, including turn_end — state.llmSpan/state.llmCtx
@@ -318,6 +339,7 @@ test('tool_execution_start firing after turn_end cleared llmCtx but before the n
   });
 
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const rootSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   const turn1Llm = capture.spans.find(
@@ -347,7 +369,7 @@ test('closeLlmSpan span.updateName() changes the name the exporter actually capt
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('the provider renames the model between request and response');
+  const done = session.prompt('the provider renames the model between request and response');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'turn_start' });
   // openLlmSpan names the span from message_start's `model` field.
@@ -368,6 +390,7 @@ test('closeLlmSpan span.updateName() changes the name the exporter actually capt
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
   assert.ok(llmSpan);
@@ -397,7 +420,13 @@ test('a stray message_start with no rootCtx never parents under whatever span is
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a stray assistant message with no agent_start ever fired');
+  // Flipped from calling session.prompt() here: under the new prompt()-
+  // anchored root model, EVERY prompt() call opens a root immediately at
+  // entry (see instrumentation.ts's module header), so it can no longer
+  // stand in for "no root context at all". steer() attaches the same span
+  // listener (via ensureSubscribed) WITHOUT ever opening a root — exactly
+  // the rootless-bypass boundary policy this test means to probe.
+  await session.steer('a stray assistant message with no prompt() ever called');
 
   const manager = new StackContextManager();
   context.setGlobalContextManager(manager);
@@ -430,7 +459,9 @@ test('a stray tool_execution_start with no llmCtx/rootCtx never parents under wh
   const { capture, Session } = makeRig();
   const session = new Session();
 
-  await session.prompt('a stray tool call with no agent_start ever fired');
+  // See the previous test's comment: steer(), not prompt(), is now the way
+  // to attach the listener without opening a root.
+  await session.steer('a stray tool call with no prompt() ever called');
 
   const manager = new StackContextManager();
   context.setGlobalContextManager(manager);

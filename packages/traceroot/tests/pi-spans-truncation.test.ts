@@ -60,7 +60,15 @@ function makeRig(config: { captureToolIo?: boolean } = {}) {
   class FakeAgentSession {
     sessionId = 'sess-1';
     private listeners: Array<(event: AgentEvent) => void> = [];
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
+    // prompt()'s returned promise settles only once its final agent_end
+    // fires (willRetry !== true) — mirrors the real SDK; see
+    // pi-test-helpers.ts's module header for the full rationale.
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+    async prompt(_text: string, _options?: unknown): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
+    }
     subscribe(listener: (event: AgentEvent) => void): () => void {
       this.listeners.push(listener);
       return () => {
@@ -69,6 +77,11 @@ function makeRig(config: { captureToolIo?: boolean } = {}) {
     }
     emit(event: AgentEvent): void {
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
     }
   }
 
@@ -128,7 +141,7 @@ async function runToolCall(
   const { capture, Session } = makeRig(config);
   const session = new Session();
 
-  await session.prompt('run a tool');
+  const done = session.prompt('run a tool');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -142,6 +155,7 @@ async function runToolCall(
   });
   session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpan = capture.spans.find(
     (s) => (s.attributes as Record<string, unknown>)['gen_ai.tool.call.id'] === 't1',

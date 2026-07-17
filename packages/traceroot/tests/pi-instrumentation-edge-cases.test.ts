@@ -35,12 +35,22 @@ function registerCapturingProvider(capture: CapturingExporter): void {
   provider.register();
 }
 
+// prompt()'s returned promise settles on the FINAL agent_end (willRetry !==
+// true), not merely by being called — see pi-test-helpers.ts's module header
+// for the full rationale (mirrored here since this file keeps its own local
+// fixture rather than importing makeFakeSessionClass, to keep
+// subscribeCallCount and direct prototype-identity assertions self-contained).
 function makeFakeSessionClass() {
   return class FakeAgentSession {
     sessionId = 'sess-1';
     private listeners: Array<(event: AgentEvent) => void> = [];
     subscribeCallCount = 0;
-    async prompt(_text: string, _options?: unknown): Promise<void> {}
+    private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
+    async prompt(_text: string, _options?: unknown): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        this.pending = { resolve, reject };
+      });
+    }
     subscribe(listener: (event: AgentEvent) => void): () => void {
       this.subscribeCallCount += 1;
       this.listeners.push(listener);
@@ -50,6 +60,11 @@ function makeFakeSessionClass() {
     }
     emit(event: AgentEvent): void {
       for (const listener of this.listeners) listener(event);
+      if (event.type === 'agent_end' && !event.willRetry && this.pending) {
+        const { resolve } = this.pending;
+        this.pending = undefined;
+        resolve();
+      }
     }
   };
 }
@@ -97,9 +112,10 @@ test('instrumenting the same sdk object twice does not double-wrap prompt', asyn
   );
 
   const session = new Session();
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(
     capture.spans.length,
@@ -127,9 +143,10 @@ test('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES
   });
 
   const session = new Session();
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(
     capture.spans.length,
@@ -244,9 +261,9 @@ test('two different session instances on the same instrumented sdk keep fully in
   (sessionB as { sessionId: string }).sessionId = 'session-b';
 
   // Interleaved on purpose: A starts, B starts, A's tool call runs, B's turn ends, A ends.
-  await sessionA.prompt('task A');
+  const doneA = sessionA.prompt('task A');
   sessionA.emit({ type: 'agent_start' });
-  await sessionB.prompt('task B');
+  const doneB = sessionB.prompt('task B');
   sessionB.emit({ type: 'agent_start' });
   sessionA.emit({ type: 'message_start', message: assistantMessage() });
   sessionA.emit({ type: 'message_end', message: assistantMessage() });
@@ -260,6 +277,7 @@ test('two different session instances on the same instrumented sdk keep fully in
   });
   sessionB.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
   sessionA.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await Promise.all([doneA, doneB]);
 
   assert.equal(capture.spans.length, 4, 'A: root+LLM+tool (3), B: root (1)');
 
@@ -284,7 +302,7 @@ test('tool_execution_end for an unknown toolCallId (no matching start) is ignore
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   assert.doesNotThrow(() => {
     session.emit({
@@ -296,6 +314,7 @@ test('tool_execution_end for an unknown toolCallId (no matching start) is ignore
     });
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.name']);
   assert.equal(toolSpans.length, 0);
@@ -309,7 +328,7 @@ test('agent_end while a tool span is still open force-closes it instead of leaki
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -321,6 +340,7 @@ test('agent_end while a tool span is still open force-closes it instead of leaki
   });
   // No tool_execution_end — simulates an aborted run mid-tool-call.
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(capture.spans.length, 3, 'root, LLM, and the force-closed dangling tool span');
   const dangling = capture.spans.find((s) => attrs(s)['gen_ai.tool.name'] === 'bash');
@@ -340,7 +360,7 @@ test('message_start/message_end for non-assistant roles never opens an LLM span'
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: { role: 'user', content: 'hi', timestamp: 0 } });
   session.emit({ type: 'message_end', message: { role: 'user', content: 'hi', timestamp: 0 } });
@@ -356,6 +376,7 @@ test('message_start/message_end for non-assistant roles never opens an LLM span'
     },
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   assert.equal(
     capture.spans.length,
@@ -372,7 +393,7 @@ test('a handler throw inside span-building is caught and never propagates to ses
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   // A message_end with `role: 'assistant'` but a malformed/missing `usage`
   // field must not crash the listener — attribute setters must tolerate it.
@@ -386,6 +407,7 @@ test('a handler throw inside span-building is caught and never propagates to ses
   assert.doesNotThrow(() => {
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
   });
+  await done;
 });
 
 test('tool args/result containing a circular reference do not crash span creation', async () => {
@@ -399,7 +421,7 @@ test('tool args/result containing a circular reference do not crash span creatio
   const circular: Record<string, unknown> = {};
   circular.self = circular;
 
-  await session.prompt('hi');
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage() });
   session.emit({ type: 'message_end', message: assistantMessage() });
@@ -421,6 +443,7 @@ test('tool args/result containing a circular reference do not crash span creatio
     });
   });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
   const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 't1');
   assert.ok(toolSpan);
@@ -431,7 +454,7 @@ test('tool args/result containing a circular reference do not crash span creatio
   );
 });
 
-test('a rejected prompt() (validation failure before agent_start) never creates a dangling root span', async () => {
+test('a rejected prompt() (validation failure before agent_start) never creates a dangling root span, and finalizes the root as ERROR', async () => {
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
   Session.prototype.prompt = async function (): Promise<void> {
@@ -443,11 +466,21 @@ test('a rejected prompt() (validation failure before agent_start) never creates 
   const session = new Session();
 
   await assert.rejects(() => session.prompt('hi'), /no model selected/);
-  // agent_start never fires for a run that failed validation before starting.
-  assert.equal(capture.spans.length, 0);
+  // agent_start never fires for a run that failed validation before starting,
+  // but the root span proto.prompt opened at entry is still finalized (as
+  // ERROR, per the DECIDED rejection/throw boundary policy) rather than left
+  // dangling open forever.
+  assert.equal(capture.spans.length, 1);
+  const rootSpan = capture.spans[0]!;
+  assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
+  assert.equal(rootSpan.status.code, 2 /* SpanStatusCode.ERROR */);
+  assert.equal(
+    rootSpan.events.some((e) => e.name === 'exception'),
+    true,
+  );
 });
 
-test('willRetry: true still closes the root span (one span per attempt), recording the attribute', async () => {
+test('a prompt() call whose run retries once (willRetry: true) keeps ONE root span open across the retry continuation, closing it exactly once with retry_count stamped', async () => {
   const capture = new CapturingExporter();
   const Session = makeFakeSessionClass();
   const sdk = { AgentSession: Session };
@@ -455,20 +488,33 @@ test('willRetry: true still closes the root span (one span per attempt), recordi
   instrumentPiCodingAgent(sdk, {});
   const session = new Session();
 
-  await session.prompt('hi');
+  // Under the pre-fix (agent_end-anchored) model this scenario produced TWO
+  // separate root spans, each independently closed, with an unconditional
+  // per-attempt `traceroot.pi.will_retry` flag (true, then false) — pi's own
+  // internal retry control flow leaked into trace *structure*. Flipped here
+  // for the new one-trace-per-prompt() contract: the retry continuation's
+  // agent_start/agent_end fire with NO new prompt() call in between (see
+  // instrumentation.ts's module header on _runAgentPrompt's continuation
+  // loop), so both attempts must land under the SAME still-open root, and
+  // that root closes exactly once — when prompt()'s own promise settles —
+  // carrying retry_count: 1 instead of a per-attempt will_retry flag.
+  const done = session.prompt('hi');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: true });
-  // A retry re-enters the loop and fires a fresh agent_start/agent_end pair.
+  // A retry re-enters the loop and fires a fresh agent_start/agent_end pair
+  // — no new prompt() call, same window.
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
 
+  const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
   assert.equal(
-    capture.spans.length,
-    2,
-    'each attempt gets its own root span, both properly closed',
+    rootSpans.length,
+    1,
+    'the retry continuation shares ONE root span with its first attempt, not two',
   );
-  assert.equal(attrs(capture.spans[0]!)['traceroot.pi.will_retry'], true);
-  assert.equal(attrs(capture.spans[1]!)['traceroot.pi.will_retry'], false);
+  assert.equal(attrs(rootSpans[0]!)['traceroot.pi.retry_count'], 1);
+  assert.equal(attrs(rootSpans[0]!)['traceroot.pi.will_retry'], undefined, 'the flag is gone');
 });
 
 test('a genuine second session.prompt() call after the first runs agent_end already fired cleanly produces a fully separate span tree, reusing the same subscribe() listener rather than re-subscribing', async () => {
@@ -480,7 +526,7 @@ test('a genuine second session.prompt() call after the first runs agent_end alre
   const session = new Session();
 
   // Run 1: a full, clean turn with a tool call, then agent_end.
-  await session.prompt('first task');
+  const done1 = session.prompt('first task');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-1-model' }) });
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'run-1-model' }) });
@@ -503,15 +549,17 @@ test('a genuine second session.prompt() call after the first runs agent_end alre
     messages: [assistantMessage({ content: [{ type: 'text', text: 'run1 done' }] })],
     willRetry: false,
   });
+  await done1;
 
   assert.equal(capture.spans.length, 3, 'run 1: root + LLM + tool span');
 
   // Run 2: a genuine second call to prompt() on the SAME session instance
   // (e.g. the user sends a second chat message), well after run 1's
-  // agent_end already tore its state down. Deliberately reuses run 1's
-  // toolCallId ("call-1") to prove a stale Map entry from run 1 cannot
-  // bleed into run 2 — agent_end already cleared state.toolSpans.
-  await session.prompt('second task');
+  // prompt() promise already settled and tore its state down. Deliberately
+  // reuses run 1's toolCallId ("call-1") to prove a stale Map entry from run
+  // 1 cannot bleed into run 2 — the prompt() settle already cleared
+  // state.toolSpans (via agent_end's own sweep).
+  const done2 = session.prompt('second task');
   session.emit({ type: 'agent_start' });
   session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
   session.emit({ type: 'message_end', message: assistantMessage({ model: 'run-2-model' }) });
@@ -534,6 +582,7 @@ test('a genuine second session.prompt() call after the first runs agent_end alre
     messages: [assistantMessage({ content: [{ type: 'text', text: 'run2 done' }] })],
     willRetry: false,
   });
+  await done2;
 
   assert.equal(
     session.subscribeCallCount,
