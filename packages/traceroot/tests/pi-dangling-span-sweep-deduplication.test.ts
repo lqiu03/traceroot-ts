@@ -136,6 +136,48 @@ test('turn_end force-closes a dangling LLM + TOOL span but leaves the root span 
   await done;
 });
 
+// Originally confirmed-bugfix-regressions.test.ts's Bug 7: kept distinct from
+// the turn_end test above because it asserts a different invariant — that
+// turn_end must also CLEAR the tool span from state.toolSpans, so agent_end's
+// own defensive sweep does not try to force-close (and double-export) the
+// same span a second time.
+test('turn_end force-closes any tool spans still open at the end of the turn, and clears them so agent_end does not force-close them a second time', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  const done = session.prompt('a tool call never gets its tool_execution_end before the turn ends');
+  session.emit({ type: 'agent_start' });
+  session.emit({ type: 'message_start', message: assistantMessage() });
+  session.emit({ type: 'message_end', message: assistantMessage() });
+  session.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'never-closes',
+    toolName: 'bash',
+    args: { command: 'sleep 999' },
+  });
+  // turn_end fires with the tool call still open — no tool_execution_end.
+  session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
+
+  const toolSpanAtTurnEnd = capture.spans.find(
+    (s) => attrs(s)['gen_ai.tool.call.id'] === 'never-closes',
+  );
+  assert.ok(
+    toolSpanAtTurnEnd,
+    'the tool span must already be force-closed and exported by turn_end, not deferred to agent_end',
+  );
+  assert.equal(attrs(toolSpanAtTurnEnd!)['traceroot.pi.force_closed'], true);
+
+  session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+  await done;
+  const toolSpans = capture.spans.filter((s) => attrs(s)['gen_ai.tool.call.id'] === 'never-closes');
+  assert.equal(
+    toolSpans.length,
+    1,
+    'the tool span must be exported exactly once — turn_end must also clear it from ' +
+      'state.toolSpans so agent_end does not try to force-close it a second time',
+  );
+});
+
 test('agent_end sweeps a dangling LLM + TOOL span while stamping (not force-closing, not even ending) the still-open root', async () => {
   // Flipped from the pre-fix model, where agent_end owned closing the root
   // normally (via closeRootSpan). Under the new model agent_end never ends
