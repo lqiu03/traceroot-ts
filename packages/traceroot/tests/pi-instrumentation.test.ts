@@ -344,3 +344,40 @@ test('captureContent:false suppresses input.value on the ROOT span for an empty-
   );
   assert.equal(trueUndefined.value, undefined);
 });
+
+// Boundary policy 2 (the prompt()-anchored root model): an early-return
+// prompt() call — a handled "/command", a queue-only steer/followUp — resolves
+// without ever reaching pi's internal run loop, so no agent_start/agent_end
+// follows. The wrapped prompt() must still open a root on entry and finalize it
+// OK on settle, yielding exactly one childless root. Migrated here from the
+// deleted pi-test-helpers.test.ts (its F2 case): this is the suite's only
+// span-asserting coverage of the no-events early-return path, so it belongs
+// with the instrumentation behavior it exercises, not among the fixture tests.
+test('an early-return prompt() call (resolved with no agent_start/agent_end) exports exactly one childless, OK-status AGENT root span', async () => {
+  const { capture, Session } = makeRig();
+  const session = new Session();
+
+  const done = session.prompt('a handled slash command');
+  session.resolvePrompt();
+  await assert.doesNotReject(() => done);
+
+  assert.equal(
+    capture.spans.length,
+    1,
+    'exactly one span: the root, with ZERO child spans (no agent_start ever fired to open any)',
+  );
+  const rootSpan = capture.spans[0]!;
+  assert.equal(rootSpan.name, 'AgentSession.prompt');
+  assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
+  assert.equal(
+    rootSpan.status.code,
+    1 /* SpanStatusCode.OK */,
+    'finalize() explicitly stamps OK on a resolved call (a successfully-resolved ' +
+      'promise, even with zero children, is not merely "unset")',
+  );
+  assert.equal(
+    rootSpan.parentSpanId,
+    undefined,
+    'the root itself has no parent (it is the trace root)',
+  );
+});
