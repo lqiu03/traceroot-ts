@@ -440,9 +440,11 @@ function sweepDanglingSpans(
   state.toolSpans.clear();
   closeDanglingSpan(state.llmSpan);
   state.llmSpan = undefined;
+  state.llmCtx = undefined;
   if (options.includeRoot) {
     closeDanglingSpan(state.rootSpan);
     state.rootSpan = undefined;
+    state.rootCtx = undefined;
   }
 }
 
@@ -507,7 +509,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       // OVERLAP SAFETY: a new call raced a still-open prior root — force-close it rather than silently leaking it.
       if (state.rootSpan) {
         sweepDanglingSpans(state, { includeRoot: true });
-        state.llmCtx = undefined;
       }
 
       // context.active(), matching claude-agent-sdk.ts, lets a host span nest this trace under it.
@@ -521,18 +522,16 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       state.rootCtx = trace.setSpan(parentCtx, rootSpan);
       state.retryCount = 0;
 
-      // Guarded by identity so a mid-run dispose() or a later sweep, which may have already force-closed it, never double-ends.
-      const finalize = (
-        status: { code: SpanStatusCode; message?: string },
-        error?: unknown,
-      ): void => {
+      // Guarded by identity so a mid-run dispose() or a later sweep, which may have already force-closed it, never double-ends. Derives the status message from the error, if any.
+      const finalize = (code: SpanStatusCode, error?: unknown): void => {
         if (state.rootSpan !== rootSpan) return;
         state.rootSpan = undefined;
         state.rootCtx = undefined;
         // A rejection can leave the in-flight attempt's spans unclosed.
         sweepDanglingSpans(state);
-        state.llmCtx = undefined;
-        finalizeRootSpan(rootSpan, state.retryCount, status, error);
+        const message =
+          error === undefined ? undefined : error instanceof Error ? error.message : String(error);
+        finalizeRootSpan(rootSpan, state.retryCount, { code, message }, error);
       };
 
       // A synchronous throw here never reached agent_start: finalize ERROR and rethrow.
@@ -540,17 +539,13 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       try {
         result = originalPrompt.call(this, text, options);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        finalize({ code: SpanStatusCode.ERROR, message }, err);
+        finalize(SpanStatusCode.ERROR, err);
         throw err;
       }
       // Separate .then() chain, not a return of result.then(...): that would swallow the rejection since onReject here doesn't rethrow.
       result.then(
-        () => finalize({ code: SpanStatusCode.OK }),
-        (err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          finalize({ code: SpanStatusCode.ERROR, message }, err);
-        },
+        () => finalize(SpanStatusCode.OK),
+        (err: unknown) => finalize(SpanStatusCode.ERROR, err),
       );
       return result;
     };
@@ -558,27 +553,20 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       proto.prompt = originalPrompt;
     });
 
-    // Standalone entry points, not prompt() wrappers — needed so a session's first call being one of these still triggers subscribe().
-    if (typeof proto.steer === 'function') {
-      const originalSteer = proto.steer;
-      proto.steer = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
+    // Standalone entry points, not prompt() wrappers — needed so a session's first call being one of these still triggers subscribe(). Both just subscribe then delegate, so they share one wrapper.
+    const patchSubscribeTrigger = (name: 'steer' | 'followUp'): void => {
+      const original = proto[name];
+      if (typeof original !== 'function') return;
+      proto[name] = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
         ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
-        return originalSteer.call(this, text, images);
+        return original.call(this, text, images);
       };
       rollback.push(() => {
-        proto.steer = originalSteer;
+        proto[name] = original;
       });
-    }
-    if (typeof proto.followUp === 'function') {
-      const originalFollowUp = proto.followUp;
-      proto.followUp = function (this: AgentSessionInstance, text: string, images?: unknown[]) {
-        ensureSubscribed(this, tracer, resolved, subscribedSessions, sessionSpanState);
-        return originalFollowUp.call(this, text, images);
-      };
-      rollback.push(() => {
-        proto.followUp = originalFollowUp;
-      });
-    }
+    };
+    patchSubscribeTrigger('steer');
+    patchSubscribeTrigger('followUp');
 
     if (typeof proto.dispose === 'function') {
       const originalDispose = proto.dispose;
@@ -595,10 +583,7 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
               err,
             );
           } finally {
-            state.rootSpan = undefined;
-            state.rootCtx = undefined;
-            state.llmSpan = undefined;
-            state.llmCtx = undefined;
+            // sweepDanglingSpans({ includeRoot: true }) above already nulled every span/ctx field; the state is dropped here regardless.
             sessionSpanState.delete(this);
             // Else a reused session would never re-subscribe (still "has" it).
             subscribedSessions.delete(this);
@@ -664,8 +649,6 @@ function handleEvent(
     case 'agent_start': {
       // Sweep dangling spans from a crashed prior attempt; root is untouched (owned by prompt()).
       sweepDanglingSpans(state);
-      state.llmSpan = undefined;
-      state.llmCtx = undefined;
       // An undefined state.rootSpan means this run bypassed the wrapped prompt() call — do not synthesize one.
       break;
     }
@@ -689,7 +672,6 @@ function handleEvent(
     case 'turn_end': {
       // If a stream error cut the turn short before message_end closed llmSpan, sweep force-closes it (and tool spans); root is untouched.
       sweepDanglingSpans(state);
-      state.llmCtx = undefined;
       break;
     }
     case 'tool_execution_start': {
@@ -717,7 +699,6 @@ function handleEvent(
     case 'agent_end': {
       // Mirrors turn_end's sweep; root is not swept (closing it is proto.prompt's job) — this only stamps output onto whatever is open.
       sweepDanglingSpans(state);
-      state.llmCtx = undefined;
       if (state.rootSpan) {
         stampRootOutput(state.rootSpan, event.messages, config.captureContent);
       }
