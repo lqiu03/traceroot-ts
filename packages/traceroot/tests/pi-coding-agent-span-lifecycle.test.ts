@@ -1197,7 +1197,7 @@ describe('pi dangling-span sweep deduplication', () => {
       assert.equal(
         attrs(span)['traceroot.pi.force_closed'],
         true,
-        `${span.name} must be marked force_closed by agent_start\'s sweep`,
+        `${span.name} must be marked force_closed by agent_start's sweep`,
       );
     }
     assert.equal(
@@ -1381,7 +1381,7 @@ describe('pi dangling-span sweep deduplication', () => {
       assert.equal(
         attrs(span)['traceroot.pi.force_closed'],
         true,
-        `${span.name} must be marked force_closed by dispose()\'s sweep`,
+        `${span.name} must be marked force_closed by dispose()'s sweep`,
       );
     }
   });
