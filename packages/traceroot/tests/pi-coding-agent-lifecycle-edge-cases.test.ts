@@ -1,28 +1,20 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { SpanStatusCode, context, propagation, trace } from '@opentelemetry/api';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
 import { stampRootOutput } from '../src/pi/spans';
 import type { AgentEvent, AgentMessage, AssistantMessage, UserMessage } from '../src/pi/types';
-import { assistantMessage, attrs, makeFakeSessionClass } from './pi-test-helpers';
+import {
+  CapturingExporter,
+  assistantMessage,
+  attrs,
+  makeFakeSessionClass,
+} from './pi-test-helpers';
 
 describe('instrumentation edge cases', () => {
-  // Copied locally — no shared state across test files, matching
-  // packages/mastra/tests/exporter-adversarial.test.ts's explicit convention.
-  class CapturingExporter implements SpanExporter {
-    readonly spans: ReadableSpan[] = [];
-    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-      this.spans.push(...spans);
-      resultCallback({ code: ExportResultCode.SUCCESS });
-    }
-    async shutdown(): Promise<void> {}
-  }
-
   // Registers a real, freshly-registered global TracerProvider wired to
   // `capture`, replacing the deleted private-exporter (`_spanExporter`)
   // injection path — see pi-test-helpers.ts's makeRig() for the full
@@ -911,17 +903,6 @@ describe('close-root-span backward scan', () => {
    * rationale), so the test below ends the span explicitly to make it visible
    * to the capturing exporter.
    */
-
-  // Copied locally — no shared state across test files, matching every other
-  // *.test.ts file's explicit convention in this package.
-  class CapturingExporter implements SpanExporter {
-    readonly spans: ReadableSpan[] = [];
-    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-      this.spans.push(...spans);
-      resultCallback({ code: ExportResultCode.SUCCESS });
-    }
-    async shutdown(): Promise<void> {}
-  }
 
   // closeRootSpan only needs a real Span (setAttribute/end), not the full
   // instrumentPiCodingAgent event pipeline — a direct NodeTracerProvider +

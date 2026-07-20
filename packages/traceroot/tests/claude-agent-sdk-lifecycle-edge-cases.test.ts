@@ -53,7 +53,7 @@ class CountingSpanProcessor {
 const LLM_SPAN = 'anthropic.messages.create';
 const QUERY_SPAN = 'ClaudeAgent.query';
 
-describe('Claude Agent SDK instrumentation (opus review pass)', () => {
+describe('Claude Agent SDK instrumentation lifecycle edge cases', () => {
   let exporter: InMemorySpanExporter;
   let provider: NodeTracerProvider;
   let counter: CountingSpanProcessor;

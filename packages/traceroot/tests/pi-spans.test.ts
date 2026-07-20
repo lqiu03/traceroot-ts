@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { resolveConfig } from '../src/pi/config';
@@ -21,6 +19,7 @@ import {
   sliceSurrogateSafe,
 } from '../src/pi/spans';
 import type { AgentEvent, AgentMessage, AssistantMessage } from '../src/pi/types';
+import { CapturingExporter } from './pi-test-helpers';
 
 describe('span name', () => {
   it('describeToolCallSpan uses the file basename for path-like args', () => {
@@ -80,7 +79,7 @@ describe('span name', () => {
   it('describeToolCallSpan bounds a path-like arg with no separators the same way it bounds a bash command', () => {
     // basename() only strips separators — a string with none at all (or whose
     // final segment is huge) passes through completely unchanged. Unlike the
-    // bash branch (explicitly capped at MAX_BASH_NAME via truncateSurrogateSafe
+    // bash branch (explicitly capped at MAX_NAME_SEGMENT_CHARS via truncateWithEllipsis
     // — see the file header's stated privacy/size-bound rationale), the path
     // branch had no equivalent cap: an untrusted/hallucinated "path" argument
     // with no "/" or "\\" could inflate the span NAME itself without bound.
@@ -211,7 +210,7 @@ describe('span name', () => {
   it('describeToolCallSpan passes non-ASCII BMP unicode in a bash command well under the 60-char limit through unmangled', () => {
     // Chinese, Cyrillic, and accented Latin characters are all single UTF-16
     // code units (unlike the emoji surrogate-pair case covered above), and the
-    // whole collapsed command is far below MAX_BASH_NAME, so no truncation
+    // whole collapsed command is far below MAX_NAME_SEGMENT_CHARS, so no truncation
     // should occur at all — the assertion is that whitespace-collapse does not
     // corrupt or drop any multi-byte chars.
     const command = 'echo   café   北京   Москва  ';
@@ -272,7 +271,7 @@ describe('spans and config boundary coverage', () => {
         async shutdown() {},
       }),
     );
-    const tracer = provider.getTracer('opus-review');
+    const tracer = provider.getTracer('pi-spans-unit');
     return { tracer, spans };
   }
 
@@ -688,10 +687,10 @@ describe('spans and config boundary coverage', () => {
 
 describe('spans truncation', () => {
   /**
-   * Lens: src/spans.ts's stringifyToolIo (capFieldReplacer) / truncateJsonSafe
+   * Lens: src/spans.ts's stringifyToolIo (capFieldReplacer) / capJsonWithMarker
    * boundary logic, exercised through the real openToolSpan/closeToolSpan call
    * path rather than as a standalone unit test of the helpers — a future
-   * refactor that stops calling truncateJsonSafe from either function must fail
+   * refactor that stops calling capJsonWithMarker from either function must fail
    * these tests, not just a test of the helper in isolation. Mirrors
    * span-name.test.ts's surrogate-pair truncation test in spirit (see 'does not
    * split a surrogate pair at the truncation boundary' there) but drives it via
@@ -705,30 +704,19 @@ describe('spans truncation', () => {
    * array slicing and scalar-width charging — was removed as part of the Ask 3a
    * simplification): a large ARRAY of many individually-small values (a big
    * grep/find output, or a numeric/boolean array) now transiently serializes in
-   * full before truncateJsonSafe's post-hoc backstop slices the final string —
+   * full before capJsonWithMarker's post-hoc backstop slices the final string —
    * an accepted O(N) trade on already-materialized data. The tests below for
    * that shape assert the surviving final char-cap/marker invariant rather than
    * the removed mid-walk behavior; see each test's own comment.
    */
 
   // Mirrors src/spans.ts's MAX_TOOL_IO_JSON_CHARS (not exported — hardcoded
-  // here the same way span-name.test.ts hardcodes MAX_BASH_NAME as 60).
+  // here the same way span-name.test.ts hardcodes MAX_NAME_SEGMENT_CHARS as 60).
   const MAX_TOOL_IO_JSON_CHARS = 32 * 1024;
 
-  // Mirrors src/spans.ts's truncateJsonSafe marker text exactly (single U+2026
+  // Mirrors src/spans.ts's capJsonWithMarker marker text exactly (single U+2026
   // ellipsis, not three ASCII dots).
   const TRUNCATION_MARKER = '…[truncated]';
-
-  // Copied locally — no shared state across test files, matching every other
-  // *.test.ts file's explicit convention in this package.
-  class CapturingExporter implements SpanExporter {
-    readonly spans: ReadableSpan[] = [];
-    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-      this.spans.push(...spans);
-      resultCallback({ code: ExportResultCode.SUCCESS });
-    }
-    async shutdown(): Promise<void> {}
-  }
 
   // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
   // patches AgentSession.prototype directly, so reusing one class across tests
@@ -858,9 +846,9 @@ describe('spans truncation', () => {
   }
 
   // Builds { data: ... } whose JSON.stringify(...) places a surrogate pair (an
-  // emoji) astride the exact truncateJsonSafe cut boundary: the high surrogate
+  // emoji) astride the exact capJsonWithMarker cut boundary: the high surrogate
   // lands at character index MAX_TOOL_IO_JSON_CHARS - 1 (0-indexed), i.e.
-  // exactly the last character truncateJsonSafe would otherwise keep.
+  // exactly the last character capJsonWithMarker would otherwise keep.
   function payloadWithSurrogateAtBoundary(): { data: string } {
     const emoji = '\u{1F600}'; // 2 UTF-16 code units (a surrogate pair).
     const prefixLen = JSON_WRAPPER_OVERHEAD - '"}'.length; // chars before the string value starts: `{"data":"`.
@@ -975,7 +963,7 @@ describe('spans truncation', () => {
     }
   });
 
-  it('captureToolIo: false still bypasses truncateJsonSafe entirely (no marker, no attribute)', async () => {
+  it('captureToolIo: false still bypasses capJsonWithMarker entirely (no marker, no attribute)', async () => {
     const args = payloadOfExactJsonLength(MAX_TOOL_IO_JSON_CHARS + 1000);
     const toolSpan = await runToolCall(args, {}, { captureToolIo: false });
 
@@ -985,8 +973,8 @@ describe('spans truncation', () => {
 
   // A single huge string field (e.g. a big file read, or long command stdout —
   // the dominant real-world shape of oversized tool I/O) must never be fully
-  // materialized by JSON.stringify before truncateJsonSafe's post-hoc cap runs.
-  // truncateJsonSafe alone already bounds the *final* attribute either way — a
+  // materialized by JSON.stringify before capJsonWithMarker's post-hoc cap runs.
+  // capJsonWithMarker alone already bounds the *final* attribute either way — a
   // naive JSON.stringify(args) then slice(0, MAX) produces byte-identical
   // output to a properly-capped serialization for this single-field shape, so
   // asserting only on the final attribute's length can't tell a fixed
@@ -1019,7 +1007,7 @@ describe('spans truncation', () => {
       if (containsHugeValue && typeof replacer !== 'function') {
         // The bug: an object containing the huge string was handed to
         // JSON.stringify with no replacer, so the full 500KB string gets
-        // embedded in the serialized output before truncateJsonSafe ever runs.
+        // embedded in the serialized output before capJsonWithMarker ever runs.
         sawBareStringifyOfHugeValue = true;
       }
 
@@ -1064,7 +1052,7 @@ describe('spans truncation', () => {
   // spec, JSON.stringify(undefined, replacer) returns the *value* undefined,
   // not the string "undefined" — a gap TypeScript's lib.es5.d.ts papers over by
   // always typing JSON.stringify's return as `string`. Handing that straight to
-  // truncateJsonSafe(...) throws a TypeError on `.length`, silently swallowed
+  // capJsonWithMarker(...) throws a TypeError on `.length`, silently swallowed
   // by openToolSpan/closeToolSpan's catch — whose comment claims it exists only
   // for "circular refs or BigInt", which this isn't. This spies on the global
   // JSON.stringify the same way the huge-string test above does, but asserts
@@ -1090,7 +1078,7 @@ describe('spans truncation', () => {
 
       assert.ok(
         !stringifyCalledWithUndefined,
-        'stringifyToolIo must recognize a literal undefined value itself and short-circuit before ever calling JSON.stringify(undefined, ...) — JSON.stringify(undefined, replacer) returns the value undefined (not a string), and handing that to truncateJsonSafe throws a TypeError that gets silently swallowed under a misleading "circular refs or BigInt" comment',
+        'stringifyToolIo must recognize a literal undefined value itself and short-circuit before ever calling JSON.stringify(undefined, ...) — JSON.stringify(undefined, replacer) returns the value undefined (not a string), and handing that to capJsonWithMarker throws a TypeError that gets silently swallowed under a misleading "circular refs or BigInt" comment',
       );
       assert.equal(
         attrs(toolSpan)['input.value'],
@@ -1113,7 +1101,7 @@ describe('spans truncation', () => {
   // budget (proactive array slicing / scalar-width charging) — capFieldReplacer
   // only caps individually-oversized strings, so a large array of many
   // individually-small strings is now fully materialized by JSON.stringify
-  // before truncateJsonSafe's post-hoc backstop slices the final string (the
+  // before capJsonWithMarker's post-hoc backstop slices the final string (the
   // accepted O(N) trade documented in this file's header). What must still hold
   // is the final char-cap/marker invariant, and that the truncated body is a
   // verbatim prefix of the real serialization (not corrupted or re-derived).
@@ -1151,7 +1139,7 @@ describe('spans truncation', () => {
     // this object's values are oversized, and its keys are never inspected at
     // all, so a many-keyed object (a word-count map, a file->stat dictionary)
     // is fully materialized by JSON.stringify. The exported attribute must
-    // nevertheless respect the hard MAX + marker bound via truncateJsonSafe's
+    // nevertheless respect the hard MAX + marker bound via capJsonWithMarker's
     // post-hoc backstop.
     const KEY_COUNT = 50_000;
     const args: Record<string, string> = {};
@@ -1189,17 +1177,6 @@ describe('config resolution', () => {
    * captureContent/captureToolIo defaults, and instrumentPiCodingAgent()'s
    * config-snapshot immutability (adapted to the surviving fields).
    */
-
-  // Copied locally per-file, matching every other tests/*.test.ts in this
-  // package — no shared module-level exporter/session state across files.
-  class CapturingExporter implements SpanExporter {
-    readonly spans: ReadableSpan[] = [];
-    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-      this.spans.push(...spans);
-      resultCallback({ code: ExportResultCode.SUCCESS });
-    }
-    async shutdown(): Promise<void> {}
-  }
 
   // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
   // patches AgentSession.prototype directly, so reusing one class across tests

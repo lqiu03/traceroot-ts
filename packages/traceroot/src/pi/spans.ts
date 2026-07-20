@@ -70,7 +70,7 @@ function endSpanSafe(span: Span | undefined): void {
 // would corrupt the UTF-8 an OTLP/proto collector requires.
 const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 
-// Appended by the post-hoc backstop (truncateJsonSafe) whenever tool I/O had
+// Appended by the post-hoc backstop (capJsonWithMarker) whenever tool I/O had
 // to be cut, so a truncated payload is always distinguishable from one that
 // merely happened to end this way.
 const TRUNCATION_MARKER = '…[truncated]';
@@ -102,7 +102,7 @@ export function sliceSurrogateSafe(text: string, maxLen: number): string {
   return text.slice(0, cut);
 }
 
-function truncateJsonSafe(json: string): string {
+function capJsonWithMarker(json: string): string {
   if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
   return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}${TRUNCATION_MARKER}`;
 }
@@ -110,13 +110,13 @@ function truncateJsonSafe(json: string): string {
 // Returns a JSON.stringify replacer that caps each individually-oversized
 // STRING field as the tree is walked, so one huge field (full file content,
 // long command stdout — the dominant real-world shape of oversized tool I/O)
-// is never fully materialized before truncateJsonSafe's post-hoc backstop
+// is never fully materialized before capJsonWithMarker's post-hoc backstop
 // runs. Non-string values pass through untouched — there is no running
 // budget across the whole payload, only a per-field cap.
 //
 // Accepted trade-off: a large ARRAY of many individually-small values (a big
 // grep/find result, none of whose elements exceed the cap on their own)
-// still transiently serializes in full before truncateJsonSafe slices the
+// still transiently serializes in full before capJsonWithMarker slices the
 // final string. That's fine — the data is already fully materialized in
 // memory by the time a tool result reaches this function. The one
 // catastrophic case, a single huge string, is still capped up front.
@@ -132,7 +132,7 @@ function capFieldReplacer(_key: string, value: unknown): unknown {
 // (or a bare function/symbol) at the top level it returns the *value*
 // undefined, not the string "undefined". args/result are typed `unknown` and
 // plausibly are `undefined` at runtime — short-circuit here so callers get an
-// honest `string | undefined` instead of handing truncateJsonSafe something
+// honest `string | undefined` instead of handing capJsonWithMarker something
 // whose `.length` access would throw. Mirrors claude-agent-sdk.ts's
 // tryStringify.
 function stringifyToolIo(value: unknown): string | undefined {
@@ -140,7 +140,7 @@ function stringifyToolIo(value: unknown): string | undefined {
   return JSON.stringify(value, capFieldReplacer);
 }
 
-function textOf(message: AgentMessage | undefined): string | undefined {
+function assistantTextOf(message: AgentMessage | undefined): string | undefined {
   if (!message) return undefined;
   if (message.role === 'user' && typeof message.content === 'string') return message.content;
   if (message.role !== 'assistant') return undefined;
@@ -182,7 +182,7 @@ export function stampRootOutput(
 ): void {
   if (!captureContent) return;
   const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-  setAttr(span, OI_OUTPUT_VALUE, textOf(lastAssistant));
+  setAttr(span, OI_OUTPUT_VALUE, assistantTextOf(lastAssistant));
 }
 
 // Ends the root span exactly once, when the wrapping prompt() call's own
@@ -234,7 +234,7 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_READ_INPUT_TOKENS, message.usage?.cacheRead);
   setAttr(span, GEN_AI_ATTRIBUTES.CACHE_WRITE_INPUT_TOKENS, message.usage?.cacheWrite);
   if (captureContent) {
-    setAttr(span, OI_OUTPUT_VALUE, textOf(message));
+    setAttr(span, OI_OUTPUT_VALUE, assistantTextOf(message));
   }
   if (message.stopReason === 'error' || message.stopReason === 'aborted') {
     span.setStatus({
@@ -247,7 +247,7 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
 
 // Privacy-safe tool span naming, ported from traceroot-pi-extension (the Pi
 // CLI extension). Never emits a full file path — basename only, handling
-// both / and \ separators — and never emits more than MAX_BASH_NAME chars of
+// both / and \ separators — and never emits more than MAX_NAME_SEGMENT_CHARS chars of
 // a bash command OR of a path-like argument's basename, truncated without
 // splitting a UTF-16 surrogate pair (which would corrupt the UTF-8 an
 // OTLP/proto collector requires). The basename cap matters because
@@ -262,7 +262,7 @@ export function closeLlmSpan(span: Span, message: AssistantMessage, captureConte
 // a span attribute when captureToolIo is explicitly enabled.
 const basename = win32.basename;
 
-const MAX_BASH_NAME = 60;
+const MAX_NAME_SEGMENT_CHARS = 60;
 
 const TOOL_PATH_ARGUMENT_KEYS = [
   'path',
@@ -284,7 +284,7 @@ function firstPathArgument(args: Record<string, unknown>): string | undefined {
 // Thin wrapper around the sliceSurrogateSafe boundary cut above: appends the
 // ellipsis marker this file's span names use, but only when truncation
 // actually happened (an untruncated name gets no trailing "…").
-function truncateSurrogateSafe(text: string, maxLen: number): string {
+function truncateWithEllipsis(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   return `${sliceSurrogateSafe(text, maxLen)}…`;
 }
@@ -300,7 +300,7 @@ export function describeToolCallSpan(toolName: string, args: unknown): string {
     // command being run.
     if (toolName === 'bash' && typeof a.command === 'string' && a.command) {
       const cmd = a.command.replace(/\s+/g, ' ').trim();
-      if (cmd) return `bash: ${truncateSurrogateSafe(cmd, MAX_BASH_NAME)}`;
+      if (cmd) return `bash: ${truncateWithEllipsis(cmd, MAX_NAME_SEGMENT_CHARS)}`;
     }
     const pathLike = firstPathArgument(a);
     if (pathLike) {
@@ -312,7 +312,7 @@ export function describeToolCallSpan(toolName: string, args: unknown): string {
       // here avoids emitting a dangling "toolName: " with nothing after the
       // colon.
       if (base) {
-        return `${toolName}: ${truncateSurrogateSafe(base, MAX_BASH_NAME)}`;
+        return `${toolName}: ${truncateWithEllipsis(base, MAX_NAME_SEGMENT_CHARS)}`;
       }
     }
   }
@@ -339,7 +339,7 @@ export function openToolSpan(
     try {
       const serializedArgs = stringifyToolIo(args);
       if (serializedArgs !== undefined) {
-        setAttr(span, OI_INPUT_VALUE, truncateJsonSafe(serializedArgs));
+        setAttr(span, OI_INPUT_VALUE, capJsonWithMarker(serializedArgs));
       }
     } catch {
       // args may contain circular refs or BigInt — skip rather than crash.
@@ -358,7 +358,7 @@ export function closeToolSpan(
     try {
       const serializedResult = stringifyToolIo(result);
       if (serializedResult !== undefined) {
-        setAttr(span, OI_OUTPUT_VALUE, truncateJsonSafe(serializedResult));
+        setAttr(span, OI_OUTPUT_VALUE, capJsonWithMarker(serializedResult));
       }
     } catch {
       // result may contain circular refs or BigInt — skip rather than crash.

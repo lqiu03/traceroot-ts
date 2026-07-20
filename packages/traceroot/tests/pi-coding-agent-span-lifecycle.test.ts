@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { hrTime, hrTimeToMilliseconds } from '@opentelemetry/core';
-import { assistantMessage, attrs, makeRig } from './pi-test-helpers';
+import { CapturingExporter, assistantMessage, attrs, makeRig } from './pi-test-helpers';
 import { context, trace, ROOT_CONTEXT, TraceFlags } from '@opentelemetry/api';
 import type { Context, ContextManager, SpanContext } from '@opentelemetry/api';
-import type { ExportResult } from '@opentelemetry/core';
-import { ExportResultCode } from '@opentelemetry/core';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
 import type { AgentEvent, AssistantMessage } from '../src/pi/types';
@@ -594,17 +592,6 @@ describe('span context parenting', () => {
    * correctness — just probing the "nothing is open at all" edge instead of
    * the "something else is open" edges the rest of this file covers.
    */
-  // Copied locally per-file, matching every other tests/*.test.ts in this
-  // package — no shared module-level exporter/session state across files.
-  class CapturingExporter implements SpanExporter {
-    readonly spans: ReadableSpan[] = [];
-    export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-      this.spans.push(...spans);
-      resultCallback({ code: ExportResultCode.SUCCESS });
-    }
-    async shutdown(): Promise<void> {}
-  }
-
   // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
   // patches AgentSession.prototype directly, so reusing one class across tests
   // would stack multiple wrap layers onto the same prototype method.
@@ -1341,7 +1328,7 @@ describe('close-event idempotency and content safety', () => {
     const done = session.prompt('agent_end delivers a malformed final message');
     session.emit({ type: 'agent_start' });
     // role passes the `=== 'assistant'` narrowing, but content is not an array,
-    // so spans.ts textOf()'s `message.content.filter(...)` throws. spans.ts's
+    // so spans.ts assistantTextOf()'s `message.content.filter(...)` throws. spans.ts's
     // stampRootOutput() now wraps that extraction so it can never crash the
     // event handler — and the span isn't even ended here (agent_end no longer
     // owns closing the root), so there is nothing to leak unended either way.
@@ -1371,7 +1358,7 @@ describe('close-event idempotency and content safety', () => {
     const done = session.prompt('message_end delivers a malformed assistant message');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'the-model' }) });
-    // Malformed content on message_end: textOf() throws inside closeLlmSpan, but
+    // Malformed content on message_end: assistantTextOf() throws inside closeLlmSpan, but
     // that extraction is now wrapped in try/catch so endSpanSafe() still runs as
     // part of THIS event — not deferred to a later force-close sweep.
     assert.doesNotThrow(() => {
