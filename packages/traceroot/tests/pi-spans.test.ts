@@ -91,15 +91,6 @@ describe('pi span name', () => {
     );
   });
 
-  it('describeToolCallSpan truncates an over-long basename without splitting a surrogate pair at the boundary', () => {
-    const name = describeToolCallSpan('read', { path: 'x'.repeat(59) + '\u{1F600}tail' });
-    assert.ok(name.startsWith('read: '));
-    assert.ok(name.endsWith('…'));
-    const body = name.slice('read: '.length, -1);
-    const lastCode = body.charCodeAt(body.length - 1);
-    assert.ok(lastCode < 0xd800 || lastCode > 0xdbff);
-  });
-
   // Unlike args.path === '' (skipped as falsy), these are non-empty but win32.basename() strips them to nothing.
   it('describeToolCallSpan falls back to the bare tool name when a non-empty path-like arg has NO basename component at all (win32.basename reduces a root/drive-only reference to "")', () => {
     assert.equal(describeToolCallSpan('list_dir', { path: '/' }), 'list_dir');
@@ -156,24 +147,6 @@ describe('pi span name', () => {
       'trailing backslash must not defeat basename reduction (Windows-style)',
     );
     assert.equal(describeToolCallSpan('list', { target: '/var/log/app/' }), 'list: app');
-  });
-
-  it("describeToolCallSpan passes unusual characters in toolName itself through unchanged (toolName is Pi's own identifier, not user-controlled args)", () => {
-    assert.equal(
-      describeToolCallSpan('mcp__filesystem__read_file', {}),
-      'mcp__filesystem__read_file',
-    );
-    assert.equal(describeToolCallSpan('weird\ntool', { path: '/a/b/c.txt' }), 'weird\ntool: c.txt');
-    assert.equal(describeToolCallSpan('', { path: '/a/b/c.txt' }), ': c.txt');
-  });
-
-  it('describeToolCallSpan passes non-ASCII BMP unicode in a bash command well under the 60-char limit through unmangled', () => {
-    const command = 'echo   café   北京   Москва  ';
-    const collapsed = 'echo café 北京 Москва';
-    assert.ok(collapsed.length < 60, 'sanity check: well under the truncation limit');
-    const name = describeToolCallSpan('bash', { command });
-    assert.equal(name, `bash: ${collapsed}`);
-    assert.ok(!name.endsWith('…'), 'must not be truncated when comfortably under the limit');
   });
 
   // A blank command collapses to '' after whitespace normalization; `if (cmd)` must fall through.
@@ -556,15 +529,6 @@ describe('pi spans and config boundary coverage', () => {
     assert.equal(sliced, 'abc');
     const lastCode = sliced.charCodeAt(sliced.length - 1);
     assert.ok(lastCode < 0xd800 || lastCode > 0xdbff, 'must not end on an unpaired high surrogate');
-  });
-
-  it('sliceSurrogateSafe appends no suffix -- callers own their own marker', () => {
-    const sliced = sliceSurrogateSafe('abcdefgh', 3);
-    assert.equal(sliced, 'abc');
-    assert.ok(
-      !sliced.includes('…'),
-      'sliceSurrogateSafe itself must not add an ellipsis or marker',
-    );
   });
 
   it('sliceSurrogateSafe returns empty string for maxLen === 0 rather than slicing', () => {

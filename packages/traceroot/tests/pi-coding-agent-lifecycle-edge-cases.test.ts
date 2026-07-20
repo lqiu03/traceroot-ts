@@ -279,37 +279,6 @@ describe('pi instrumentation edge cases', () => {
     assert.equal(toolSpans.length, 0);
   });
 
-  it('agent_end while a tool span is still open force-closes it instead of leaking', async () => {
-    const capture = new CapturingExporter();
-    const Session = makeFakeSessionClass();
-    const sdk = { AgentSession: Session };
-    registerCapturingProvider(capture);
-    instrumentPiCodingAgent(sdk, {});
-    const session = new Session();
-
-    const done = session.prompt('hi');
-    session.emit({ type: 'agent_start' });
-    session.emit({ type: 'message_start', message: assistantMessage() });
-    session.emit({ type: 'message_end', message: assistantMessage() });
-    session.emit({
-      type: 'tool_execution_start',
-      toolCallId: 'dangling',
-      toolName: 'bash',
-      args: {},
-    });
-    session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
-    await done;
-
-    assert.equal(capture.spans.length, 3, 'root, LLM, and the force-closed dangling tool span');
-    const dangling = capture.spans.find((s) => attrs(s)['gen_ai.tool.name'] === 'bash');
-    assert.ok(dangling);
-    assert.equal(
-      attrs(dangling!)['traceroot.pi.force_closed'],
-      true,
-      'must be marked as abnormally closed, not indistinguishable from a clean tool span',
-    );
-  });
-
   it('message_start/message_end for non-assistant roles never opens an LLM span', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();

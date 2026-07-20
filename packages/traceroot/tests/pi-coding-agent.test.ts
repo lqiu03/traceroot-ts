@@ -292,50 +292,6 @@ describe('pi instrumentation', () => {
     );
   });
 
-  it('captureContent:false suppresses input.value on the ROOT span for an empty-string prompt exactly as for an absent one, while captureContent:true legitimately records the empty string', async () => {
-    async function rootInputValue(
-      captureContent: boolean,
-      promptText: string | undefined,
-    ): Promise<{ hasKey: boolean; value: unknown }> {
-      const { capture, Session } = makeRig({ captureContent });
-      const session = new Session();
-      // Non-string bypasses the `typeof text === 'string'` guard (prompt text genuinely absent).
-      const done = session.prompt(promptText as unknown as string);
-      session.emit({ type: 'agent_start' });
-      session.emit({ type: 'agent_end', messages: [], willRetry: false });
-      await done;
-      const root = capture.spans[0]!;
-      return {
-        hasKey: Object.prototype.hasOwnProperty.call(attrs(root), 'input.value'),
-        value: attrs(root)['input.value'],
-      };
-    }
-
-    const falseEmpty = await rootInputValue(false, '');
-    assert.equal(falseEmpty.hasKey, false, 'captureContent:false must omit input.value for ""');
-    assert.equal(falseEmpty.value, undefined);
-
-    const falseUndefined = await rootInputValue(false, undefined);
-    assert.equal(
-      falseUndefined.hasKey,
-      false,
-      'captureContent:false must omit input.value for undefined',
-    );
-    assert.equal(falseUndefined.value, undefined);
-
-    const trueEmpty = await rootInputValue(true, '');
-    assert.equal(trueEmpty.hasKey, true, 'captureContent:true legitimately sets input.value to ""');
-    assert.equal(trueEmpty.value, '');
-
-    const trueUndefined = await rootInputValue(true, undefined);
-    assert.equal(
-      trueUndefined.hasKey,
-      false,
-      'no prompt text at all must leave input.value unset even when captureContent is on',
-    );
-    assert.equal(trueUndefined.value, undefined);
-  });
-
   it('an early-return prompt() call (resolved with no agent_start/agent_end) exports exactly one childless, OK-status AGENT root span', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();

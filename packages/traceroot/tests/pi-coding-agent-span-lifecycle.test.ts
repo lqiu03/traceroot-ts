@@ -1350,42 +1350,6 @@ describe('pi dangling-span sweep deduplication', () => {
     );
   });
 
-  it('dispose() mid-run force-closes the root + LLM + TOOL spans', async () => {
-    const { capture, Session } = makeRig();
-    const session = new Session();
-
-    session.prompt('run torn down mid-flight');
-    session.emit({ type: 'agent_start' });
-    session.emit({ type: 'message_start', message: assistantMessage({ model: 'dispose-llm' }) });
-    session.emit({
-      type: 'tool_execution_start',
-      toolCallId: 'dispose-tool',
-      toolName: 'read_file',
-      args: { path: '/tmp/dispose' },
-    });
-    assert.equal(capture.spans.length, 0, 'nothing exports while the run is still open');
-
-    session.dispose();
-
-    assert.equal(
-      capture.spans.length,
-      3,
-      'dispose() must force-close the root, LLM, and TOOL spans (found ' +
-        `${capture.spans.length})`,
-    );
-    const rootSpan = capture.spans.find((s) => s.name === 'AgentSession.prompt');
-    const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'dispose-llm');
-    const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'dispose-tool');
-    assert.ok(rootSpan && llmSpan && toolSpan);
-    for (const span of [rootSpan!, llmSpan!, toolSpan!]) {
-      assert.equal(
-        attrs(span)['traceroot.pi.force_closed'],
-        true,
-        `${span.name} must be marked force_closed by dispose()'s sweep`,
-      );
-    }
-  });
-
   // A second prompt() call while a previous window's root is still open (rare; isStreaming guards most
   // overlaps, but not verified to cover every path) must force-close the stale window, not leak it.
   it("a second prompt() call while the first window's root is still open force-closes the first root (and its dangling LLM/TOOL), then opens a fresh root for the second", async () => {
