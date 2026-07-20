@@ -16,7 +16,6 @@ import { win32 } from 'node:path';
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import type { Context, Span } from '@opentelemetry/api';
 import { OI_INPUT_VALUE, OI_OUTPUT_VALUE, OI_SPAN_KIND, OI_TRACE_SESSION_ID } from '../constants';
-import { sliceSurrogateSafe } from './surrogate-safe';
 import type { AgentMessage, AssistantMessage } from './types';
 import type { SpanFactory } from '../reresolving-tracer';
 
@@ -71,9 +70,9 @@ function endSpanSafe(span: Span | undefined): void {
 // Tool args/results can be arbitrarily large (a big file read, a long shell
 // command's stdout) — cap the exported JSON so one tool call can't inflate a
 // span's attribute payload without bound. Shares describeToolCallSpan's
-// MAX_BASH_NAME cap pattern below and the ./surrogate-safe sliceSurrogateSafe
-// helper: cut on a UTF-16 code-unit boundary that never splits a surrogate
-// pair, which would corrupt the UTF-8 an OTLP/proto collector requires.
+// MAX_BASH_NAME cap pattern below and the sliceSurrogateSafe helper below:
+// cut on a UTF-16 code-unit boundary that never splits a surrogate pair,
+// which would corrupt the UTF-8 an OTLP/proto collector requires.
 const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 
 // Appended by the post-hoc backstop (truncateJsonSafe) whenever tool I/O had
@@ -82,10 +81,41 @@ const MAX_TOOL_IO_JSON_CHARS = 32 * 1024; // 32 KB of UTF-16 code units
 // text.
 const TRUNCATION_MARKER = '…[truncated]';
 
-// sliceSurrogateSafe (./surrogate-safe) is the shared boundary-detection cut,
-// no marker appended — callers that need the TRUNCATION_MARKER suffix
-// (truncateJsonSafe) or a bare cap (capFieldReplacer, used mid-serialization)
-// each append what they need on top of it.
+/**
+ * UTF-16 surrogate-pair-safe truncation boundary check, shared by every cut
+ * point in this file (the tool I/O JSON payloads below and the privacy-safe
+ * tool span names in describeToolCallSpan) so a string is never capped at a
+ * UTF-16 code-unit length that splits a surrogate pair — doing so would
+ * leave a lone high surrogate in the output and corrupt the UTF-8 an
+ * OTLP/proto collector requires. Keeping this as a single implementation
+ * means a boundary-math fix lands in one place instead of drifting across
+ * duplicated cut logic. No marker is appended here — callers that need the
+ * TRUNCATION_MARKER suffix (truncateJsonSafe) or a bare cap (capFieldReplacer,
+ * used mid-serialization) or an ellipsis (truncateSurrogateSafe) each append
+ * what they need on top of the raw sliced text this returns.
+ *
+ * Contract for maxLen <= 0: treated as "cap to nothing" and returns ''.
+ * Without this guard, a negative maxLen would fall through to
+ * `text.slice(0, cut)` with a negative `cut`, which slices from the END of
+ * the string (e.g. 'abcdefghij'.slice(0, -3) === 'abcdefg') — the opposite
+ * of capping. Both current call sites pass hardcoded positive literals, but
+ * this is an exported, reusable primitive, so a future caller computing
+ * maxLen dynamically (e.g. a remaining-budget calculation that can underflow
+ * below 0) must get a clear, safe cap rather than silently oversized output.
+ */
+export function sliceSurrogateSafe(text: string, maxLen: number): string {
+  if (maxLen <= 0) return '';
+  if (text.length <= maxLen) return text;
+  let cut = maxLen;
+  const code = text.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff) {
+    // High surrogate sitting right at the cut boundary — back off one so we
+    // never emit a lone surrogate.
+    cut -= 1;
+  }
+  return text.slice(0, cut);
+}
+
 function truncateJsonSafe(json: string): string {
   if (json.length <= MAX_TOOL_IO_JSON_CHARS) return json;
   return `${sliceSurrogateSafe(json, MAX_TOOL_IO_JSON_CHARS)}${TRUNCATION_MARKER}`;
@@ -286,7 +316,7 @@ function firstPathArgument(args: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-// Thin wrapper around the shared ./surrogate-safe boundary cut: appends the
+// Thin wrapper around the sliceSurrogateSafe boundary cut above: appends the
 // ellipsis marker this file's span names use, but only when truncation
 // actually happened (an untruncated name gets no trailing "…").
 function truncateSurrogateSafe(text: string, maxLen: number): string {

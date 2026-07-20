@@ -1,9 +1,11 @@
 /**
  * Direct unit coverage of spans.ts's LLM/tool/dangling span helpers
  * (usage-token mapping incl. zero values, error/aborted status, updateName,
- * captureContent gating), surrogate-safe boundary edges (all-lone-surrogates,
- * complete pair at boundary), and circular-ref handling through
- * openToolSpan — surfaces the rest of the suite leaves thin.
+ * captureContent gating), circular-ref handling through openToolSpan —
+ * surfaces the rest of the suite leaves thin — and the canonical
+ * sliceSurrogateSafe unit tests (boundary edges, the maxLen<=0 and
+ * negative-maxLen guards), which live in this file since sliceSurrogateSafe
+ * itself now lives in spans.ts.
  *
  * Two subjects from the original packages/pi version of this file are
  * deliberately NOT carried over: baseUrl whitespace normalization (config.ts
@@ -30,7 +32,7 @@ import {
   closeToolSpan,
   closeDanglingSpan,
 } from '../src/pi/spans';
-import { sliceSurrogateSafe } from '../src/pi/surrogate-safe';
+import { sliceSurrogateSafe } from '../src/pi/spans';
 import type { AgentMessage, AssistantMessage } from '../src/pi/types';
 
 // Direct-span rig, mirroring close-root-span-backward-scan.test.ts: a real
@@ -387,7 +389,7 @@ test('closeToolSpan sets ERROR status (no message) when isError is true', () => 
   assert.equal(toolSpan!.status.code, SpanStatusCode.ERROR);
 });
 
-// --- surrogate-safe: edges not already pinned ---------------------------
+// --- sliceSurrogateSafe: boundary tests ---------------------------------
 
 test('sliceSurrogateSafe on a string of only lone high surrogates never emits a trailing lone high surrogate', () => {
   const loneHighs = '\uD800\uD800\uD800\uD800\uD800';
@@ -413,4 +415,43 @@ test('sliceSurrogateSafe keeps a complete surrogate pair when the LOW surrogate 
 test('sliceSurrogateSafe returns text unchanged when a surrogate pair sits entirely under maxLen', () => {
   const text = 'x\u{1F600}y';
   assert.equal(sliceSurrogateSafe(text, 10), text, 'a fully-contained pair must never be touched');
+});
+
+test('sliceSurrogateSafe returns text unchanged when at or under maxLen (<=, not <)', () => {
+  assert.equal(sliceSurrogateSafe('hello', 5), 'hello');
+  assert.equal(sliceSurrogateSafe('hello', 10), 'hello');
+  assert.equal(sliceSurrogateSafe('', 0), '');
+});
+
+test('sliceSurrogateSafe slices plainly when no surrogate sits at the cut boundary', () => {
+  assert.equal(sliceSurrogateSafe('abcdef', 3), 'abc');
+});
+
+test('sliceSurrogateSafe backs off one code unit when a high surrogate sits at the cut boundary', () => {
+  // 3 ASCII chars + an emoji (a surrogate pair): cutting at maxLen=4 would
+  // otherwise land the boundary exactly on the emoji's high surrogate.
+  const emoji = '\u{1F600}';
+  const text = `abc${emoji}tail`;
+  const sliced = sliceSurrogateSafe(text, 4);
+  assert.equal(sliced, 'abc');
+  const lastCode = sliced.charCodeAt(sliced.length - 1);
+  assert.ok(lastCode < 0xd800 || lastCode > 0xdbff, 'must not end on an unpaired high surrogate');
+});
+
+test('sliceSurrogateSafe appends no suffix — callers own their own marker', () => {
+  const sliced = sliceSurrogateSafe('abcdefgh', 3);
+  assert.equal(sliced, 'abc');
+  assert.ok(!sliced.includes('…'), 'sliceSurrogateSafe itself must not add an ellipsis or marker');
+});
+
+test('sliceSurrogateSafe returns empty string for maxLen === 0 rather than slicing', () => {
+  assert.equal(sliceSurrogateSafe('abcdefghij', 0), '');
+});
+
+test('sliceSurrogateSafe returns empty string for a negative maxLen instead of slicing from the end', () => {
+  // Regression guard: text.slice(0, cut) with a negative cut slices from the
+  // END of the string (e.g. 'abcdefghij'.slice(0, -3) === 'abcdefg'), which
+  // is the opposite of capping. A negative maxLen must be treated as "cap to
+  // nothing" and return ''.
+  assert.equal(sliceSurrogateSafe('abcdefghij', -3), '');
 });
