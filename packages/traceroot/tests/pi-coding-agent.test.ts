@@ -414,7 +414,7 @@ describe('wiring', () => {
    * proving the WIRING path (unwrap, dispatch, warn-don't-throw) is correct.
    * Deep capture-toggle span behavior belongs to a later phase's moved pi
    * behavioral suite, and cross-package no-mocks span assertions already live
-   * in pi-coding-agent-integration.test.ts.
+   * in the `integration` suite in this file.
    */
 
   // A minimal, self-contained fake `import * as pi from

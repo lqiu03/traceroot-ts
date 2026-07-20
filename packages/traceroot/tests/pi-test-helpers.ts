@@ -87,7 +87,7 @@ export class CapturingExporter implements SpanExporter {
  *   throw — where the call to `session.prompt(...)` itself throws, before
  *   ever returning a promise at all — is a materially different case,
  *   exercising a different catch branch in instrumentation.ts's proto.prompt;
- *   see pi-instrumentation-edge-cases.test.ts's dedicated synchronous-throw
+ *   see the `instrumentation edge cases` suite's dedicated synchronous-throw
  *   fake, which overrides prompt() with a plain non-async function instead of
  *   using this predicate.) Used to reproduce a prompt() call that fails
  *   validation before agent_start ever fires — the real SDK's own
@@ -170,13 +170,13 @@ export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
       this.pending = undefined;
       reject(err);
     }
-    // dispose() mirrors the real, verified SDK mechanism (see
-    // session-dispose.test.ts's module header): it reassigns the session's
+    // dispose() mirrors the real, verified SDK mechanism (see the
+    // `session dispose` suite's header): it reassigns the session's
     // internal listener array to a fresh empty one rather than calling each
     // stored unsubscribe() closure. Included unconditionally (not gated
     // behind an options flag) because every other caller of this factory
     // never invokes .dispose(), so its presence is inert for them — only
-    // session-dispose.test.ts exercises it.
+    // the `session dispose` suite exercises it.
     dispose(): void {
       this.disposed = true;
       this.listeners = [];
