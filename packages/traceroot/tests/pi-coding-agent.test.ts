@@ -8,14 +8,14 @@ import { instrumentPiCodingAgent, type AgentEvent, type AssistantMessage } from 
 import { TraceRoot, _resetForTesting } from '../src/traceroot';
 import {
   assistantMessage,
+  assistantMessage as baseAssistantMessage,
   attrs,
   CapturingExporter,
   makeFakeSessionClass,
   makeRig,
 } from './pi-test-helpers';
-import { assistantMessage as baseAssistantMessage } from './pi-test-helpers';
 
-describe('instrumentation', () => {
+describe('pi instrumentation', () => {
   // Overrides the shared helper's placeholder usage since this file asserts on specific numbers.
   function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
     return baseAssistantMessage({
@@ -366,7 +366,7 @@ describe('instrumentation', () => {
   });
 });
 
-describe('wiring', () => {
+describe('pi wiring', () => {
   // Wiring-only coverage for instrumentModules.piCodingAgent; deep span behavior is covered elsewhere.
 
   // Fresh per call, since the wrap-once guard is stamped on the prototype itself.
@@ -512,7 +512,7 @@ describe('wiring', () => {
   });
 });
 
-describe('integration', () => {
+describe('pi integration', () => {
   // Drives the real pi instrumentation through TraceRoot.initialize() with no mocked pi export.
   interface FakeAgentEvent {
     type: string;
@@ -663,7 +663,7 @@ describe('integration', () => {
   });
 });
 
-describe('session dispose', () => {
+describe('pi session dispose', () => {
   // dispose() clears every listener via subscribe(), reassigning the internal array to a fresh empty one.
 
   // Local instrumentPiCodingAgent() calls (not makeRig()) so tests can drive dispose() on the raw session.
@@ -699,7 +699,7 @@ describe('session dispose', () => {
     assert.equal(
       capture.spans.length,
       1,
-      'no new spans may appear after dispose() — the listener must no longer be reachable',
+      'no new spans may appear after dispose() -- the listener must no longer be reachable',
     );
   });
 
@@ -902,7 +902,7 @@ describe('session dispose', () => {
     assert.equal(
       capture.spans.length,
       5,
-      'all 5 spans (root, LLM, call-1, call-2, call-3) must still export — a setAttribute failure ' +
+      'all 5 spans (root, LLM, call-1, call-2, call-3) must still export -- a setAttribute failure ' +
         'on the force_closed marker must never prevent the span itself from being ended',
     );
     const exportedToolCallIds = capture.spans
@@ -981,7 +981,7 @@ describe('session dispose', () => {
   });
 });
 
-describe('steer / followUp', () => {
+describe('pi steer / followUp', () => {
   // Must patch .steer/.followUp too, not just .prompt: real bug was a host whose first interaction
   // was steer()/followUp() got zero tracing. Their text is deliberately never asserted onto the root's
   // input.value: they only enqueue, never trigger a run, so attributing it would misattribute to a later run.
@@ -1004,7 +1004,7 @@ describe('steer / followUp', () => {
 
   // Only prompt() opens a root span; a steer()-only run produces none, so this checks its tool span
   // still exports (as a parentless mini-trace) to prove the listener is attached, not zero-tracing.
-  it('calling steer() as the FIRST interaction (no prior prompt() call) still attaches tracing — its run is ROOTLESS (bypasses prompt()), but its child spans still export', async () => {
+  it('calling steer() as the FIRST interaction (no prior prompt() call) still attaches tracing -- its run is ROOTLESS (bypasses prompt()), but its child spans still export', async () => {
     const capture = new CapturingExporter();
     const Session = makeSteerAndFollowUpSessionClass();
     const sdk = { AgentSession: Session };
@@ -1037,18 +1037,18 @@ describe('steer / followUp', () => {
     const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'bypass-tool');
     assert.ok(
       toolSpan,
-      'steer() must still attach the span listener itself — otherwise this bypass run’s tool span ' +
+      "steer() must still attach the span listener itself -- otherwise this bypass run's tool span " +
         'would never have been captured at all, proving prompt() was not required first',
     );
     assert.equal(
       toolSpan!.parentSpanId,
       undefined,
-      'with no root open, the bypass run’s tool span parents under ROOT_CONTEXT (a fresh, ' +
+      "with no root open, the bypass run's tool span parents under ROOT_CONTEXT (a fresh, " +
         'standalone parentless mini-trace)',
     );
   });
 
-  it('calling followUp() as the FIRST interaction (no prior prompt() call) still attaches tracing — its run is ROOTLESS (bypasses prompt()), but its child spans still export', async () => {
+  it('calling followUp() as the FIRST interaction (no prior prompt() call) still attaches tracing -- its run is ROOTLESS (bypasses prompt()), but its child spans still export', async () => {
     const capture = new CapturingExporter();
     const Session = makeSteerAndFollowUpSessionClass();
     const sdk = { AgentSession: Session };
@@ -1104,7 +1104,7 @@ describe('steer / followUp', () => {
     assert.equal(
       capture.spans.length,
       1,
-      'exactly one root span — proves steer()/followUp() reused the same listener prompt() already attached, instead of subscribing a second time',
+      'exactly one root span -- proves steer()/followUp() reused the same listener prompt() already attached, instead of subscribing a second time',
     );
   });
 });

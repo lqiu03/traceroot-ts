@@ -23,7 +23,7 @@ import {
 } from '../src/pi';
 import { CapturingExporter } from './pi-test-helpers';
 
-describe('span name', () => {
+describe('pi span name', () => {
   it('describeToolCallSpan uses the file basename for path-like args', () => {
     assert.equal(describeToolCallSpan('read', { path: '/a/b/app.py' }), 'read: app.py');
     assert.equal(describeToolCallSpan('write', { file: 'notes.md' }), 'write: notes.md');
@@ -177,7 +177,7 @@ describe('span name', () => {
   });
 
   // A blank command collapses to '' after whitespace normalization; `if (cmd)` must fall through.
-  it('describeToolCallSpan treats a whitespace-only bash command as absent — falls back to a path arg or the bare tool name, never emitting a dangling "bash: "', () => {
+  it('describeToolCallSpan treats a whitespace-only bash command as absent -- falls back to a path arg or the bare tool name, never emitting a dangling "bash: "', () => {
     assert.equal(describeToolCallSpan('bash', { command: '   ' }), 'bash');
     assert.equal(describeToolCallSpan('bash', { command: ' \t\n ' }), 'bash');
     assert.equal(
@@ -187,7 +187,7 @@ describe('span name', () => {
   });
 });
 
-describe('spans and config boundary coverage', () => {
+describe('pi spans and config boundary coverage', () => {
   // Direct unit coverage of pi.ts's LLM/tool/dangling span helpers and sliceSurrogateSafe.
   function makeTracer() {
     const spans: ReadableSpan[] = [];
@@ -363,7 +363,7 @@ describe('spans and config boundary coverage', () => {
     assert.equal(
       attrs(spans[0]!)['output.value'],
       undefined,
-      'a tool-only assistant turn has no text — output.value must be absent, not empty string',
+      'a tool-only assistant turn has no text -- output.value must be absent, not empty string',
     );
   });
 
@@ -512,7 +512,7 @@ describe('spans and config boundary coverage', () => {
     assert.equal(toolSpan!.status.code, SpanStatusCode.ERROR);
   });
 
-  it('sliceSurrogateSafe on a string of only lone high surrogates never emits a trailing lone high surrogate', () => {
+  it('sliceSurrogateSafe caps a run of lone high surrogates without repairing the pre-existing ones', () => {
     const loneHighs = '\uD800\uD800\uD800\uD800\uD800';
     const sliced = sliceSurrogateSafe(loneHighs, 3);
     assert.equal(sliced.length, 2);
@@ -558,7 +558,7 @@ describe('spans and config boundary coverage', () => {
     assert.ok(lastCode < 0xd800 || lastCode > 0xdbff, 'must not end on an unpaired high surrogate');
   });
 
-  it('sliceSurrogateSafe appends no suffix — callers own their own marker', () => {
+  it('sliceSurrogateSafe appends no suffix -- callers own their own marker', () => {
     const sliced = sliceSurrogateSafe('abcdefgh', 3);
     assert.equal(sliced, 'abc');
     assert.ok(
@@ -577,7 +577,7 @@ describe('spans and config boundary coverage', () => {
   });
 });
 
-describe('spans truncation', () => {
+describe('pi spans truncation', () => {
   // capFieldReplacer only caps an individually-oversized STRING field mid-walk; an ARRAY of many small
   // values serializes in full before capJsonWithMarker's post-hoc backstop slices it (accepted O(N) trade).
 
@@ -808,7 +808,7 @@ describe('spans truncation', () => {
   // A huge string field must never be fully materialized before capJsonWithMarker's cap runs; asserting
   // only on final length can't distinguish that from a fixed implementation, so this spies on JSON.stringify.
   it('a single huge string tool argument is capped during serialization, not only after the fact', async () => {
-    const HUGE_LEN = 500 * 1024; // 500 KB — far past MAX_TOOL_IO_JSON_CHARS.
+    const HUGE_LEN = 500 * 1024; // 500 KB -- far past MAX_TOOL_IO_JSON_CHARS.
     const hugeValue = 'A'.repeat(HUGE_LEN);
     const args = { fileContent: hugeValue };
 
@@ -850,7 +850,7 @@ describe('spans truncation', () => {
 
       assert.ok(
         !sawBareStringifyOfHugeValue,
-        'the huge string argument must never be handed to a bare JSON.stringify(args) call with no replacer — that fully materializes it before truncation can cap it',
+        'the huge string argument must never be handed to a bare JSON.stringify(args) call with no replacer -- that fully materializes it before truncation can cap it',
       );
       assert.ok(
         sawReplacerCapTheHugeValue,
@@ -887,7 +887,7 @@ describe('spans truncation', () => {
 
       assert.ok(
         !stringifyCalledWithUndefined,
-        'stringifyToolIo must recognize a literal undefined value itself and short-circuit before ever calling JSON.stringify(undefined, ...) — JSON.stringify(undefined, replacer) returns the value undefined (not a string), and handing that to capJsonWithMarker throws a TypeError that gets silently swallowed under a misleading "circular refs or BigInt" comment',
+        'stringifyToolIo must recognize a literal undefined value itself and short-circuit before ever calling JSON.stringify(undefined, ...) -- JSON.stringify(undefined, replacer) returns the value undefined (not a string), and handing that to capJsonWithMarker throws a TypeError that gets silently swallowed under a misleading "circular refs or BigInt" comment',
       );
       assert.equal(
         attrs(toolSpan)['input.value'],
@@ -955,7 +955,7 @@ describe('spans truncation', () => {
   });
 });
 
-describe('config resolution', () => {
+describe('pi config resolution', () => {
   function makeFakeSessionClass() {
     return class FakeAgentSession {
       sessionId = 'sess-1';
@@ -1039,7 +1039,7 @@ describe('config resolution', () => {
     assert.equal(bothOff.captureToolIo, false);
   });
 
-  it('instrumentPiCodingAgent() snapshots the config object at call time — mutating captureContent on the caller-owned object after the call returns has no effect on already-instrumented behavior', async () => {
+  it('instrumentPiCodingAgent() snapshots the config object at call time -- mutating captureContent on the caller-owned object after the call returns has no effect on already-instrumented behavior', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
     const sdk = { AgentSession: Session };
@@ -1068,7 +1068,7 @@ describe('config resolution', () => {
       attrs(rootSpan!)['input.value'],
       'sensitive prompt text',
       'captureContent must still resolve to its call-time value (true), not the post-call ' +
-        'mutation to false — resolveConfig() must copy primitives by value, not hold a live ' +
+        'mutation to false -- resolveConfig() must copy primitives by value, not hold a live ' +
         'reference to the caller-owned config object',
     );
     assert.equal(attrs(rootSpan!)['output.value'], 'sensitive reply');

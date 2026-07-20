@@ -19,7 +19,7 @@ import {
   makeFakeSessionClass,
 } from './pi-test-helpers';
 
-describe('instrumentation edge cases', () => {
+describe('pi instrumentation edge cases', () => {
   // Local rig, since several tests assert on direct prompt identity / subscribeCallCount.
   function registerCapturingProvider(capture: CapturingExporter): void {
     trace.disable();
@@ -109,12 +109,12 @@ describe('instrumentation edge cases', () => {
     assert.equal(
       capture.spans.length,
       1,
-      'exactly one root span, not two — proves subscribe() was not registered twice',
+      'exactly one root span, not two -- proves subscribe() was not registered twice',
     );
   });
 
   // A real `import * as pi` namespace object is always non-extensible per spec; Object.preventExtensions
-  // reproduces that shape — the wrap-once guard must never be stamped directly onto `sdk` itself.
+  // reproduces that shape -- the wrap-once guard must never be stamped directly onto `sdk` itself.
   it('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES module namespace) does not throw', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -159,8 +159,8 @@ describe('instrumentation edge cases', () => {
     assert.equal(
       guardKeys[0],
       Symbol.for('traceroot.pi_coding_agent.wrapped'),
-      'the guard key must be the globally-interned Symbol.for() value — not a ' +
-        'module-scoped Symbol() — so that two independently-loaded copies of ' +
+      'the guard key must be the globally-interned Symbol.for() value -- not a ' +
+        'module-scoped Symbol() -- so that two independently-loaded copies of ' +
         "this module sharing one AgentSession.prototype detect each other's " +
         'stamp instead of silently double-wrapping and doubling every span export',
     );
@@ -339,7 +339,7 @@ describe('instrumentation edge cases', () => {
     assert.equal(
       capture.spans.length,
       1,
-      'only the root span — no LLM span for user/toolResult messages',
+      'only the root span -- no LLM span for user/toolResult messages',
     );
   });
 
@@ -353,7 +353,7 @@ describe('instrumentation edge cases', () => {
 
     const done = session.prompt('hi');
     session.emit({ type: 'agent_start' });
-    // A malformed/missing `usage` field must not crash the listener — attribute setters must tolerate it.
+    // A malformed/missing `usage` field must not crash the listener -- attribute setters must tolerate it.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'message_end',
@@ -412,7 +412,7 @@ describe('instrumentation edge cases', () => {
   });
 
   // This fake's `async` prompt() turns its throw into a REJECTED PROMISE, exercising the
-  // `result.then(onResolve, onReject)` branch — contrast the synchronous-throw test below.
+  // `result.then(onResolve, onReject)` branch -- contrast the synchronous-throw test below.
   it('a rejected prompt() (validation failure before agent_start) never creates a dangling root span, and finalizes the root as ERROR', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -462,7 +462,7 @@ describe('instrumentation edge cases', () => {
     );
   });
 
-  it('a prompt() call whose run retries once (willRetry: true) keeps ONE root span open across the retry continuation, closing it exactly once with retry_count stamped, and both attempts’ LLM spans (ERROR then OK) parent under that single root', async () => {
+  it("a prompt() call whose run retries once (willRetry: true) keeps ONE root span open across the retry continuation, closing it exactly once with retry_count stamped, and both attempts' LLM spans (ERROR then OK) parent under that single root", async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
     const sdk = { AgentSession: Session };
@@ -513,27 +513,27 @@ describe('instrumentation edge cases', () => {
     assert.equal(llmSpans.length, 2, 'each attempt gets its own child LLM span, not a merged one');
     const errorLlm = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'attempt-1-model');
     const okLlm = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'attempt-2-model');
-    assert.ok(errorLlm, 'attempt 1’s LLM span must be present');
-    assert.ok(okLlm, 'attempt 2’s LLM span must be present');
+    assert.ok(errorLlm, "attempt 1's LLM span must be present");
+    assert.ok(okLlm, "attempt 2's LLM span must be present");
     assert.equal(
       errorLlm!.status.code,
       SpanStatusCode.ERROR,
-      'attempt 1’s LLM span must carry the ERROR status from its failing stopReason',
+      "attempt 1's LLM span must carry the ERROR status from its failing stopReason",
     );
     assert.equal(
       okLlm!.status.code,
       SpanStatusCode.UNSET,
-      'attempt 2’s LLM span must NOT be ERROR — it is the successful retry',
+      "attempt 2's LLM span must NOT be ERROR -- it is the successful retry",
     );
     assert.equal(
       errorLlm!.parentSpanId,
       root.spanContext().spanId,
-      'attempt 1’s (failed) LLM span must parent under the single shared root, not a discarded one',
+      "attempt 1's (failed) LLM span must parent under the single shared root, not a discarded one",
     );
     assert.equal(
       okLlm!.parentSpanId,
       root.spanContext().spanId,
-      'attempt 2’s (succeeded) LLM span must parent under the SAME single shared root as attempt 1',
+      "attempt 2's (succeeded) LLM span must parent under the SAME single shared root as attempt 1",
     );
   });
 
@@ -601,7 +601,7 @@ describe('instrumentation edge cases', () => {
     assert.equal(
       session.subscribeCallCount,
       1,
-      'a second real prompt() call on the same session instance must not re-subscribe — the ' +
+      'a second real prompt() call on the same session instance must not re-subscribe -- the ' +
         'subscribedSessions WeakSet guard must hold across repeated prompt() calls, not just ' +
         'across repeated instrumentPiCodingAgent() calls',
     );
@@ -649,7 +649,7 @@ describe('instrumentation edge cases', () => {
   });
 });
 
-describe('install rollback', () => {
+describe('pi install rollback', () => {
   // Two failure points along the install path must both leave AgentSession.prototype exactly as found:
   // a failure mid-patching, and a failure from the final wrap-once stamp after every patch succeeded.
 
@@ -717,7 +717,7 @@ describe('install rollback', () => {
       const proto = FullSession.prototype as unknown as Record<PropertyKey, unknown>;
 
       // Pre-define WRAPPED as non-configurable so setup proceeds, but the final stamp's defineProperty
-      // can't redefine it and throws — standing in for a frozen/sealed prototype at that final step.
+      // can't redefine it and throws -- standing in for a frozen/sealed prototype at that final step.
       Object.defineProperty(proto, WRAPPED, {
         value: false,
         configurable: false,
@@ -752,7 +752,7 @@ describe('install rollback', () => {
   });
 });
 
-describe('close-root-span backward scan', () => {
+describe('pi close-root-span backward scan', () => {
   // stampRootOutput's search for the last assistant message must keep walking past trailing
   // non-assistant messages; it only stamps output.value, so the test ends the span explicitly.
   function makeTracer() {
@@ -818,7 +818,7 @@ describe('close-root-span backward scan', () => {
   });
 });
 
-describe('tracer reresolution', () => {
+describe('pi tracer reresolution', () => {
   // TraceRoot.shutdown() swaps the OTel API's ProxyTracerProvider for a new instance rather than
   // mutating it, so a tracer captured once at wrap time would go dark; createReresolvingTracer instead
   // re-resolves through the global `trace` facade on every span-open.
@@ -880,7 +880,7 @@ describe('tracer reresolution', () => {
         .find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
       assert.ok(
         rootB,
-        'the second run must export through provider B after the cycle — no silent black hole',
+        'the second run must export through provider B after the cycle -- no silent black hole',
       );
       assert.equal(attrs(rootB!)['input.value'], 'second run');
     } finally {
@@ -889,7 +889,7 @@ describe('tracer reresolution', () => {
   });
 });
 
-describe('real SDK shape smoke', () => {
+describe('pi real SDK shape smoke', () => {
   // src/pi.ts hand-cites private internals of the real SDK, none part of a stable public contract;
   // these verify those shapes against the actual devDependency so a version bump fails loudly here.
 

@@ -9,7 +9,7 @@ import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { instrumentPiCodingAgent, type AgentEvent, type AssistantMessage } from '../src/pi';
 
-describe('span lifecycle event ordering', () => {
+describe('pi span lifecycle event ordering', () => {
   // Probes out-of-order/malformed AgentEvent sequences: a span never .end()ed is never exported,
   // so an abandoned span/state must always be force-closed, never silently overwritten.
   it('a second message_start with no intervening message_end/turn_end force-closes the abandoned first LLM span instead of silently dropping it', async () => {
@@ -33,7 +33,7 @@ describe('span lifecycle event ordering', () => {
     assert.equal(
       llmSpans.length,
       2,
-      'both the abandoned first LLM span and the properly-closed second must be exported — the ' +
+      'both the abandoned first LLM span and the properly-closed second must be exported -- the ' +
         'first must never silently vanish just because state.llmSpan was overwritten',
     );
     const firstSpan = llmSpans.find((s) => attrs(s)['gen_ai.request.model'] === 'first-model');
@@ -55,7 +55,7 @@ describe('span lifecycle event ordering', () => {
     );
   });
 
-  it('a stray message_start firing after a clean prompt() call already settled (no matching message_end) is force-closed on the NEXT prompt() call’s agent_start instead of being silently dropped', async () => {
+  it("a stray message_start firing after a clean prompt() call already settled (no matching message_end) is force-closed on the NEXT prompt() call's agent_start instead of being silently dropped", async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -73,7 +73,7 @@ describe('span lifecycle event ordering', () => {
       message: assistantMessage({ model: 'stray-orphaned-model' }),
     });
 
-    // Run 2 must be a genuinely new prompt() call — the moment the orphaned span above must sweep.
+    // Run 2 must be a genuinely new prompt() call -- the moment the orphaned span above must sweep.
     const done2 = session.prompt('run 2 prompt text');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
@@ -155,7 +155,7 @@ describe('span lifecycle event ordering', () => {
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     await done;
 
-    assert.equal(capture.spans.length, 2, 'root + tool span only — no LLM span was ever opened');
+    assert.equal(capture.spans.length, 2, 'root + tool span only -- no LLM span was ever opened');
     const rootSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
     const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 't1');
     assert.ok(rootSpan);
@@ -204,7 +204,7 @@ describe('span lifecycle event ordering', () => {
     assert.equal(
       toolSpans.length,
       2,
-      'both the abandoned first span and the properly-closed second span must be exported — the ' +
+      'both the abandoned first span and the properly-closed second span must be exported -- the ' +
         'first must never silently vanish just because its Map slot was overwritten',
     );
     const firstSpan = toolSpans.find((s) => attrs(s)['gen_ai.tool.name'] === 'bash');
@@ -283,7 +283,7 @@ describe('span lifecycle event ordering', () => {
     assert.equal(
       rootSpans.length,
       1,
-      'both attempts share exactly ONE root span — agent_start must never force-close it under the ' +
+      'both attempts share exactly ONE root span -- agent_start must never force-close it under the ' +
         'new model, since it belongs to the whole prompt() window, not to one attempt',
     );
 
@@ -308,12 +308,12 @@ describe('span lifecycle event ordering', () => {
     assert.equal(
       attempt1LlmSpan!.spanContext().traceId,
       attempt2Tool!.spanContext().traceId,
-      'both attempts must live in the SAME trace — the whole point of anchoring the root on ' +
+      'both attempts must live in the SAME trace -- the whole point of anchoring the root on ' +
         'prompt() rather than on each individual attempt',
     );
   });
 
-  it('a stray tool_execution_start firing after a clean prompt() call already settled does not corrupt the NEXT prompt() call’s span tree', async () => {
+  it("a stray tool_execution_start firing after a clean prompt() call already settled does not corrupt the NEXT prompt() call's span tree", async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -412,7 +412,7 @@ describe('span lifecycle event ordering', () => {
     );
   });
 
-  it('a message_end (assistant) whose message_start never arrived is ignored — no crash, no phantom LLM span, and the run still completes normally', async () => {
+  it('a message_end (assistant) whose message_start never arrived is ignored -- no crash, no phantom LLM span, and the run still completes normally', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -431,7 +431,7 @@ describe('span lifecycle event ordering', () => {
     assert.equal(
       llmSpans.length,
       1,
-      'only the real message_start/message_end pair produces an LLM span — the orphaned message_end produces nothing',
+      'only the real message_start/message_end pair produces an LLM span -- the orphaned message_end produces nothing',
     );
     assert.equal(attrs(llmSpans[0])['gen_ai.request.model'], 'real-model');
     const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
@@ -444,10 +444,10 @@ describe('span lifecycle event ordering', () => {
   });
 });
 
-describe('span context parenting', () => {
+describe('pi span context parenting', () => {
   // Probes OTel Context/parent-span correctness across turn boundaries and ambient-context leakage.
 
-  // Fresh class per rig — instrumentPiCodingAgent patches the prototype directly.
+  // Fresh class per rig -- instrumentPiCodingAgent patches the prototype directly.
   function makeRig() {
     const capture = new CapturingExporter();
 
@@ -663,7 +663,7 @@ describe('span context parenting', () => {
     assert.equal(
       turn1Tool!.parentSpanId,
       turn1Llm!.spanContext().spanId,
-      "turn 1's tool span must stay bound to turn 1's LLM span — the parent Context was captured at " +
+      "turn 1's tool span must stay bound to turn 1's LLM span -- the parent Context was captured at " +
         'tool_execution_start time and is immutable, so it must not silently move onto turn 2 just ' +
         'because state.llmCtx has since been reassigned',
     );
@@ -729,7 +729,7 @@ describe('span context parenting', () => {
     );
   });
 
-  it('closeLlmSpan span.updateName() changes the name the exporter actually captures — the final response model wins over the initial request model', async () => {
+  it('closeLlmSpan span.updateName() changes the name the exporter actually captures -- the final response model wins over the initial request model', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -776,7 +776,7 @@ describe('span context parenting', () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
-    // steer() attaches the listener without ever opening a root, unlike prompt() — the "no root" case.
+    // steer() attaches the listener without ever opening a root, unlike prompt() -- the "no root" case.
     await session.steer('a stray assistant message with no prompt() ever called');
 
     const manager = new StackContextManager();
@@ -851,7 +851,7 @@ describe('span context parenting', () => {
   });
 });
 
-describe('close-event idempotency and content safety', () => {
+describe('pi close-event idempotency and content safety', () => {
   // Duplicate/late CLOSE events, concurrent tool calls, retry-count isolation, and malformed
   // message content that could throw before endSpanSafe() ran, silently dropping the span.
   it('tool_execution_end firing twice for the same toolCallId exports exactly one tool span and never crashes on the second (stale) close', async () => {
@@ -892,7 +892,7 @@ describe('close-event idempotency and content safety', () => {
     assert.equal(
       attrs(toolSpans[0]!)['traceroot.pi.force_closed'],
       undefined,
-      'the tool span closed normally via the first end — it must not be marked force_closed',
+      'the tool span closed normally via the first end -- it must not be marked force_closed',
     );
   });
 
@@ -914,7 +914,7 @@ describe('close-event idempotency and content safety', () => {
     assert.equal(
       llmSpans.length,
       1,
-      'one LLM span — the second message_end must not fabricate another',
+      'one LLM span -- the second message_end must not fabricate another',
     );
   });
 
@@ -1008,7 +1008,7 @@ describe('close-event idempotency and content safety', () => {
     assert.equal(attrs(byId.get('a')!)['gen_ai.tool.name'], 'bash');
     assert.equal(attrs(byId.get('b')!)['gen_ai.tool.name'], 'read');
     assert.equal(attrs(byId.get('c')!)['gen_ai.tool.name'], 'write');
-    // None force-closed — each got its own explicit end.
+    // None force-closed -- each got its own explicit end.
     for (const s of toolSpans) {
       assert.equal(attrs(s)['traceroot.pi.force_closed'], undefined);
     }
@@ -1059,7 +1059,7 @@ describe('close-event idempotency and content safety', () => {
     );
   });
 
-  // agent_end never closes the root itself, only stamps output — a duplicate is a harmless repeated stamp.
+  // agent_end never closes the root itself, only stamps output -- a duplicate is a harmless repeated stamp.
   it('agent_end firing twice for one attempt before prompt() settles stamps output idempotently', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1137,7 +1137,7 @@ describe('close-event idempotency and content safety', () => {
     assert.equal(
       attrs(llmSpans[0]!)['traceroot.pi.force_closed'],
       undefined,
-      "message_end is the LLM span's normal close — a malformed content payload must not " +
+      "message_end is the LLM span's normal close -- a malformed content payload must not " +
         'demote it to a force-closed span (which means span.end() was skipped in closeLlmSpan)',
     );
   });
@@ -1164,7 +1164,7 @@ describe('close-event idempotency and content safety', () => {
   });
 });
 
-describe('dangling-span sweep deduplication', () => {
+describe('pi dangling-span sweep deduplication', () => {
   // Guards that the dangling-span sweep runs at every call site (agent_start, turn_end, agent_end,
   // proto.prompt's overlap check, dispose()) via real scenarios, not a source-text regex.
   it('agent_start sweeps a dangling LLM + TOOL span from a crashed prior ATTEMPT, but leaves the still-open root untouched', async () => {
@@ -1187,23 +1187,23 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(
       capture.spans.length,
       2,
-      'agent_start must force-close attempt one’s LLM and TOOL spans only, not the still-open root ' +
+      "agent_start must force-close attempt one's LLM and TOOL spans only, not the still-open root " +
         `(found ${capture.spans.length})`,
     );
     const llmSpan = capture.spans.find((s) => attrs(s)['gen_ai.request.model'] === 'attempt1-llm');
     const toolSpan = capture.spans.find((s) => attrs(s)['gen_ai.tool.call.id'] === 'attempt1-tool');
-    assert.ok(llmSpan && toolSpan, 'attempt one’s LLM and TOOL spans must be exported');
+    assert.ok(llmSpan && toolSpan, "attempt one's LLM and TOOL spans must be exported");
     for (const span of [llmSpan!, toolSpan!]) {
       assert.equal(
         attrs(span)['traceroot.pi.force_closed'],
         true,
-        `${span.name} must be marked force_closed by agent_start’s sweep`,
+        `${span.name} must be marked force_closed by agent_start\'s sweep`,
       );
     }
     assert.equal(
       capture.spans.find((s) => s.name === 'AgentSession.prompt'),
       undefined,
-      'the root span must still be open — agent_start never force-closes it under the new model',
+      'the root span must still be open -- agent_start never force-closes it under the new model',
     );
 
     session.emit({
@@ -1291,7 +1291,7 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(
       toolSpans.length,
       1,
-      'the tool span must be exported exactly once — turn_end must also clear it from ' +
+      'the tool span must be exported exactly once -- turn_end must also clear it from ' +
         'state.toolSpans so agent_end does not try to force-close it a second time',
     );
   });
@@ -1325,17 +1325,17 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(
       attrs(llmSpan!)['traceroot.pi.force_closed'],
       true,
-      'the dangling LLM span must be force-closed by agent_end’s sweep',
+      "the dangling LLM span must be force-closed by agent_end's sweep",
     );
     assert.equal(
       attrs(toolSpan!)['traceroot.pi.force_closed'],
       true,
-      'the dangling TOOL span must be force-closed by agent_end’s sweep',
+      "the dangling TOOL span must be force-closed by agent_end's sweep",
     );
     assert.equal(
       capture.spans.find((s) => s.name === 'AgentSession.prompt'),
       undefined,
-      'the root span must still be open — agent_end only stamps it, never ends it',
+      'the root span must still be open -- agent_end only stamps it, never ends it',
     );
 
     await done;
@@ -1381,14 +1381,14 @@ describe('dangling-span sweep deduplication', () => {
       assert.equal(
         attrs(span)['traceroot.pi.force_closed'],
         true,
-        `${span.name} must be marked force_closed by dispose()’s sweep`,
+        `${span.name} must be marked force_closed by dispose()\'s sweep`,
       );
     }
   });
 
   // A second prompt() call while a previous window's root is still open (rare; isStreaming guards most
   // overlaps, but not verified to cover every path) must force-close the stale window, not leak it.
-  it('a second prompt() call while the first window’s root is still open force-closes the first root (and its dangling LLM/TOOL), then opens a fresh root for the second', async () => {
+  it("a second prompt() call while the first window's root is still open force-closes the first root (and its dangling LLM/TOOL), then opens a fresh root for the second", async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -1425,7 +1425,7 @@ describe('dangling-span sweep deduplication', () => {
     const overlapLlm = capture.spans.find(
       (s) => attrs(s)['gen_ai.request.model'] === 'overlap-llm',
     );
-    assert.ok(overlapLlm, 'the first window’s dangling LLM span must also be swept, not leaked');
+    assert.ok(overlapLlm, "the first window's dangling LLM span must also be swept, not leaked");
     assert.equal(attrs(overlapLlm!)['traceroot.pi.force_closed'], true);
     assert.notEqual(
       firstRoot!.spanContext().traceId,
@@ -1436,7 +1436,7 @@ describe('dangling-span sweep deduplication', () => {
 
   // A mid-stream steer/followUp must not be treated as an overlap: before this fix, proto.prompt couldn't
   // distinguish it from a genuine overlapping call and force-closed the still-live active root/LLM span.
-  it('a mid-stream steer (isStreaming===true, streamingBehavior set) never opens a fresh root or sweeps the active run’s still-open root — the active trace stays intact', async () => {
+  it("a mid-stream steer (isStreaming===true, streamingBehavior set) never opens a fresh root or sweeps the active run's still-open root -- the active trace stays intact", async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
@@ -1444,14 +1444,14 @@ describe('dangling-span sweep deduplication', () => {
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'active-llm' }) });
 
-    // A mid-stream steer call in this state must delegate straight through — no new root, no overlap sweep.
+    // A mid-stream steer call in this state must delegate straight through -- no new root, no overlap sweep.
     session.isStreaming = true;
     await session.prompt('steer text', { streamingBehavior: 'steer' });
 
     assert.equal(
       capture.spans.length,
       0,
-      'the mid-stream steer call must not force-close or export anything — the active run’s root ' +
+      "the mid-stream steer call must not force-close or export anything -- the active run's root " +
         'and LLM span are still genuinely open',
     );
 
@@ -1475,7 +1475,7 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(
       rootSpans.length,
       1,
-      'exactly one intact root for the whole run — the steer call never opened a second one',
+      'exactly one intact root for the whole run -- the steer call never opened a second one',
     );
     const root = rootSpans[0]!;
     assert.notEqual(
@@ -1486,7 +1486,7 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(attrs(root)['output.value'], 'steered result');
 
     const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
-    assert.ok(llmSpan, 'the active run’s LLM span must still export normally');
+    assert.ok(llmSpan, "the active run's LLM span must still export normally");
     assert.notEqual(
       attrs(llmSpan!)['traceroot.pi.force_closed'],
       true,
@@ -1499,7 +1499,7 @@ describe('dangling-span sweep deduplication', () => {
     );
   });
 
-  // Before this fix, finalize only ended the root span — a mid-run rejection left a still-open
+  // Before this fix, finalize only ended the root span -- a mid-run rejection left a still-open
   // tool/LLM span never .end()ed, silently dropped rather than exported.
   it('a prompt() call that REJECTS mid-run force-closes a still-open tool span before finalizing the root as ERROR (claude-agent-sdk.ts endInFlight parity)', async () => {
     const { capture, Session } = makeRig();
@@ -1533,7 +1533,7 @@ describe('dangling-span sweep deduplication', () => {
     assert.equal(
       attrs(toolSpan!)['traceroot.pi.force_closed'],
       true,
-      'the tool span must be force-closed by finalize’s pre-close sweep',
+      "the tool span must be force-closed by finalize's pre-close sweep",
     );
     assert.equal(
       toolSpan!.parentSpanId,
