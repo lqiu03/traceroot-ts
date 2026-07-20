@@ -10,13 +10,8 @@ import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { instrumentPiCodingAgent, type AgentEvent, type AssistantMessage } from '../src/pi';
 
 describe('span lifecycle event ordering', () => {
-  // Probes out-of-order / malformed AgentEvent sequences a buggy or aborted
-  // agent loop could plausibly produce: what happens to in-flight state
-  // (state.llmSpan, state.toolSpans, rootCtx) when a second "open" event
-  // arrives before the first closed, or an event arrives with nothing open.
-  // All must force-close the abandoned span/state instead of silently
-  // overwriting it — a span that never has .end() called on it is never
-  // exported by OTel at all.
+  // Probes out-of-order/malformed AgentEvent sequences: a span never .end()ed is never exported,
+  // so an abandoned span/state must always be force-closed, never silently overwritten.
   it('a second message_start with no intervening message_end/turn_end force-closes the abandoned first LLM span instead of silently dropping it', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -26,7 +21,6 @@ describe('span lifecycle event ordering', () => {
     );
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'first-model' }) });
-    // A second message_start fires with no message_end for the first.
     assert.doesNotThrow(() => {
       session.emit({ type: 'message_start', message: assistantMessage({ model: 'second-model' }) });
     });
@@ -65,8 +59,7 @@ describe('span lifecycle event ordering', () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
-    // Run 1 must fully settle (root opened and closed) before the stray
-    // event fires, so the root is genuinely closed when it arrives.
+    // Run 1 must fully settle before the stray event fires, so the root is genuinely closed.
     const done1 = session.prompt('run 1 finishes cleanly with no LLM turn at all');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
@@ -74,15 +67,13 @@ describe('span lifecycle event ordering', () => {
 
     assert.equal(capture.spans.length, 1, 'only run 1s root span has exported so far');
 
-    // A straggler assistant message_start arrives after run 1 settled (e.g. a
-    // late stream event); its message_end never arrives either.
+    // A straggler assistant message_start arrives after run 1 settled; its message_end never arrives.
     session.emit({
       type: 'message_start',
       message: assistantMessage({ model: 'stray-orphaned-model' }),
     });
 
-    // Run 2 must be a genuinely new prompt() call, not just another
-    // agent_start — this is the moment the orphaned span above must sweep.
+    // Run 2 must be a genuinely new prompt() call — the moment the orphaned span above must sweep.
     const done2 = session.prompt('run 2 prompt text');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
@@ -118,7 +109,6 @@ describe('span lifecycle event ordering', () => {
     const done = session.prompt('a stream error truncates turn 1 before message_end fires');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-1-model' }) });
-    // No message_end for turn 1 (stream/abort cuts it short); turn_end still fires.
     session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-2-model' }) });
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-2-model' }) });
@@ -191,8 +181,7 @@ describe('span lifecycle event ordering', () => {
       toolName: 'bash',
       args: { command: 'first' },
     });
-    // Duplicate start for the SAME toolCallId (a retried dispatch reusing the
-    // id) would otherwise silently drop the first still-open span from the Map.
+    // Duplicate start for the SAME toolCallId (a retried dispatch) would otherwise drop the first span.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'tool_execution_start',
@@ -239,8 +228,7 @@ describe('span lifecycle event ordering', () => {
     );
   });
 
-  // The wrapped prompt() call opens a root the instant it's called, so
-  // agent_end can stamp output onto it even with no agent_start ever fired.
+  // prompt() opens a root the instant it's called, so agent_end can stamp output even with no agent_start.
   it('agent_end with zero prior agent_start events still stamps the root that prompt() already opened, and does not throw', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -259,10 +247,8 @@ describe('span lifecycle event ordering', () => {
     );
   });
 
-  // Two agent_starts with no intervening agent_end and no new prompt() call
-  // is the retry/compaction continuation shape: both attempts belong to the
-  // same prompt() call and must share the same still-open root, with only
-  // the dangling LLM/TOOL spans from the abandoned first attempt swept.
+  // Two agent_starts with no intervening agent_end is the retry/compaction shape: both attempts share
+  // the same still-open root, with only the dangling LLM/TOOL spans from the abandoned attempt swept.
   it('agent_start firing twice with no intervening agent_end, and no new prompt() call between them, shares ONE root and does not leak a stale LLM context into the continuation', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -275,8 +261,7 @@ describe('span lifecycle event ordering', () => {
       type: 'message_start',
       message: assistantMessage({ model: 'attempt-1-model' }),
     });
-    // Attempt one never reaches message_end/turn_end/agent_end before the loop
-    // restarts and emits a second agent_start (no new prompt()).
+    // Attempt one never reaches message_end/turn_end/agent_end before the loop restarts.
     session.emit({ type: 'agent_start' }); // attempt two, no agent_end for attempt one in between
     session.emit({
       type: 'tool_execution_start',
@@ -336,8 +321,7 @@ describe('span lifecycle event ordering', () => {
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     await done1;
-    // Capture run 1's root id before run 2 starts, so the two roots (which
-    // otherwise carry identical attributes) can be told apart.
+    // Capture run 1's root id before run 2 starts, since the two roots otherwise carry identical attributes.
     assert.equal(capture.spans.length, 1);
     const run1RootSpanId = capture.spans[0]!.spanContext().spanId;
 
@@ -398,12 +382,8 @@ describe('span lifecycle event ordering', () => {
 
     const done2 = session.prompt('run 2 prompt text');
     session.emit({ type: 'agent_start' });
-    // A real ~30ms gap before run 2's own work. If the orphan were only swept
-    // at run 2's agent_end (the bug), its endTime would land only a fraction
-    // of a millisecond from run 2's LLM span opening — indistinguishable from
-    // jitter. Comparing against agent_start's own timestamp instead gives a
-    // real ~30ms margin. hrTime() matches the clock ReadableSpan start/end
-    // times use (unlike process.hrtime(), a different arbitrary-origin clock).
+    // A real ~30ms gap before run 2's work: if the orphan were only swept at agent_end (the bug), its
+    // endTime would be indistinguishable from jitter; hrTime() matches the clock ReadableSpan times use.
     const preGapTimestamp = hrTime();
     await new Promise((resolve) => setTimeout(resolve, 30));
     session.emit({ type: 'message_start', message: assistantMessage() });
@@ -422,10 +402,7 @@ describe('span lifecycle event ordering', () => {
     );
     const orphanClosedBeforeGapMs =
       hrTimeToMilliseconds(preGapTimestamp) - hrTimeToMilliseconds(orphanSpan!.endTime);
-    // A small tolerance for hrTime() sub-millisecond read jitter (observed
-    // flake: "closed 0.051ms after the gap started"), far below the 30ms gap
-    // this discriminates against, so the real bug (swept only at agent_end)
-    // still fails hard.
+    // Tolerance for hrTime() sub-ms read jitter, far below the 30ms gap this discriminates against.
     const CLOCK_JITTER_TOLERANCE_MS = 5;
     assert.ok(
       orphanClosedBeforeGapMs >= -CLOCK_JITTER_TOLERANCE_MS,
@@ -443,7 +420,6 @@ describe('span lifecycle event ordering', () => {
       'a stream resumes mid-message: only the end event is ever delivered',
     );
     session.emit({ type: 'agent_start' });
-    // No message_start — the close event arrives with nothing open.
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'orphan-end-model' }) });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'real-model' }) });
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'real-model' }) });
@@ -469,32 +445,22 @@ describe('span lifecycle event ordering', () => {
 });
 
 describe('span context parenting', () => {
-  // Probes OTel Context/parent-span correctness across turn boundaries: does
-  // a turn-2 LLM span inherit turn-1's cleared llmCtx, does a turn-1 tool
-  // span stay bound to turn-1's immutable parent Context after state moves
-  // to turn 2, does a tool_execution_start with no preceding message_start
-  // fall back to root instead of a stale context, does span.updateName() in
-  // closeLlmSpan change what the exporter captures, and does a stray event
-  // with no rootCtx/llmCtx at all avoid attaching to the host's ambient span.
+  // Probes OTel Context/parent-span correctness across turn boundaries and ambient-context leakage.
 
-  // Fresh class per rig — instrumentPiCodingAgent patches the prototype
-  // directly, so reuse would stack wrap layers across tests.
+  // Fresh class per rig — instrumentPiCodingAgent patches the prototype directly.
   function makeRig() {
     const capture = new CapturingExporter();
 
     class FakeAgentSession {
       sessionId = 'sess-1';
       private listeners: Array<(event: AgentEvent) => void> = [];
-      // Settles only on final agent_end (willRetry !== true); see
-      // pi-test-helpers.ts's CONTRACT.
       private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
       async prompt(_text: string, _options?: unknown): Promise<void> {
         return new Promise<void>((resolve, reject) => {
           this.pending = { resolve, reject };
         });
       }
-      // Used by the "no root open at all" tests below to attach the span
-      // listener without opening a root (unlike prompt()).
+      // Used by the "no root open at all" tests below to attach the listener without opening a root.
       async steer(_text: string): Promise<void> {}
       subscribe(listener: (event: AgentEvent) => void): () => void {
         this.listeners.push(listener);
@@ -513,8 +479,7 @@ describe('span context parenting', () => {
     }
 
     const sdk = { AgentSession: FakeAgentSession };
-    // trace.disable() first clears any prior rig's registration, keeping
-    // this file's tests isolated (see pi-test-helpers.ts's makeRig()).
+    // trace.disable() first clears any prior rig's registration, keeping this file's tests isolated.
     trace.disable();
     const provider = new NodeTracerProvider();
     provider.addSpanProcessor(new SimpleSpanProcessor(capture));
@@ -549,10 +514,7 @@ describe('span context parenting', () => {
     return span.attributes as Record<string, unknown>;
   }
 
-  // A real, synchronous ContextManager, since the default NoopContextManager
-  // makes context.with() a no-op and would make the ambient-context bug
-  // untestable. Reproduces what a host's real OTel setup (e.g.
-  // AsyncHooksContextManager) does.
+  // A real, synchronous ContextManager, since NoopContextManager makes context.with() a no-op.
   class StackContextManager implements ContextManager {
     private stack: Context[] = [ROOT_CONTEXT];
     active(): Context {
@@ -595,7 +557,6 @@ describe('span context parenting', () => {
     const done = session.prompt('do two turns');
     session.emit({ type: 'agent_start' });
 
-    // Turn 1.
     session.emit({ type: 'turn_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-1-model' }) });
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-1-model' }) });
@@ -662,8 +623,7 @@ describe('span context parenting', () => {
     const done = session.prompt('turn 1s tool call resolves late, after turn 2 already started');
     session.emit({ type: 'agent_start' });
 
-    // llmCtx is kept alive after message_end so a tool call in the grace
-    // window before turn_end still parents under turn 1's LLM span.
+    // llmCtx stays alive after message_end so a tool call in the grace window still parents under it.
     session.emit({ type: 'turn_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-1-model' }) });
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-1-model' }) });
@@ -673,11 +633,9 @@ describe('span context parenting', () => {
       toolName: 'bash',
       args: { command: 'echo turn1' },
     });
-    // turn_end clears state.llmSpan/state.llmCtx before turn 1's tool call
-    // has closed, simulating a slow-to-arrive completion event.
+    // turn_end clears state.llmSpan/llmCtx before turn 1's tool call closed (slow-to-arrive completion).
     session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
 
-    // Turn 2's own LLM span overwrites state.llmSpan/state.llmCtx entirely.
     session.emit({ type: 'turn_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-2-model' }) });
 
@@ -723,13 +681,11 @@ describe('span context parenting', () => {
     const done = session.prompt('a tool fires in the gap between two turns');
     session.emit({ type: 'agent_start' });
 
-    // Turn 1 completes fully; state.llmSpan/state.llmCtx are cleared.
     session.emit({ type: 'turn_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'turn-1-model' }) });
     session.emit({ type: 'message_end', message: assistantMessage({ model: 'turn-1-model' }) });
     session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
 
-    // A tool call fires in the gap before turn 2's message_start arrives.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'tool_execution_start',
@@ -780,13 +736,11 @@ describe('span context parenting', () => {
     const done = session.prompt('the provider renames the model between request and response');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'turn_start' });
-    // openLlmSpan names the span from message_start's `model` field.
     session.emit({
       type: 'message_start',
       message: assistantMessage({ model: 'claude-sonnet-5-preview', provider: 'anthropic' }),
     });
-    // closeLlmSpan renames it via span.updateName() using message_end's
-    // `responseModel`.
+    // closeLlmSpan renames the span via span.updateName() using message_end's `responseModel`.
     session.emit({
       type: 'message_end',
       message: assistantMessage({
@@ -802,8 +756,7 @@ describe('span context parenting', () => {
     const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
     assert.ok(llmSpan);
 
-    // SimpleSpanProcessor exports onEnd, so the final (post-updateName) name
-    // must show up, never the transient name set at startSpan() time.
+    // SimpleSpanProcessor exports onEnd, so the final (post-updateName) name must show up.
     assert.equal(
       llmSpan!.name,
       'claude-sonnet-5-20260315',
@@ -823,9 +776,7 @@ describe('span context parenting', () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
-    // steer() attaches the span listener without ever opening a root, unlike
-    // prompt() (which always opens one immediately) — the "no root at all"
-    // case this test means to probe.
+    // steer() attaches the listener without ever opening a root, unlike prompt() — the "no root" case.
     await session.steer('a stray assistant message with no prompt() ever called');
 
     const manager = new StackContextManager();
@@ -901,12 +852,8 @@ describe('span context parenting', () => {
 });
 
 describe('close-event idempotency and content safety', () => {
-  // Duplicate/late CLOSE events (the rest of the suite covers duplicate OPEN
-  // events but not stale CLOSE ones), 3+ concurrent tool calls, cross-session
-  // retry-count isolation, idempotent agent_end output stamping, and
-  // malformed message content reaching stampRootOutput/closeLlmSpan (a bug
-  // where content extraction could throw before endSpanSafe() ran, silently
-  // dropping the span instead of exporting it).
+  // Duplicate/late CLOSE events, concurrent tool calls, retry-count isolation, and malformed
+  // message content that could throw before endSpanSafe() ran, silently dropping the span.
   it('tool_execution_end firing twice for the same toolCallId exports exactly one tool span and never crashes on the second (stale) close', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -928,7 +875,6 @@ describe('close-event idempotency and content safety', () => {
       result: { ok: true },
       isError: false,
     });
-    // Second end for the same id; the Map entry is already gone.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'tool_execution_end',
@@ -988,7 +934,7 @@ describe('close-event idempotency and content safety', () => {
     });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     await done;
-    // The real end lands late, after the sweep already cleared state.toolSpans.
+    // Lands late, after the sweep already cleared state.toolSpans.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'tool_execution_end',
@@ -1066,7 +1012,6 @@ describe('close-event idempotency and content safety', () => {
     for (const s of toolSpans) {
       assert.equal(attrs(s)['traceroot.pi.force_closed'], undefined);
     }
-    // c was an error result — it must carry ERROR status; a and b must not.
     const llmSpan = capture.spans.find((s) => attrs(s)['openinference.span.kind'] === 'LLM');
     assert.ok(llmSpan);
     for (const s of toolSpans) {
@@ -1078,8 +1023,7 @@ describe('close-event idempotency and content safety', () => {
     }
   });
 
-  // Session A retrying must not bleed its retry_count into an unrelated
-  // session B's own root span.
+  // Session A retrying must not bleed its retry_count into an unrelated session B's own root span.
   it('the retry-attempt count is per-session: one session incrementing it must not make another session inherit it', async () => {
     const { capture, Session } = makeRig();
     const sessionA = new Session();
@@ -1115,9 +1059,7 @@ describe('close-event idempotency and content safety', () => {
     );
   });
 
-  // agent_end never closes the root itself — it only stamps output onto
-  // whatever root is open, so a duplicate agent_end is a harmless repeated
-  // stamp; the root closes once, when prompt()'s own promise settles.
+  // agent_end never closes the root itself, only stamps output — a duplicate is a harmless repeated stamp.
   it('agent_end firing twice for one attempt before prompt() settles stamps output idempotently', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1145,8 +1087,7 @@ describe('close-event idempotency and content safety', () => {
 
     const done = session.prompt('agent_end delivers a malformed final message');
     session.emit({ type: 'agent_start' });
-    // content is not an array, so assistantTextOf()'s `.filter(...)` throws;
-    // stampRootOutput() wraps that so it can never crash the event handler.
+    // content is not an array, so assistantTextOf()'s `.filter(...)` throws; stampRootOutput() wraps it.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'agent_end',
@@ -1173,8 +1114,7 @@ describe('close-event idempotency and content safety', () => {
     const done = session.prompt('message_end delivers a malformed assistant message');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'the-model' }) });
-    // assistantTextOf() throws inside closeLlmSpan, but is wrapped in
-    // try/catch so endSpanSafe() still runs as part of this same event.
+    // assistantTextOf() throws inside closeLlmSpan, wrapped in try/catch so endSpanSafe() still runs.
     assert.doesNotThrow(() => {
       session.emit({
         type: 'message_end',
@@ -1225,22 +1165,8 @@ describe('close-event idempotency and content safety', () => {
 });
 
 describe('dangling-span sweep deduplication', () => {
-  // Guards that the "force-close every open tool span, then LLM, then
-  // (sometimes) root" dangling-span sweep actually runs at every call site
-  // that needs it (agent_start, turn_end, agent_end, proto.prompt's overlap
-  // check, dispose()), by driving each site into a real dangling-span
-  // scenario and asserting the observable result — not a source-text regex,
-  // which broke on harmless refactors and never exercised real behavior.
-  //
-  // Sweep scope: agent_start & turn_end sweep only dangling LLM/TOOL spans
-  // (the root belongs to the whole prompt() window, spanning several
-  // attempts via retry/compaction, so it must survive a continuation).
-  // agent_end also sweeps only LLM/TOOL spans and stamps (never ends) the
-  // root. proto.prompt's overlap check and dispose() are the only two
-  // places that ever force-close a still-open root.
-  // Two agent_starts with no agent_end between them, and no new prompt()
-  // call, is the retry/compaction continuation shape: the root must stay
-  // open and become the shared parent for both attempts' spans.
+  // Guards that the dangling-span sweep runs at every call site (agent_start, turn_end, agent_end,
+  // proto.prompt's overlap check, dispose()) via real scenarios, not a source-text regex.
   it('agent_start sweeps a dangling LLM + TOOL span from a crashed prior ATTEMPT, but leaves the still-open root untouched', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1329,8 +1255,7 @@ describe('dangling-span sweep deduplication', () => {
     await done;
   });
 
-  // turn_end must also CLEAR the tool span from state.toolSpans, so
-  // agent_end's own defensive sweep does not double-export the same span.
+  // turn_end must also CLEAR the tool span from state.toolSpans, so agent_end doesn't double-export it.
   it('turn_end force-closes any tool spans still open at the end of the turn, and clears them so agent_end does not force-close them a second time', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1385,9 +1310,8 @@ describe('dangling-span sweep deduplication', () => {
       args: { path: '/tmp/end' },
     });
 
-    // The LLM + TOOL spans never see their own close: agent_end's defensive
-    // sweep force-closes those two, then stamps output onto the root without
-    // ending it.
+    // The LLM + TOOL spans never see their own close: agent_end's sweep force-closes both, then stamps
+    // output onto the root without ending it.
     session.emit({
       type: 'agent_end',
       messages: [assistantMessage({ content: [{ type: 'text', text: 'stamped output' }] })],
@@ -1462,10 +1386,8 @@ describe('dangling-span sweep deduplication', () => {
     }
   });
 
-  // A second prompt() call arriving while a previous window's root is still
-  // open (rare; the SDK's isStreaming guard throws for most overlaps, but
-  // not verified to cover every path) must force-close the stale window
-  // instead of silently overwriting state.rootSpan and leaking it forever.
+  // A second prompt() call while a previous window's root is still open (rare; isStreaming guards most
+  // overlaps, but not verified to cover every path) must force-close the stale window, not leak it.
   it('a second prompt() call while the first window’s root is still open force-closes the first root (and its dangling LLM/TOOL), then opens a fresh root for the second', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1479,8 +1401,7 @@ describe('dangling-span sweep deduplication', () => {
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     await done2;
-    // done1 never settles on its own (its agent_end never fired); only the
-    // sweep's effect on spans matters here, so it's left unawaited.
+    // done1 never settles on its own; only the sweep's effect on spans matters here.
     void done1;
 
     const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
@@ -1513,11 +1434,8 @@ describe('dangling-span sweep deduplication', () => {
     );
   });
 
-  // A mid-stream steer/followUp call must not be treated as an overlap. When
-  // isStreaming is true and the caller passes streamingBehavior, prompt()
-  // queues into the active run and returns early. Before this fix,
-  // proto.prompt couldn't distinguish that from a genuine overlapping
-  // prompt() call, so it force-closed the still-live active root/LLM span.
+  // A mid-stream steer/followUp must not be treated as an overlap: before this fix, proto.prompt couldn't
+  // distinguish it from a genuine overlapping call and force-closed the still-live active root/LLM span.
   it('a mid-stream steer (isStreaming===true, streamingBehavior set) never opens a fresh root or sweeps the active run’s still-open root — the active trace stays intact', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -1526,8 +1444,7 @@ describe('dangling-span sweep deduplication', () => {
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'active-llm' }) });
 
-    // A mid-stream steer call in this state must delegate straight through —
-    // no new root, no overlap sweep.
+    // A mid-stream steer call in this state must delegate straight through — no new root, no overlap sweep.
     session.isStreaming = true;
     await session.prompt('steer text', { streamingBehavior: 'steer' });
 
@@ -1582,10 +1499,8 @@ describe('dangling-span sweep deduplication', () => {
     );
   });
 
-  // Before this fix, finalize (the settle path that ends the root on
-  // resolve/reject) only ended the root span — a mid-run rejection with a
-  // tool/LLM span still open left that span never .end()ed, so it was
-  // silently dropped rather than exported.
+  // Before this fix, finalize only ended the root span — a mid-run rejection left a still-open
+  // tool/LLM span never .end()ed, silently dropped rather than exported.
   it('a prompt() call that REJECTS mid-run force-closes a still-open tool span before finalizing the root as ERROR (claude-agent-sdk.ts endInFlight parity)', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();

@@ -16,8 +16,7 @@ import {
 import { assistantMessage as baseAssistantMessage } from './pi-test-helpers';
 
 describe('instrumentation', () => {
-  // Overrides the shared helper's placeholder usage with realistic values,
-  // since this file asserts on specific usage/cost numbers below.
+  // Overrides the shared helper's placeholder usage since this file asserts on specific numbers.
   function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
     return baseAssistantMessage({
       usage: {
@@ -82,12 +81,10 @@ describe('instrumentation', () => {
     assert.equal(rootSpan.name, 'AgentSession.prompt');
     assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
     assert.equal(attrs(rootSpan)['session.id'], 'sess-1');
-    // traceroot.sdk.name is owned by core's TraceRootSpanProcessor, which
-    // this rig doesn't wire, so it's absent here.
+    // traceroot.sdk.name is owned by TraceRootSpanProcessor, which this rig doesn't wire.
     assert.equal(attrs(rootSpan)['traceroot.sdk.name'], undefined);
     assert.equal(attrs(rootSpan)['input.value'], 'list files in /tmp');
     assert.equal(attrs(rootSpan)['output.value'], 'listed the files');
-    // Stamped once when prompt() settles; no retry happened here, so 0.
     assert.equal(attrs(rootSpan)['traceroot.pi.retry_count'], 0);
 
     assert.equal(attrs(llmSpan)['openinference.span.kind'], 'LLM');
@@ -263,9 +260,7 @@ describe('instrumentation', () => {
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage() });
     session.emit({ type: 'message_end', message: assistantMessage() });
-    // A path arg (not a bash command) so the name always reduces to its
-    // basename — bash commands appear verbatim in the span name by design,
-    // which is unrelated to what captureToolIo gates here.
+    // A path arg, not a bash command, so the name reduces to its basename.
     session.emit({
       type: 'tool_execution_start',
       toolCallId: 't1',
@@ -304,8 +299,7 @@ describe('instrumentation', () => {
     ): Promise<{ hasKey: boolean; value: unknown }> {
       const { capture, Session } = makeRig({ captureContent });
       const session = new Session();
-      // Non-string bypasses the `typeof text === 'string'` guard, simulating
-      // a caller whose prompt text is genuinely absent.
+      // Non-string bypasses the `typeof text === 'string'` guard (prompt text genuinely absent).
       const done = session.prompt(promptText as unknown as string);
       session.emit({ type: 'agent_start' });
       session.emit({ type: 'agent_end', messages: [], willRetry: false });
@@ -342,10 +336,6 @@ describe('instrumentation', () => {
     assert.equal(trueUndefined.value, undefined);
   });
 
-  // An early-return prompt() call (handled "/command", queue-only
-  // steer/followUp) resolves without reaching pi's run loop, so no
-  // agent_start/agent_end follows. The wrapped prompt() must still open a
-  // root on entry and finalize it OK on settle.
   it('an early-return prompt() call (resolved with no agent_start/agent_end) exports exactly one childless, OK-status AGENT root span', async () => {
     const { capture, Session } = makeRig();
     const session = new Session();
@@ -377,13 +367,9 @@ describe('instrumentation', () => {
 });
 
 describe('wiring', () => {
-  // Wiring-only coverage for instrumentModules.piCodingAgent: proves the
-  // unwrap/dispatch/warn-don't-throw path is correct. Deep span behavior is
-  // covered elsewhere in this file and in the `integration` suite below.
+  // Wiring-only coverage for instrumentModules.piCodingAgent; deep span behavior is covered elsewhere.
 
-  // A fake AgentSession exposing prompt/subscribe/dispose on its prototype —
-  // the structural surface instrumentPiCodingAgent() patches. Fresh per
-  // call, since the wrap-once guard is stamped on the prototype itself.
+  // Fresh per call, since the wrap-once guard is stamped on the prototype itself.
   function makePiModule() {
     class FakeAgentSession {
       sessionId = 'wiring-test-sess';
@@ -471,8 +457,7 @@ describe('wiring', () => {
     });
 
     it('warns but leaves isInitialized() true for a misshapen module (pi warns, does not throw)', () => {
-      // No prompt/subscribe on the prototype; instrumentPiCodingAgent() warns
-      // rather than throwing (unlike wireClaudeAgentSDKInstrumentation()).
+      // No prompt/subscribe on the prototype; warns rather than throwing (unlike claude-agent-sdk's wiring).
       const misshapen = { AgentSession: class {} };
 
       const warnings: string[] = [];
@@ -528,14 +513,7 @@ describe('wiring', () => {
 });
 
 describe('integration', () => {
-  // Real cross-package integration: drives the actual in-tree pi
-  // instrumentation through a real TraceRoot.initialize() call, with no
-  // mocked pi export, proving pi's spans land in TraceRoot's own pipeline
-  // with TraceRootSpanProcessor enrichment applied. Every other test in this
-  // file mocks one side or the other; this one mocks neither.
-
-  // Structural surface instrumentPiCodingAgent() patches, passed straight
-  // into instrumentModules.piCodingAgent.
+  // Drives the real pi instrumentation through TraceRoot.initialize() with no mocked pi export.
   interface FakeAgentEvent {
     type: string;
     [key: string]: unknown;
@@ -544,8 +522,7 @@ describe('integration', () => {
     class FakeAgentSession {
       sessionId = 'integration-sess';
       private listeners: Array<(event: FakeAgentEvent) => void> = [];
-      // Settles only on final agent_end (willRetry !== true); see
-      // pi-test-helpers.ts's CONTRACT.
+      // Settles only on final agent_end (willRetry !== true); see pi-test-helpers.ts's CONTRACT.
       private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
       async prompt(_text: string): Promise<void> {
         return new Promise<void>((resolve, reject) => {
@@ -594,8 +571,7 @@ describe('integration', () => {
     };
   }
 
-  // Reaches the provider TraceRoot.initialize() registered as the OTel
-  // global delegate and adds an exporter so we can observe what it exports.
+  // Reaches the provider TraceRoot.initialize() registered as the OTel global delegate.
   function attachInMemoryExporterToGlobalProvider(): InMemorySpanExporter {
     const proxy = trace.getTracerProvider() as { getDelegate?: () => unknown };
     const delegate = (typeof proxy.getDelegate === 'function' ? proxy.getDelegate() : proxy) as {
@@ -661,12 +637,9 @@ describe('integration', () => {
     assert.equal(attrOf(rootSpan!)['session.id'], 'integration-sess');
     assert.equal(attrOf(rootSpan!)['input.value'], 'summarize the repository');
     assert.equal(attrOf(rootSpan!)['output.value'], 'the repository has three packages');
-    // traceroot.sdk.name is owned by core's TraceRootSpanProcessor.onStart,
-    // uniformly across every span, hence 'traceroot-ts' here.
+    // traceroot.sdk.name is owned by TraceRootSpanProcessor.onStart, uniformly across every span.
     assert.equal(attrOf(rootSpan!)['traceroot.sdk.name'], 'traceroot-ts');
 
-    // Proves the spans travelled through TraceRoot's own pipeline (enriched
-    // by TraceRootSpanProcessor), not a private pi pipeline.
     assert.equal(attrOf(rootSpan!)['deployment.environment'], 'integration-test');
     assert.equal(attrOf(rootSpan!)['traceroot.git.repo'], 'traceroot-ai/traceroot-ts');
     assert.equal(attrOf(rootSpan!)['traceroot.git.ref'], 'integration-ref');
@@ -691,12 +664,9 @@ describe('integration', () => {
 });
 
 describe('session dispose', () => {
-  // dispose() clears every listener registered via subscribe() — including
-  // instrumentPiCodingAgent()'s own — by reassigning the session's internal
-  // listener array to a fresh empty one, mirroring the real SDK's mechanism.
+  // dispose() clears every listener via subscribe(), reassigning the internal array to a fresh empty one.
 
-  // Local instrumentPiCodingAgent() calls (not makeRig()) so tests can drive
-  // session.dispose() directly on the raw session.
+  // Local instrumentPiCodingAgent() calls (not makeRig()) so tests can drive dispose() on the raw session.
   function registerCapturingProvider(capture: CapturingExporter): void {
     trace.disable();
     const provider = new NodeTracerProvider();
@@ -723,9 +693,7 @@ describe('session dispose', () => {
     }, 'dispose() must be safe to call even though instrumentPiCodingAgent() never captured or called the subscribe() unsubscribe function itself');
     assert.equal(session.disposed, true);
 
-    // instrumentPiCodingAgent() relies entirely on dispose() clearing the
-    // SDK's own listener array, not its own hook — so events after dispose()
-    // must produce no further spans.
+    // instrumentPiCodingAgent() relies on dispose() clearing the SDK's own listener array, not its own hook.
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
     assert.equal(
@@ -758,8 +726,7 @@ describe('session dispose', () => {
     instrumentPiCodingAgent(sdk, {});
     const session = new Session();
 
-    // Open AGENT/LLM/TOOL spans and never fire agent_end — the "host
-    // disposes mid-run" scenario. Not awaited: this run is abandoned mid-flight.
+    // "Host disposes mid-run": open spans, never fire agent_end. Not awaited: abandoned mid-flight.
     session.prompt('long-running task');
     session.emit({ type: 'agent_start' });
     session.emit({
@@ -826,10 +793,8 @@ describe('session dispose', () => {
     );
   });
 
-  // Guards a real bug: instrumentPiCodingAgent()'s `subscribedSessions`
-  // WeakSet used to permanently remember a session as "already subscribed"
-  // and never re-attach its span listener after dispose(), so every run
-  // after the first dispose() silently produced zero spans.
+  // Guards a real bug: subscribedSessions used to permanently remember a session as subscribed
+  // and never re-attach its listener after dispose(), so every run after the first dispose() produced zero spans.
   it('a session reused after dispose() re-subscribes and resumes tracing on its next prompt()', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -860,9 +825,8 @@ describe('session dispose', () => {
     );
   });
 
-  // closeDanglingSpan() guards its setAttribute(FORCE_CLOSED) call in a
-  // try/catch (warn-and-continue) so a throwing setAttribute() never
-  // prevents that span's own end() — nor the rest of dispose()'s sweep.
+  // closeDanglingSpan() guards its setAttribute(FORCE_CLOSED) call in a try/catch (warn-and-continue)
+  // so a throwing setAttribute() never prevents that span's own end() or the rest of dispose()'s sweep.
   it('dispose() force-closes the OTHER open spans even when one span throws while being force-closed', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -902,8 +866,7 @@ describe('session dispose', () => {
       'no span should export before dispose() while still open',
     );
 
-    // Poison call-2 (by its gen_ai.tool.call.id, not call order): throw the
-    // first time dispose()'s sweep tries to mark it force_closed.
+    // Poison call-2 (by tool.call.id, not call order): throw on its first force_closed mark.
     type SetAttributeFn = typeof Span.prototype.setAttribute;
     const originalSetAttribute: SetAttributeFn = Span.prototype.setAttribute;
     Span.prototype.setAttribute = function (
@@ -974,12 +937,8 @@ describe('session dispose', () => {
     );
   });
 
-  // Guards a reentrancy race: a host listener registered before pi's own
-  // (i.e. before the first prompt()) that calls session.dispose()
-  // synchronously on agent_end force-closes the root before pi's own
-  // agent_end handler runs for that same event. Pi must detect its root was
-  // force-closed out from under it rather than silently producing an
-  // incomplete trace.
+  // Guards a reentrancy race: a host listener registered before pi's own that calls dispose()
+  // synchronously on agent_end force-closes the root before pi's own agent_end handler runs.
   it('agent_end after a reentrant dispose() force-closed the root still exports it exactly once', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -988,8 +947,7 @@ describe('session dispose', () => {
     instrumentPiCodingAgent(sdk, {});
     const session = new Session();
 
-    // Registered before pi's own subscribe() (on the first prompt() below),
-    // so it sits ahead of pi's handler in dispatch order.
+    // Registered before pi's own subscribe() (below), so it sits ahead of pi's handler.
     session.subscribe((event: AgentEvent) => {
       if (event.type === 'agent_end') session.dispose();
     });
@@ -1024,16 +982,9 @@ describe('session dispose', () => {
 });
 
 describe('steer / followUp', () => {
-  // instrumentPiCodingAgent() must patch .steer and .followUp too, not just
-  // .prompt — they are standalone entry points a host can call without ever
-  // calling prompt() first. Before this fix, a host whose first interaction
-  // was steer()/followUp() got zero tracing for the session's entire
-  // lifetime, since subscribe() was never called.
-  //
-  // Deliberately not asserting that steer()/followUp() text becomes the root
-  // span's input.value: they only enqueue into an internal queue and never
-  // themselves trigger a run, so attributing their text to prompt()'s FIFO
-  // would misattribute it to whatever later run's agent_start fires next.
+  // Must patch .steer/.followUp too, not just .prompt: real bug was a host whose first interaction
+  // was steer()/followUp() got zero tracing. Their text is deliberately never asserted onto the root's
+  // input.value: they only enqueue, never trigger a run, so attributing it would misattribute to a later run.
 
   function registerCapturingProvider(capture: CapturingExporter): void {
     trace.disable();
@@ -1042,9 +993,7 @@ describe('steer / followUp', () => {
     provider.register();
   }
 
-  // Extends the shared FakeAgentSession with steer()/followUp(), which the
-  // base fixture omits. Fresh per call, like makeFakeSessionClass, so
-  // prototype patches never stack across tests.
+  // Extends the shared FakeAgentSession with steer()/followUp(). Fresh per call so patches don't stack.
   function makeSteerAndFollowUpSessionClass() {
     const Base = makeFakeSessionClass();
     return class SteerAndFollowUpAgentSession extends Base {
@@ -1053,10 +1002,8 @@ describe('steer / followUp', () => {
     };
   }
 
-  // Only the wrapped prompt() call opens a root span; steer()/followUp()
-  // never do. A run whose only interaction is steer() therefore produces no
-  // root span — this proves the listener is attached (not zero-tracing) by
-  // checking that its tool span still exports, as a parentless mini-trace.
+  // Only prompt() opens a root span; a steer()-only run produces none, so this checks its tool span
+  // still exports (as a parentless mini-trace) to prove the listener is attached, not zero-tracing.
   it('calling steer() as the FIRST interaction (no prior prompt() call) still attaches tracing — its run is ROOTLESS (bypasses prompt()), but its child spans still export', async () => {
     const capture = new CapturingExporter();
     const Session = makeSteerAndFollowUpSessionClass();
@@ -1147,8 +1094,6 @@ describe('steer / followUp', () => {
     instrumentPiCodingAgent(sdk, {});
     const session = new Session();
 
-    // steer()/followUp() must reuse the same listener prompt() already
-    // attached, not subscribe again.
     const done = session.prompt('start the run');
     await session.steer('steer mid-run');
     await session.followUp('follow up after');
