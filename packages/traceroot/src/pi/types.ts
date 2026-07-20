@@ -4,9 +4,9 @@
  *
  * Deliberately NOT imported from the real packages, matching the convention
  * in claude-agent-sdk.ts (hand-rolls a structural ClaudeAgentSDKModule type
- * rather than depending on @anthropic-ai/claude-agent-sdk). Keeps this
- * package free of any dependency — even a type-only devDependency — on Pi's
- * own package, and easy to re-verify against a new Pi version by hand.
+ * rather than depending on @anthropic-ai/claude-agent-sdk). This source file
+ * imports nothing from Pi's own packages, so the shapes below are easy to
+ * re-verify against a new Pi version by hand.
  *
  * Every field here was confirmed against the real published .d.ts for
  * @earendil-works/pi-coding-agent@0.80.6, @earendil-works/pi-agent-core@0.80.6,
@@ -93,10 +93,6 @@ export type AgentMessage = AssistantMessage | UserMessage | ToolResultMessage | 
 export type AgentEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; messages: AgentMessage[]; willRetry?: boolean }
-  // The one session-level exception in this mirror: its former consumer (the
-  // removed prompt-queue's willRetry reservation) no longer exists, so this
-  // member is now dead — a candidate for removal from the type surface.
-  | { type: 'auto_retry_end'; success: boolean; attempt?: number; finalError?: string }
   | { type: 'turn_start' }
   | { type: 'turn_end'; message: AgentMessage; toolResults: ToolResultMessage[] }
   | { type: 'message_start'; message: AgentMessage }
@@ -119,11 +115,8 @@ export type AgentEvent =
     };
 
 export interface PromptOptions {
-  expandPromptTemplates?: boolean;
   images?: unknown[];
   streamingBehavior?: 'steer' | 'followUp';
-  source?: unknown;
-  preflightResult?: (success: boolean) => void;
 }
 
 export interface AgentSessionInstance {
@@ -141,32 +134,6 @@ export interface AgentSessionInstance {
    */
   readonly isStreaming?: boolean;
   prompt(text: string, options?: PromptOptions): Promise<void>;
-  /**
-   * Whether any extension has registered a handler for the given event type
-   * (e.g. `'input'`). Confirmed public on @earendil-works/pi-coding-agent@0.80.6
-   * (dist/core/agent-session.d.ts:618) — mirrors the exact
-   * `this._extensionRunner.hasHandlers("input")` check prompt() itself makes
-   * before dispatching to an 'input' hook. Optional here, like
-   * steer()/followUp()/dispose(), so a minimal/partial double never disables
-   * prompt instrumentation over a missing method. instrumentation.ts's
-   * proto.prompt wrapper uses this as a best-effort signal (NOT a precise
-   * one) that a call might be fully intercepted by an 'input' hook and never
-   * reach agent_start.
-   */
-  hasExtensionHandlers?(eventType: string): boolean;
-  /**
-   * The session's extension runner, exposing `getCommand(name)` — confirmed
-   * public on @earendil-works/pi-coding-agent@0.80.6
-   * (dist/core/agent-session.d.ts:622; dist/core/extensions/runner.d.ts:128).
-   * Only the one method this package actually calls is declared here — see
-   * this file's header comment on why the full real SDK type isn't imported.
-   * instrumentation.ts's proto.prompt wrapper uses this to deterministically
-   * detect a leading "/" prompt that a registered extension command will
-   * fully handle, so it never reaches agent_start.
-   */
-  readonly extensionRunner?: {
-    getCommand?(name: string): unknown;
-  };
   /**
    * Queue a steering message while the agent is running — delivered after
    * the current assistant turn finishes its tool calls, before the next LLM

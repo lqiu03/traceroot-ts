@@ -1147,38 +1147,20 @@ describe('tracer reresolution', () => {
 describe('real SDK shape smoke', () => {
   /**
    * Lens: the private @earendil-works/pi-coding-agent internals that
-   * src/instrumentation.ts and src/types.ts document by hand.
+   * src/instrumentation.ts and src/pi/types.ts document by hand.
    *
    * Those files cite specific fields and methods of the real, installed SDK --
-   * the private `_eventListeners` listener array and the standalone
-   * steer()/followUp()/dispose() entry points -- all read straight out of the
-   * installed source, none of them part of a stable public contract. The peer
-   * range (>=0.79.0 <1) permits a patch bump that could silently rename or drop
-   * any of them, invalidating those comments (and the behavior that depends on
-   * them) with zero failures anywhere else in the suite, because every other
-   * test mocks a hand-rolled FakeAgentSession.
+   * the private `_eventListeners` listener array, the `isStreaming` getter,
+   * and the standalone steer()/followUp()/dispose() entry points -- all read
+   * straight out of the installed source, none of them part of a stable
+   * public contract. This test verifies those hand-mirrored shapes against
+   * the actual installed `@earendil-works/pi-coding-agent@0.80.x`
+   * devDependency, so a version bump that renames or drops any of them fails
+   * loudly here instead of silently shipping broken instrumentation.
    *
-   * The `extensionRunner` getter, `hasExtensionHandlers()`, and
-   * ExtensionRunner's `getCommand()` were previously verified here too --
-   * proto.prompt's now-deleted prompt-queue "should this call skip the FIFO"
-   * heuristic (shouldSkipQueue, prompt-queue.ts) was the only reader of any of
-   * them. Now that the root span is anchored on prompt()'s own promise window
-   * instead of a per-session input-attribution queue (see instrumentation.ts's
-   * module header), instrumentation.ts no longer reads any of those three, so
-   * asserting their shape here no longer protects anything this package
-   * depends on.
-   *
-   * `isStreaming` is the one exception: proto.prompt's isQueueOnlySteer check
-   * (see instrumentation.ts) reads it live on every prompt() call to detect a
-   * mid-stream queue-only steer/followUp and skip root management for it, so
-   * its shape is asserted below just like prompt/subscribe/steer/followUp/
-   * dispose.
-   *
-   * This is the ONLY test that imports the REAL package, so a future SDK bump
-   * that changes any of these shapes fails loudly here instead of silently
-   * shipping broken instrumentation. It asserts shape only -- it never
-   * constructs a live AgentSession (the real constructor needs a full
-   * agent/session/settings runtime) or performs any agent work.
+   * It asserts shape only -- it never constructs a live AgentSession (the
+   * real constructor needs a full agent/session/settings runtime) or
+   * performs any agent work.
    */
 
   // @earendil-works/pi-coding-agent is ESM-only (its package.json exports only an
