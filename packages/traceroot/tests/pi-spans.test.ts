@@ -62,13 +62,11 @@ describe('span name', () => {
   });
 
   it('describeToolCallSpan does not split a surrogate pair at the truncation boundary', () => {
-    // 59 ASCII chars + an emoji (a surrogate pair) puts the pair astride the 60-char cut.
+    // 59 ASCII chars + an emoji (surrogate pair) puts the pair astride the 60-char cut.
     const name = describeToolCallSpan('bash', { command: 'x'.repeat(59) + '\u{1F600}tail' });
     assert.ok(name.startsWith('bash: '));
     assert.ok(name.endsWith('…'));
     const body = name.slice('bash: '.length, -1);
-    // A lone high surrogate at the end would be invalid UTF-16; confirm the
-    // last code unit is not an unpaired high surrogate.
     const lastCode = body.charCodeAt(body.length - 1);
     assert.ok(lastCode < 0xd800 || lastCode > 0xdbff);
   });
@@ -78,13 +76,11 @@ describe('span name', () => {
     assert.equal(describeToolCallSpan('read', { path: null }), 'read');
   });
 
+  // basename() only strips separators; a string with none passes through
+  // unchanged. Unlike the bash branch, the path branch had no cap, so an
+  // untrusted "path" argument with no separators could inflate the span
+  // name without bound.
   it('describeToolCallSpan bounds a path-like arg with no separators the same way it bounds a bash command', () => {
-    // basename() only strips separators — a string with none at all (or whose
-    // final segment is huge) passes through completely unchanged. Unlike the
-    // bash branch (explicitly capped at MAX_NAME_SEGMENT_CHARS via truncateWithEllipsis
-    // — see the file header's stated privacy/size-bound rationale), the path
-    // branch had no equivalent cap: an untrusted/hallucinated "path" argument
-    // with no "/" or "\\" could inflate the span NAME itself without bound.
     const hugeNoSeparators = 'x'.repeat(5000);
     const name = describeToolCallSpan('read', { path: hugeNoSeparators });
     assert.ok(
@@ -99,9 +95,6 @@ describe('span name', () => {
   });
 
   it('describeToolCallSpan truncates an over-long basename without splitting a surrogate pair at the boundary', () => {
-    // Mirrors the equivalent bash surrogate-pair test above, but for the path
-    // branch: a filename component with no separators, long enough to force
-    // truncation, with a surrogate pair astride the cut boundary.
     const name = describeToolCallSpan('read', { path: 'x'.repeat(59) + '\u{1F600}tail' });
     assert.ok(name.startsWith('read: '));
     assert.ok(name.endsWith('…'));
@@ -110,24 +103,15 @@ describe('span name', () => {
     assert.ok(lastCode < 0xd800 || lastCode > 0xdbff);
   });
 
+  // Unlike args.path === '' (skipped as falsy before reaching basename),
+  // these values are non-empty and truthy but win32.basename() strips them
+  // to nothing (entirely separators or a bare drive letter).
   it('describeToolCallSpan falls back to the bare tool name when a non-empty path-like arg has NO basename component at all (win32.basename reduces a root/drive-only reference to "")', () => {
-    // Unlike the args.path === '' case (already covered above, where
-    // firstPathArgument itself skips the falsy candidate), these path values
-    // are genuinely non-empty and truthy — firstPathArgument happily returns
-    // them — but win32.basename() strips them down to nothing because they are
-    // ENTIRELY separators (or a bare drive letter) with no filename component
-    // to keep. A perfectly ordinary, non-adversarial tool call reading or
-    // listing a root directory (`{ path: '/' }`) must not produce a dangling
-    // "toolName: " with nothing after the colon — the exact pattern the
-    // args.path === '' test above already asserts must never happen.
     assert.equal(describeToolCallSpan('list_dir', { path: '/' }), 'list_dir');
     assert.equal(describeToolCallSpan('read', { path: '\\' }), 'read');
     assert.equal(describeToolCallSpan('read', { path: '///' }), 'read');
     assert.equal(describeToolCallSpan('read', { path: 'C:\\' }), 'read');
     assert.equal(describeToolCallSpan('read', { path: 'C:/' }), 'read');
-    // A bash tool call whose ONLY path-like arg reduces to nothing must still
-    // fall through to the bash-command branch rather than emitting a dangling
-    // "bash: " and ignoring a perfectly good command right next to it.
     assert.equal(
       describeToolCallSpan('bash', { path: '/', command: 'ls -la' }),
       'bash: ls -la',
@@ -136,46 +120,33 @@ describe('span name', () => {
   });
 
   it('describeToolCallSpan resolves multiple simultaneous path-like keys by TOOL_PATH_ARGUMENT_KEYS order, not object insertion order, and skips an empty-string candidate', () => {
-    // 'target' is inserted first in the object literal but 'path' outranks it
-    // in TOOL_PATH_ARGUMENT_KEYS — the winner must be decided by the fixed key
-    // list, not by whichever property happens to appear first in the object.
+    // 'target' is inserted first but 'path' outranks it in TOOL_PATH_ARGUMENT_KEYS.
     assert.equal(
       describeToolCallSpan('grep', { target: '/z.txt', path: '/x.txt', filename: 'y.txt' }),
       'grep: x.txt',
       'path outranks target and filename regardless of property insertion order',
     );
-    // With 'path' absent, 'file' (earlier in the key list) must beat 'filePath'.
     assert.equal(
       describeToolCallSpan('grep', { filePath: '/should-lose.txt', file: '/x.txt' }),
       'grep: x.txt',
     );
-    // An empty string at the highest-priority key ('path') is falsy and must be
-    // skipped in favor of the next candidate, not treated as "no path found"
-    // for the whole args object.
     assert.equal(
       describeToolCallSpan('read', { path: '', file: 'notes.md' }),
       'read: notes.md',
       'an empty-string path must fall through to the next path-like key, not win by being present',
     );
-    // If every path-like key is empty/absent, fall back to the bare tool name
-    // (no dangling "toolName: " with nothing after the colon).
     assert.equal(describeToolCallSpan('read', { path: '' }), 'read');
   });
 
+  // Arrays are typeof 'object' in JS, so they pass the `typeof === 'object'`
+  // guard, but TOOL_PATH_ARGUMENT_KEYS are named string keys an array never
+  // has as own properties — must degrade to the bare tool name.
   it('describeToolCallSpan never leaks positional array elements as a path and safely falls back to the bare tool name', () => {
-    // Arrays are typeof 'object' in JS, so they pass describeToolCallSpan's
-    // `args && typeof args === 'object'` guard. TOOL_PATH_ARGUMENT_KEYS are all
-    // named string keys ('path', 'file', ...), which a plain array never has as
-    // own properties, so this must degrade to the bare tool name rather than
-    // reading array indices or throwing.
     assert.equal(
       describeToolCallSpan('read', ['/etc/passwd', 'ignored']),
       'read',
       'an array must never be scanned for a path-like value by index',
     );
-    // The bash-specific branch reads args.command; an array has no .command
-    // own property either, so this must also degrade safely instead of
-    // crashing or stringifying the array into the span name.
     assert.equal(describeToolCallSpan('bash', ['ls', '-la']), 'bash');
     assert.equal(describeToolCallSpan('bash', []), 'bash');
   });
@@ -191,30 +162,20 @@ describe('span name', () => {
       'edit: project',
       'trailing backslash must not defeat basename reduction (Windows-style)',
     );
-    // Nested directory path with no filename component at all.
     assert.equal(describeToolCallSpan('list', { target: '/var/log/app/' }), 'list: app');
   });
 
   it("describeToolCallSpan passes unusual characters in toolName itself through unchanged (toolName is Pi's own identifier, not user-controlled args)", () => {
-    // MCP-style namespaced tool identifiers use double underscores and must
-    // survive untouched when no path/command arg triggers reduction.
     assert.equal(
       describeToolCallSpan('mcp__filesystem__read_file', {}),
       'mcp__filesystem__read_file',
     );
-    // A toolName containing a newline is not sanitized by describeToolCallSpan
-    // (only args are privacy-reduced) — confirm this doesn't crash and the
-    // path reduction still applies on top of it.
+    // toolName is not sanitized (only args are privacy-reduced).
     assert.equal(describeToolCallSpan('weird\ntool', { path: '/a/b/c.txt' }), 'weird\ntool: c.txt');
     assert.equal(describeToolCallSpan('', { path: '/a/b/c.txt' }), ': c.txt');
   });
 
   it('describeToolCallSpan passes non-ASCII BMP unicode in a bash command well under the 60-char limit through unmangled', () => {
-    // Chinese, Cyrillic, and accented Latin characters are all single UTF-16
-    // code units (unlike the emoji surrogate-pair case covered above), and the
-    // whole collapsed command is far below MAX_NAME_SEGMENT_CHARS, so no truncation
-    // should occur at all — the assertion is that whitespace-collapse does not
-    // corrupt or drop any multi-byte chars.
     const command = 'echo   café   北京   Москва  ';
     const collapsed = 'echo café 北京 Москва';
     assert.ok(collapsed.length < 60, 'sanity check: well under the truncation limit');
@@ -223,15 +184,12 @@ describe('span name', () => {
     assert.ok(!name.endsWith('…'), 'must not be truncated when comfortably under the limit');
   });
 
+  // A truthy-but-blank command ('   ') collapses to '' after whitespace
+  // normalization; the inner `if (cmd)` guard must fall through rather than
+  // returning 'bash: ' with nothing after the colon.
   it('describeToolCallSpan treats a whitespace-only bash command as absent — falls back to a path arg or the bare tool name, never emitting a dangling "bash: "', () => {
-    // A truthy-but-blank command ('   ') survives the `typeof === "string" &&
-    // a.command` truthiness check, but collapses to '' after the whitespace
-    // normalization — the inner `if (cmd)` guard must then fall through rather
-    // than returning 'bash: ' with nothing after the colon.
     assert.equal(describeToolCallSpan('bash', { command: '   ' }), 'bash');
     assert.equal(describeToolCallSpan('bash', { command: ' \t\n ' }), 'bash');
-    // With a path-like arg riding along, the fall-through continues into the
-    // path branch instead of stopping at the bare name.
     assert.equal(
       describeToolCallSpan('bash', { command: '   ', path: '/a/b/c.txt' }),
       'bash: c.txt',
@@ -240,27 +198,14 @@ describe('span name', () => {
 });
 
 describe('spans and config boundary coverage', () => {
-  /**
-   * Direct unit coverage of spans.ts's LLM/tool/dangling span helpers
-   * (usage-token mapping incl. zero values, error/aborted status, updateName,
-   * captureContent gating), circular-ref handling through openToolSpan —
-   * surfaces the rest of the suite leaves thin — and the canonical
-   * sliceSurrogateSafe unit tests (boundary edges, the maxLen<=0 and
-   * negative-maxLen guards), which live in this file since sliceSurrogateSafe
-   * itself now lives in spans.ts.
-   *
-   * Two subjects from the original packages/pi version of this file are
-   * deliberately NOT carried over: baseUrl whitespace normalization (config.ts
-   * no longer has a baseUrl field — see packages/traceroot/src/pi.ts)
-   * and provider forceFlush idempotency (this in-tree integration never builds
-   * or owns its own TracerProvider — see instrumentation.ts's
-   * createReresolvingTracer — so there is no createTracing()/forceFlush() of
-   * its own left to test).
-   */
+  // Direct unit coverage of pi.ts's LLM/tool/dangling span helpers
+  // (usage-token mapping incl. zero values, error/aborted status,
+  // updateName, captureContent gating), circular-ref handling through
+  // openToolSpan, and the canonical sliceSurrogateSafe unit tests (boundary
+  // edges, the maxLen<=0 and negative-maxLen guards).
 
-  // Direct-span rig, mirroring close-root-span-backward-scan.test.ts: a real
-  // NodeTracerProvider + SimpleSpanProcessor is the most direct way to unit-test
-  // the spans.ts helpers in isolation from the instrumentation event pipeline.
+  // A real NodeTracerProvider + SimpleSpanProcessor is the most direct way
+  // to unit-test the pi.ts helpers without the instrumentation event pipeline.
   function makeTracer() {
     const spans: ReadableSpan[] = [];
     const provider = new NodeTracerProvider();
@@ -302,7 +247,7 @@ describe('spans and config boundary coverage', () => {
     } as AssistantMessage;
   }
 
-  // --- spans.ts: LLM span attribute mapping -------------------------------
+  // --- pi.ts: LLM span attribute mapping -------------------------------
 
   it('closeLlmSpan emits ZERO-valued usage tokens as attributes (setAttr must not treat 0 as absent)', () => {
     const { tracer, spans } = makeTracer();
@@ -320,8 +265,7 @@ describe('spans and config boundary coverage', () => {
     closeLlmSpan(span, message, true);
 
     const a = attrs(spans[0]!);
-    // A genuine "0 output tokens" turn is real trace data — a `if (!value) skip`
-    // guard would drop it. setAttr only skips null/undefined, so 0 must land.
+    // setAttr must skip only null/undefined, not falsy 0 values.
     assert.equal(a['gen_ai.usage.input_tokens'], 0);
     assert.equal(a['gen_ai.usage.output_tokens'], 0);
     assert.equal(a['gen_ai.usage.cache_read_input_tokens'], 0);
@@ -361,7 +305,6 @@ describe('spans and config boundary coverage', () => {
 
     const { tracer: t2, spans: s2 } = makeTracer();
     const blank = openLlmSpan(t2, ROOT_CONTEXT, assistantMessage({ model: '' }));
-    // updateName in close would also fall back; force both model+responseModel empty.
     closeLlmSpan(blank, assistantMessage({ model: '', responseModel: '' }), false);
     assert.equal(s2[0]!.name, 'pi.llm');
   });
@@ -444,15 +387,8 @@ describe('spans and config boundary coverage', () => {
     );
   });
 
-  // --- spans.ts: root span ------------------------------------------------
+  // --- pi.ts: root span ------------------------------------------------
 
-  // Rephrased from a pre-fix test of the now-removed TR_ATTRIBUTES.WILL_RETRY
-  // flag (closeRootSpan used to stamp will_retry unconditionally, coercing
-  // undefined to false). Under the new prompt()-anchored root model, the root
-  // closes once via finalizeRootSpan — called by instrumentation.ts's
-  // proto.prompt when the enclosing prompt() call's own promise settles — and
-  // stamps the observable per-window retry ATTEMPT COUNT instead of a
-  // per-attempt boolean flag (see spans.ts's own header comment on the split).
   it('finalizeRootSpan stamps retry_count and sets the given status', () => {
     const { tracer, spans } = makeTracer();
     const span = openRootSpan(tracer, ROOT_CONTEXT, {
@@ -483,15 +419,10 @@ describe('spans and config boundary coverage', () => {
     );
   });
 
-  // F9: instrumentation.ts's proto.prompt calls finalizeRootSpan from inside a
-  // detached `.then(onResolve, onReject)` chain nobody awaits — a throw there
-  // becomes an unhandledRejection capable of crashing the host. setAttribute/
-  // setStatus/recordException are not otherwise guarded the way endSpanSafe
-  // already guards span.end(), so a single misbehaving Span implementation
-  // could throw out of finalizeRootSpan before ever reaching endSpanSafe. This
-  // drives exactly that: a span whose setStatus() throws must not propagate
-  // out of finalizeRootSpan, and the span must still be ended (so it still
-  // exports) despite the mid-call failure.
+  // proto.prompt calls finalizeRootSpan from inside a detached `.then()`
+  // chain nobody awaits — a throw there becomes an unhandledRejection
+  // capable of crashing the host. setAttribute/setStatus/recordException
+  // aren't otherwise guarded the way endSpanSafe guards span.end().
   it('finalizeRootSpan never throws when the span misbehaves (setStatus throws), and still ends the span', () => {
     const { tracer } = makeTracer();
     const realSpan = tracer.startSpan('AgentSession.prompt');
@@ -574,14 +505,13 @@ describe('spans and config boundary coverage', () => {
     assert.equal(attrs(spans[0]!)['output.value'], undefined);
   });
 
-  // --- spans.ts: dangling + tool spans ------------------------------------
+  // --- pi.ts: dangling + tool spans ------------------------------------
 
   it('closeDanglingSpan marks force_closed and ends; is a no-op on undefined', () => {
     const { tracer, spans } = makeTracer();
     const span = tracer.startSpan('AgentSession.prompt');
     closeDanglingSpan(span);
     assert.equal(attrs(spans[0]!)['traceroot.pi.force_closed'], true);
-    // Must not throw on undefined (the abandoned-span sweep can pass undefined slots).
     assert.doesNotThrow(() => closeDanglingSpan(undefined));
   });
 
@@ -600,7 +530,6 @@ describe('spans and config boundary coverage', () => {
       undefined,
       'a circular arg must be skipped (caught), not partially serialized',
     );
-    // The result was serializable and must still be captured.
     assert.equal(attrs(toolSpan!)['output.value'], JSON.stringify({ ok: true }));
   });
 
@@ -617,7 +546,6 @@ describe('spans and config boundary coverage', () => {
   it('sliceSurrogateSafe on a string of only lone high surrogates never emits a trailing lone high surrogate', () => {
     const loneHighs = '\uD800\uD800\uD800\uD800\uD800';
     const sliced = sliceSurrogateSafe(loneHighs, 3);
-    // The boundary char is a high surrogate, so it must back off to length 2.
     assert.equal(sliced.length, 2);
     const last = sliced.charCodeAt(sliced.length - 1);
     assert.ok(
@@ -627,8 +555,6 @@ describe('spans and config boundary coverage', () => {
   });
 
   it('sliceSurrogateSafe keeps a complete surrogate pair when the LOW surrogate sits at the boundary', () => {
-    // 'ab' + emoji: indices 0,1 = a,b; 2 = high; 3 = low. maxLen 4 lands the cut
-    // right after the low surrogate — the pair is complete and must be kept whole.
     const text = 'ab\u{1F600}cd';
     const sliced = sliceSurrogateSafe(text, 4);
     assert.equal(sliced, 'ab\u{1F600}');
@@ -655,8 +581,6 @@ describe('spans and config boundary coverage', () => {
   });
 
   it('sliceSurrogateSafe backs off one code unit when a high surrogate sits at the cut boundary', () => {
-    // 3 ASCII chars + an emoji (a surrogate pair): cutting at maxLen=4 would
-    // otherwise land the boundary exactly on the emoji's high surrogate.
     const emoji = '\u{1F600}';
     const text = `abc${emoji}tail`;
     const sliced = sliceSurrogateSafe(text, 4);
@@ -678,60 +602,40 @@ describe('spans and config boundary coverage', () => {
     assert.equal(sliceSurrogateSafe('abcdefghij', 0), '');
   });
 
+  // text.slice(0, cut) with a negative cut slices from the END of the
+  // string, the opposite of capping; a negative maxLen must return ''.
   it('sliceSurrogateSafe returns empty string for a negative maxLen instead of slicing from the end', () => {
-    // Regression guard: text.slice(0, cut) with a negative cut slices from the
-    // END of the string (e.g. 'abcdefghij'.slice(0, -3) === 'abcdefg'), which
-    // is the opposite of capping. A negative maxLen must be treated as "cap to
-    // nothing" and return ''.
     assert.equal(sliceSurrogateSafe('abcdefghij', -3), '');
   });
 });
 
 describe('spans truncation', () => {
-  /**
-   * Lens: src/spans.ts's stringifyToolIo (capFieldReplacer) / capJsonWithMarker
-   * boundary logic, exercised through the real openToolSpan/closeToolSpan call
-   * path rather than as a standalone unit test of the helpers — a future
-   * refactor that stops calling capJsonWithMarker from either function must fail
-   * these tests, not just a test of the helper in isolation. Mirrors
-   * span-name.test.ts's surrogate-pair truncation test in spirit (see 'does not
-   * split a surrogate pair at the truncation boundary' there) but drives it via
-   * the tool span attributes.
-   *
-   * capFieldReplacer only caps an individually-oversized STRING field as
-   * JSON.stringify visits it — a single huge string field (a big file read,
-   * long command stdout, the dominant real-world shape) is capped mid-walk,
-   * before it is embedded in the growing output. It deliberately carries no
-   * running budget across the whole payload (that machinery — mid-serialization
-   * array slicing and scalar-width charging — was removed as part of the Ask 3a
-   * simplification): a large ARRAY of many individually-small values (a big
-   * grep/find output, or a numeric/boolean array) now transiently serializes in
-   * full before capJsonWithMarker's post-hoc backstop slices the final string —
-   * an accepted O(N) trade on already-materialized data. The tests below for
-   * that shape assert the surviving final char-cap/marker invariant rather than
-   * the removed mid-walk behavior; see each test's own comment.
-   */
+  // Exercises pi.ts's stringifyToolIo (capFieldReplacer) / capJsonWithMarker
+  // boundary logic through the real openToolSpan/closeToolSpan call path, so a
+  // future refactor that stops calling capJsonWithMarker fails these tests too.
+  //
+  // capFieldReplacer only caps an individually-oversized STRING field as
+  // JSON.stringify visits it (a big file read or command stdout), mid-walk,
+  // before it's embedded in the growing output. It carries no running budget
+  // across the whole payload, so a large ARRAY of many small values
+  // transiently serializes in full before capJsonWithMarker's post-hoc
+  // backstop slices the final string — an accepted O(N) trade on
+  // already-materialized data.
 
-  // Mirrors src/spans.ts's MAX_TOOL_IO_JSON_CHARS (not exported — hardcoded
-  // here the same way span-name.test.ts hardcodes MAX_NAME_SEGMENT_CHARS as 60).
+  // Mirrors src/pi.ts's MAX_TOOL_IO_JSON_CHARS (not exported).
   const MAX_TOOL_IO_JSON_CHARS = 32 * 1024;
 
-  // Mirrors src/spans.ts's capJsonWithMarker marker text exactly (single U+2026
-  // ellipsis, not three ASCII dots).
+  // Mirrors src/pi.ts's capJsonWithMarker marker text exactly.
   const TRUNCATION_MARKER = '…[truncated]';
 
-  // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
-  // patches AgentSession.prototype directly, so reusing one class across tests
-  // would stack multiple wrap layers onto the same prototype method.
   function makeRig(config: { captureToolIo?: boolean } = {}) {
     const capture = new CapturingExporter();
 
     class FakeAgentSession {
       sessionId = 'sess-1';
       private listeners: Array<(event: AgentEvent) => void> = [];
-      // prompt()'s returned promise settles only once its final agent_end
-      // fires (willRetry !== true) — mirrors the real SDK; see
-      // pi-test-helpers.ts's module header for the full rationale.
+      // Settles only on final agent_end (willRetry !== true); see
+      // pi-test-helpers.ts's CONTRACT.
       private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
       async prompt(_text: string, _options?: unknown): Promise<void> {
         return new Promise<void>((resolve, reject) => {
@@ -755,14 +659,9 @@ describe('spans truncation', () => {
     }
 
     const sdk = { AgentSession: FakeAgentSession };
-    // Real global provider per rig, not a private exporter injection —
-    // PiInstrumentationConfig no longer has an apiKey/_spanExporter escape
-    // hatch (see packages/traceroot/src/pi.ts); the in-tree
-    // integration always re-resolves its tracer through the OTel API's
-    // global `trace` facade. trace.disable() first clears any prior rig's
-    // registration so this file's 11 sequential makeRig() calls stay
-    // isolated from one another (see pi-test-helpers.ts's makeRig() for the
-    // full rationale, mirrored here since this file keeps its own local rig).
+    // trace.disable() first clears any prior rig's registration, so this
+    // file's sequential makeRig() calls stay isolated (see
+    // pi-test-helpers.ts's makeRig()).
     trace.disable();
     const provider = new NodeTracerProvider();
     provider.addSpanProcessor(new SimpleSpanProcessor(capture));
@@ -797,11 +696,9 @@ describe('spans truncation', () => {
     return span.attributes as Record<string, unknown>;
   }
 
-  // Drives one tool call (args in, result out) through the full instrumented
-  // event sequence — agent_start through agent_end — and returns the exported
-  // TOOL span. This is the "real call path" the task asks for: it goes through
-  // instrumentPiCodingAgent's event handler, which calls openToolSpan/
-  // closeToolSpan itself, rather than calling those functions directly.
+  // Drives one tool call through the full instrumented event sequence
+  // (agent_start through agent_end) rather than calling openToolSpan/
+  // closeToolSpan directly, and returns the exported TOOL span.
   async function runToolCall(
     args: unknown,
     result: unknown,
@@ -833,10 +730,8 @@ describe('spans truncation', () => {
     return toolSpan!;
   }
 
-  // JSON.stringify overhead for a single-key { data: '' } object, computed at
-  // runtime rather than hardcoded — derives the exact prefix/suffix length
-  // (`{"data":"` + `"}`) so payload builders below stay correct even if this
-  // ever changes, instead of silently miscalculating.
+  // JSON.stringify overhead for a single-key { data: '' } object, computed
+  // at runtime so payload builders below stay correct if it ever changes.
   const JSON_WRAPPER_OVERHEAD = JSON.stringify({ data: '' }).length;
 
   // Builds { data: <filler> } whose JSON.stringify(...) is exactly totalLength
@@ -847,10 +742,8 @@ describe('spans truncation', () => {
     return { data: filler.repeat(fillerLength) };
   }
 
-  // Builds { data: ... } whose JSON.stringify(...) places a surrogate pair (an
-  // emoji) astride the exact capJsonWithMarker cut boundary: the high surrogate
-  // lands at character index MAX_TOOL_IO_JSON_CHARS - 1 (0-indexed), i.e.
-  // exactly the last character capJsonWithMarker would otherwise keep.
+  // Builds { data: ... } whose JSON.stringify(...) places a surrogate pair
+  // (an emoji) exactly astride the capJsonWithMarker cut boundary.
   function payloadWithSurrogateAtBoundary(): { data: string } {
     const emoji = '\u{1F600}'; // 2 UTF-16 code units (a surrogate pair).
     const prefixLen = JSON_WRAPPER_OVERHEAD - '"}'.length; // chars before the string value starts: `{"data":"`.
@@ -905,10 +798,6 @@ describe('spans truncation', () => {
     assert.ok(inputValue.endsWith(TRUNCATION_MARKER), 'input.value must end with the marker');
     assert.ok(outputValue.endsWith(TRUNCATION_MARKER), 'output.value must end with the marker');
 
-    // Neither payload has a surrogate at the boundary (plain ASCII filler), so
-    // the cut lands exactly at MAX_TOOL_IO_JSON_CHARS and the total length is
-    // bounded by MAX + the marker's own length — nowhere near the untruncated
-    // (MAX + 1000 / MAX + 500) length.
     assert.ok(
       inputValue.length <= MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length,
       'input.value total length must stay within MAX + marker bound',
@@ -937,9 +826,6 @@ describe('spans truncation', () => {
       rawArgsJson.length > MAX_TOOL_IO_JSON_CHARS,
       'sanity check: payload must actually exceed the cap to exercise truncation',
     );
-    // Sanity check the fixture actually puts a high surrogate exactly at the
-    // cut boundary (charCodeAt(MAX - 1)) — otherwise this test would pass
-    // trivially without ever exercising the surrogate-safe backoff branch.
     const boundaryCode = rawArgsJson.charCodeAt(MAX_TOOL_IO_JSON_CHARS - 1);
     assert.ok(
       boundaryCode >= 0xd800 && boundaryCode <= 0xdbff,
@@ -953,8 +839,6 @@ describe('spans truncation', () => {
     for (const value of [inputValue, outputValue]) {
       assert.ok(value.endsWith(TRUNCATION_MARKER), 'value must end with the marker');
       const body = value.slice(0, -TRUNCATION_MARKER.length);
-      // The backoff must have dropped the whole emoji (and everything after
-      // it), landing one code unit short of MAX_TOOL_IO_JSON_CHARS.
       assert.equal(body.length, MAX_TOOL_IO_JSON_CHARS - 1);
       const lastCode = body.charCodeAt(body.length - 1);
       assert.ok(
@@ -973,19 +857,13 @@ describe('spans truncation', () => {
     assert.equal(attrs(toolSpan)['output.value'], undefined);
   });
 
-  // A single huge string field (e.g. a big file read, or long command stdout —
-  // the dominant real-world shape of oversized tool I/O) must never be fully
-  // materialized by JSON.stringify before capJsonWithMarker's post-hoc cap runs.
-  // capJsonWithMarker alone already bounds the *final* attribute either way — a
-  // naive JSON.stringify(args) then slice(0, MAX) produces byte-identical
-  // output to a properly-capped serialization for this single-field shape, so
-  // asserting only on the final attribute's length can't tell a fixed
-  // implementation apart from a broken one here. Instead this spies on the
-  // global JSON.stringify to observe *how* serialization happened: a bare
-  // JSON.stringify(args) call (no replacer) covering the huge value is exactly
-  // the bug — it means the full string was embedded in the output before any
-  // cap applied. A fixed implementation must instead pass a replacer that caps
-  // the oversized string as JSON.stringify visits it, before it's embedded.
+  // A single huge string field must never be fully materialized by
+  // JSON.stringify before capJsonWithMarker's post-hoc cap runs. Asserting
+  // only on the final attribute's length can't tell a fixed implementation
+  // apart from a broken one here (both produce byte-identical output for
+  // this shape), so this spies on the global JSON.stringify to observe how
+  // serialization happened: a bare call with no replacer covering the huge
+  // value means it was fully embedded before any cap applied.
   it('a single huge string tool argument is capped during serialization, not only after the fact', async () => {
     const HUGE_LEN = 500 * 1024; // 500 KB — far past MAX_TOOL_IO_JSON_CHARS.
     const hugeValue = 'A'.repeat(HUGE_LEN);
@@ -1007,9 +885,6 @@ describe('spans truncation', () => {
         Object.values(value as Record<string, unknown>).includes(hugeValue);
 
       if (containsHugeValue && typeof replacer !== 'function') {
-        // The bug: an object containing the huge string was handed to
-        // JSON.stringify with no replacer, so the full 500KB string gets
-        // embedded in the serialized output before capJsonWithMarker ever runs.
         sawBareStringifyOfHugeValue = true;
       }
 
@@ -1057,10 +932,9 @@ describe('spans truncation', () => {
   // capJsonWithMarker(...) throws a TypeError on `.length`, silently swallowed
   // by openToolSpan/closeToolSpan's catch — whose comment claims it exists only
   // for "circular refs or BigInt", which this isn't. This spies on the global
-  // JSON.stringify the same way the huge-string test above does, but asserts
-  // the opposite: a correct implementation must recognize a literal `undefined`
-  // itself and never hand it to JSON.stringify in the first place, exactly like
-  // packages/traceroot/src/claude-agent-sdk.ts's tryStringify already does.
+  // A correct implementation must recognize a literal `undefined` itself and
+  // never hand it to JSON.stringify (which returns undefined, not a string,
+  // for that input) — mirrors claude-agent-sdk.ts's tryStringify.
   it('undefined args/result (parameterless tool call / void-returning tool) never reach a bare JSON.stringify(undefined) call, and produce no input.value/output.value attribute', async () => {
     const originalStringify = JSON.stringify;
     let stringifyCalledWithUndefined = false;
@@ -1097,21 +971,15 @@ describe('spans truncation', () => {
     }
   });
 
-  // REPHRASED for Ask 3a (was: 'a large array of many small strings is capped
-  // by a running serialization budget, not fully materialized then sliced').
-  // That assertion pinned the now-intentionally-dropped mid-serialization
-  // budget (proactive array slicing / scalar-width charging) — capFieldReplacer
-  // only caps individually-oversized strings, so a large array of many
-  // individually-small strings is now fully materialized by JSON.stringify
-  // before capJsonWithMarker's post-hoc backstop slices the final string (the
-  // accepted O(N) trade documented in this file's header). What must still hold
-  // is the final char-cap/marker invariant, and that the truncated body is a
-  // verbatim prefix of the real serialization (not corrupted or re-derived).
+  // capFieldReplacer only caps individually-oversized strings, so a large
+  // array of many individually-small strings is fully materialized before
+  // capJsonWithMarker's post-hoc backstop slices the final string. What must
+  // still hold: the final char-cap/marker invariant, and the truncated body
+  // being a verbatim prefix of the real serialization.
   it('a large array of many small strings still exports a bounded, marked-truncated input.value', async () => {
     const LINE_LEN = 512;
-    // 200 * 512 = ~100 KB total, far past the 32 KB cap — yet each individual
-    // line (512 chars) is well under the cap, so the per-field cap never fires
-    // for any of them.
+    // 200 * 512 = ~100 KB total, past the 32 KB cap, but each line is under
+    // it, so the per-field cap never fires for any single one.
     const LINE_COUNT = 200;
     const line = 'x'.repeat(LINE_LEN);
     const args = { matches: Array.from({ length: LINE_COUNT }, () => line) };
@@ -1136,13 +1004,10 @@ describe('spans truncation', () => {
     );
   });
 
+  // Keys are never inspected and no single value is oversized, so this
+  // many-keyed object is fully materialized before capJsonWithMarker's
+  // post-hoc backstop must still hold the hard MAX + marker bound.
   it('a flat object with a huge number of SHORT-valued keys still exports a bounded input.value (the post-hoc backstop must hold the line)', async () => {
-    // capFieldReplacer only caps individually-oversized STRING values — none of
-    // this object's values are oversized, and its keys are never inspected at
-    // all, so a many-keyed object (a word-count map, a file->stat dictionary)
-    // is fully materialized by JSON.stringify. The exported attribute must
-    // nevertheless respect the hard MAX + marker bound via capJsonWithMarker's
-    // post-hoc backstop.
     const KEY_COUNT = 50_000;
     const args: Record<string, string> = {};
     for (let i = 0; i < KEY_COUNT; i++) {
@@ -1165,31 +1030,18 @@ describe('spans truncation', () => {
 });
 
 describe('config resolution', () => {
-  /**
-   * Lens: config resolution (packages/traceroot/src/pi.ts).
-   *
-   * Split out of packages/pi/tests/config-resolution.test.ts: this in-tree
-   * integration's PiInstrumentationConfig no longer has apiKey/baseUrl fields
-   * (see config.ts's own header — there is no export-pipeline configuration
-   * here at all, since this integration always gets its tracer from the
-   * globally-registered OTel provider core sets up, never builds its own). So
-   * every apiKey/baseUrl/env-var-precedence/empty-apiKey-disables-instrumentation
-   * test from the original file is deleted along with those fields — there is
-   * nothing left for them to probe. What remains: resolveConfig()'s
-   * captureContent/captureToolIo defaults, and instrumentPiCodingAgent()'s
-   * config-snapshot immutability (adapted to the surviving fields).
-   */
+  // PiInstrumentationConfig has no apiKey/baseUrl fields (this integration
+  // always gets its tracer from the globally-registered OTel provider core
+  // sets up, never builds its own), so there's nothing left to probe there.
+  // What remains: resolveConfig()'s captureContent/captureToolIo defaults,
+  // and instrumentPiCodingAgent()'s config-snapshot immutability.
 
-  // Fresh class per rig, not a shared module-level class — instrumentPiCodingAgent
-  // patches AgentSession.prototype directly, so reusing one class across tests
-  // would stack multiple wrap layers onto the same prototype method.
   function makeFakeSessionClass() {
     return class FakeAgentSession {
       sessionId = 'sess-1';
       private listeners: Array<(event: AgentEvent) => void> = [];
-      // prompt()'s returned promise settles only once its final agent_end
-      // fires (willRetry !== true) — mirrors the real SDK; see
-      // pi-test-helpers.ts's module header for the full rationale.
+      // Settles only on final agent_end (willRetry !== true); see
+      // pi-test-helpers.ts's CONTRACT.
       private pending: { resolve: () => void; reject: (err: unknown) => void } | undefined;
       async prompt(_text: string, _options?: unknown): Promise<void> {
         return new Promise<void>((resolve, reject) => {
@@ -1274,17 +1126,12 @@ describe('config resolution', () => {
     const Session = makeFakeSessionClass();
     const sdk = { AgentSession: Session };
 
-    // A plain mutable object, exactly as a caller might build and later reuse
-    // or mutate it (e.g. a shared config object edited elsewhere in the host
-    // app).
     const config = { captureContent: true };
 
     registerCapturingProvider(capture);
     instrumentPiCodingAgent(sdk, config);
 
-    // Mutate the field AFTER instrumentPiCodingAgent() has already returned.
-    // resolveConfig() must have copied the primitive value out (not retained a
-    // live reference to `config`).
+    // Mutate after instrumentPiCodingAgent() has already returned.
     config.captureContent = false;
 
     const session = new Session();

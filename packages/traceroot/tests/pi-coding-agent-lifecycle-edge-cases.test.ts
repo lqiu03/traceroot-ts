@@ -20,14 +20,9 @@ import {
 } from './pi-test-helpers';
 
 describe('instrumentation edge cases', () => {
-  // Registers a real, freshly-registered global TracerProvider wired to
-  // `capture`, replacing the deleted private-exporter (`_spanExporter`)
-  // injection path — see pi-test-helpers.ts's makeRig() for the full
-  // isolation rationale behind calling trace.disable() first. This file keeps
-  // its own local rig (per-test CapturingExporter/Session construction, not
-  // pi-test-helpers.ts's makeRig()) because several tests below assert on
-  // direct AgentSession.prototype.prompt identity/subscribeCallCount, which
-  // need the raw Session class, not the rig's wrapped return shape.
+  // Local rig (not pi-test-helpers.ts's makeRig()), since several tests
+  // below assert on direct AgentSession.prototype.prompt identity /
+  // subscribeCallCount, needing the raw Session class.
   function registerCapturingProvider(capture: CapturingExporter): void {
     trace.disable();
     const provider = new NodeTracerProvider();
@@ -35,11 +30,9 @@ describe('instrumentation edge cases', () => {
     provider.register();
   }
 
-  // prompt()'s returned promise settles on the FINAL agent_end (willRetry !==
-  // true), not merely by being called — see pi-test-helpers.ts's module header
-  // for the full rationale (mirrored here since this file keeps its own local
-  // fixture rather than importing makeFakeSessionClass, to keep
-  // subscribeCallCount and direct prototype-identity assertions self-contained).
+  // Settles only on final agent_end (willRetry !== true); see
+  // pi-test-helpers.ts's CONTRACT. Local fixture (with subscribeCallCount)
+  // rather than the shared one, to keep prototype-identity assertions self-contained.
   function makeFakeSessionClass() {
     return class FakeAgentSession {
       sessionId = 'sess-1';
@@ -124,15 +117,12 @@ describe('instrumentation edge cases', () => {
     );
   });
 
+  // A real `import * as pi` ES module namespace object is always
+  // non-extensible per spec, even though AgentSession and its prototype
+  // (reachable through it) are ordinary extensible objects.
+  // Object.preventExtensions reproduces that shape: instrumentPiCodingAgent()
+  // must never try to stamp its wrap-once guard directly onto `sdk` itself.
   it('instrumenting a non-extensible sdk object (e.g. a real `import * as pi` ES module namespace) does not throw', async () => {
-    // `import * as pi from "@earendil-works/pi-coding-agent"` — the exact
-    // usage documented in this package's own README — hands back an ES module
-    // namespace exotic object. Per the ECMAScript spec, module namespace
-    // objects are always non-extensible, even though the values reachable
-    // through them (like AgentSession and its prototype) are ordinary,
-    // extensible objects. `Object.preventExtensions` reproduces that shape
-    // precisely enough to catch a regression: instrumentPiCodingAgent() must
-    // never try to stamp its wrap-once guard directly onto `sdk` itself.
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
     const sdk = Object.preventExtensions({ AgentSession: Session });
@@ -154,9 +144,6 @@ describe('instrumentation edge cases', () => {
       'instrumentation still works end-to-end against a non-extensible sdk object',
     );
 
-    // A second call against the same frozen namespace must still be an
-    // idempotent no-op, proving the wrap-once guard now lives somewhere that
-    // actually persists (AgentSession.prototype), not on the frozen `sdk`.
     const wrappedOnce = Session.prototype.prompt;
     assert.doesNotThrow(() => {
       instrumentPiCodingAgent(sdk, {});
@@ -164,30 +151,16 @@ describe('instrumentation edge cases', () => {
     assert.equal(Session.prototype.prompt, wrappedOnce);
   });
 
+  // Guards silent double-instrumentation across two independently-loaded
+  // copies of this package sharing one AgentSession.prototype (e.g. a
+  // monorepo dedup failure). A module-scoped `Symbol()` guard would fail
+  // silently here: each copy gets its own non-interned symbol, invisible to
+  // the other's check, so both patch prompt/steer/followUp/dispose and
+  // double every span export with no warning. Symbol.for(key) is looked up
+  // in the process-wide global registry, so any code calling it with the
+  // same string gets back the identical symbol — asserted directly against
+  // the registry rather than by loading two physical copies of the module.
   it('the wrap-once guard key is the globally-interned Symbol.for() value, and a second call warns and is rejected', () => {
-    // Regression test for silent double-instrumentation across two
-    // independently-loaded copies of this package sharing one
-    // AgentSession.prototype (e.g. a monorepo hoisting/dedup failure that
-    // leaves two differently-versioned installs of @traceroot-ai/pi both
-    // patching the same underlying @earendil-works/pi-coding-agent instance).
-    //
-    // A module-scoped `Symbol()` guard would fail this scenario silently: each
-    // loaded copy gets its own distinct, non-interned symbol, so one copy's
-    // wrap-once stamp is invisible to the other copy's guard check — both
-    // copies patch prompt/steer/followUp/dispose, and every real session call
-    // then runs through two independent listener layers, doubling every span
-    // export forever with zero warning. Symbol.for(key), by spec, is looked up
-    // in the process-wide global symbol registry: ANY code anywhere in the
-    // process that calls Symbol.for() with this exact string gets back the
-    // IDENTICAL symbol value, so a second copy's guard check correctly sees the
-    // first copy's stamp and rejects (warn + no-op) instead of silently
-    // double-wrapping.
-    //
-    // Asserted directly against the registry rather than by loading two
-    // physical copies of the module: Symbol.for(key) is spec-guaranteed to
-    // return the exact same value on every call anywhere in the process, so
-    // "the stamped guard key equals Symbol.for(that same key)" is exactly the
-    // property that makes cross-copy detection work.
     const Session = makeFakeSessionClass();
     const sdk = { AgentSession: Session };
 
@@ -206,9 +179,6 @@ describe('instrumentation edge cases', () => {
         'stamp instead of silently double-wrapping and doubling every span export',
     );
 
-    // Confirm the warn-and-reject path actually fires on a second call: a
-    // different config (a different tenant's captureContent setting, here)
-    // must be rejected, not silently applied on top of the first.
     const originalWarn = console.warn;
     const warnings: unknown[][] = [];
     console.warn = (...args: unknown[]) => {
@@ -459,15 +429,10 @@ describe('instrumentation edge cases', () => {
     );
   });
 
-  // This fake's prompt() is declared `async`, so `throw` inside it is captured
-  // into a REJECTED PROMISE — the call to session.prompt('hi') itself never
-  // throws; only the promise it returns rejects. This exercises proto.prompt's
-  // `result.then(onResolve, onReject)` branch. See the DEDICATED
-  // synchronous-throw test directly below for the materially different case
-  // (the call to session.prompt(...) itself throwing, before ever returning a
-  // promise), which exercises proto.prompt's OTHER catch branch — the
-  // `try { result = originalPrompt.call(...) } catch (err) { ... }` around the
-  // call itself.
+  // This fake's `async` prompt() turns its throw into a REJECTED PROMISE (not
+  // a genuine synchronous throw), exercising proto.prompt's
+  // `result.then(onResolve, onReject)` branch — contrast the dedicated
+  // synchronous-throw test below, which exercises the other catch branch.
   it('a rejected prompt() (validation failure before agent_start) never creates a dangling root span, and finalizes the root as ERROR', async () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -480,10 +445,8 @@ describe('instrumentation edge cases', () => {
     const session = new Session();
 
     await assert.rejects(() => session.prompt('hi'), /no model selected/);
-    // agent_start never fires for a run that failed validation before starting,
-    // but the root span proto.prompt opened at entry is still finalized (as
-    // ERROR, per the DECIDED rejection/throw boundary policy) rather than left
-    // dangling open forever.
+    // agent_start never fires, but the root proto.prompt opened at entry is
+    // still finalized as ERROR rather than left dangling open forever.
     assert.equal(capture.spans.length, 1);
     const rootSpan = capture.spans[0]!;
     assert.equal(attrs(rootSpan)['openinference.span.kind'], 'AGENT');
@@ -494,17 +457,10 @@ describe('instrumentation edge cases', () => {
     );
   });
 
-  // F5: both of this suite's pre-existing "sync" fakes (the one above, and
-  // pi-test-helpers.ts's shouldReject predicate) are ASYNC-function throws —
-  // i.e. rejected promises, not genuine synchronous throws — so
-  // instrumentation.ts's proto.prompt SYNCHRONOUS catch branch
-  // (`try { result = originalPrompt.call(this, text, options); } catch (err)
-  // { ...; throw err; }`) had zero real coverage anywhere in this suite. This
-  // fake's prompt() is a plain (non-async) function that throws BEFORE ever
-  // constructing or returning a promise, exercising that exact branch: the
-  // wrapper must catch it, finalize the root as ERROR with the exception
-  // recorded, and then RETHROW SYNCHRONOUSLY — the call to session.prompt(...)
-  // itself must throw, not return a rejected promise.
+  // This fake's prompt() is a plain (non-async) function that throws before
+  // ever constructing or returning a promise, exercising proto.prompt's
+  // synchronous catch branch: the wrapper must finalize the root as ERROR
+  // and then rethrow synchronously, not return a rejected promise.
   it('a prompt() that throws SYNCHRONOUSLY (before ever returning a promise) still finalizes the root as ERROR and rethrows synchronously, not as a rejected promise', () => {
     const capture = new CapturingExporter();
     const Session = makeFakeSessionClass();
@@ -537,22 +493,10 @@ describe('instrumentation edge cases', () => {
     instrumentPiCodingAgent(sdk, {});
     const session = new Session();
 
-    // Under the pre-fix (agent_end-anchored) model this scenario produced TWO
-    // separate root spans, each independently closed, with an unconditional
-    // per-attempt `traceroot.pi.will_retry` flag (true, then false) — pi's own
-    // internal retry control flow leaked into trace *structure*. Flipped here
-    // for the new one-trace-per-prompt() contract: the retry continuation's
-    // agent_start/agent_end fire with NO new prompt() call in between (see
-    // instrumentation.ts's module header on _runAgentPrompt's continuation
-    // loop), so both attempts must land under the SAME still-open root, and
-    // that root closes exactly once — when prompt()'s own promise settles —
-    // carrying retry_count: 1 instead of a per-attempt will_retry flag.
-    //
-    // F4: extended beyond the bare root+retry_count assertion to also drive a
-    // real child LLM span through each attempt (attempt 1 fails at the
-    // provider with an error stopReason and triggers the retry; attempt 2
-    // succeeds), proving the retry's own child spans — not just the root —
-    // land under the single shared trace.
+    // The retry continuation's agent_start/agent_end fire with no new
+    // prompt() call in between, so both attempts must land under the same
+    // still-open root (closing once, carrying retry_count: 1) — and each
+    // attempt's own child LLM span, not just the root, must land there too.
     const done = session.prompt('hi');
     session.emit({ type: 'agent_start' });
     session.emit({
@@ -569,8 +513,7 @@ describe('instrumentation edge cases', () => {
     });
     session.emit({ type: 'turn_end', message: assistantMessage(), toolResults: [] });
     session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: true });
-    // A retry re-enters the loop and fires a fresh agent_start/agent_end pair
-    // — no new prompt() call, same window.
+    // Retry re-enters the loop; no new prompt() call.
     session.emit({ type: 'agent_start' });
     session.emit({
       type: 'message_start',
@@ -627,7 +570,6 @@ describe('instrumentation edge cases', () => {
     instrumentPiCodingAgent(sdk, {});
     const session = new Session();
 
-    // Run 1: a full, clean turn with a tool call, then agent_end.
     const done1 = session.prompt('first task');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-1-model' }) });
@@ -655,12 +597,8 @@ describe('instrumentation edge cases', () => {
 
     assert.equal(capture.spans.length, 3, 'run 1: root + LLM + tool span');
 
-    // Run 2: a genuine second call to prompt() on the SAME session instance
-    // (e.g. the user sends a second chat message), well after run 1's
-    // prompt() promise already settled and tore its state down. Deliberately
-    // reuses run 1's toolCallId ("call-1") to prove a stale Map entry from run
-    // 1 cannot bleed into run 2 — the prompt() settle already cleared
-    // state.toolSpans (via agent_end's own sweep).
+    // Deliberately reuses run 1's toolCallId ("call-1") to prove a stale Map
+    // entry cannot bleed into run 2.
     const done2 = session.prompt('second task');
     session.emit({ type: 'agent_start' });
     session.emit({ type: 'message_start', message: assistantMessage({ model: 'run-2-model' }) });
@@ -719,8 +657,6 @@ describe('instrumentation edge cases', () => {
     const run2Tool = toolSpans.find((s) => s.name.includes('run2'));
     assert.ok(run1Tool);
     assert.ok(run2Tool);
-    // ReadableSpan has no top-level traceId field — it lives under
-    // spanContext().traceId, matching how root-span trace ids are read above.
     assert.notEqual(
       run1Tool!.spanContext().traceId,
       run2Tool!.spanContext().traceId,
@@ -740,52 +676,27 @@ describe('instrumentation edge cases', () => {
 });
 
 describe('install rollback', () => {
-  /**
-   * Lens: instrumentPiCodingAgent() install rollback.
-   *
-   * instrumentPiCodingAgent() stamps AgentSession.prototype with its wrap-once
-   * guard. Two distinct failure points along that install path must both leave
-   * the prototype exactly as found — never half-patched, never stamped without
-   * being fully patched:
-   *
-   *  - A failure DURING the method patching (a throwing `steer` probe below).
-   *    If the wrap-once stamp were applied BEFORE setup finishes and setup then
-   *    throws, the prototype is left permanently marked "wrapped" while the SDK
-   *    is never actually patched — so every later instrumentPiCodingAgent()
-   *    call is silently rejected with "config ignored" instead of the real
-   *    setup failure ever surfacing.
-   *
-   *  - A failure from the FINAL wrap-once stamp itself, after every method
-   *    patch has already succeeded (Object.defineProperty(proto, WRAPPED, ...)
-   *    throwing because the prototype was frozen/sealed in between, or a
-   *    conflicting non-configurable WRAPPED-keyed property already exists).
-   *    Originally that stamp sat OUTSIDE the try/catch, so its throw escaped
-   *    rollback: the prototype was left fully patched but UNSTAMPED. The next
-   *    instrumentPiCodingAgent() call then saw no guard, re-patched the
-   *    already-patched prompt/steer/followUp/dispose, and every event emitted
-   *    DUPLICATE spans forever.
-   *
-   * Both tests prove the stamp lands only after setup fully succeeds and lives
-   * inside the try: the failure surfaces as a clear error, and a partial
-   * install is rolled back rather than left half-applied (which a later retry
-   * would then double-wrap).
-   */
+  // Two failure points along instrumentPiCodingAgent()'s install path must
+  // both leave AgentSession.prototype exactly as found: a failure during
+  // method patching (stamping the wrap-once guard before setup finishes
+  // would leave the prototype marked "wrapped" but never actually patched,
+  // silently swallowing later calls), and a failure from the final wrap-once
+  // stamp itself after every patch succeeded (if that stamp sits outside the
+  // try/catch, the prototype ends up fully patched but unstamped, so the
+  // next call re-patches it and doubles every span export forever).
 
   // Same registry key the instrumentation stamps on AgentSession.prototype.
   const WRAPPED = Symbol.for('traceroot.pi_coding_agent.wrapped');
 
   it('a setup failure after the wrap-once decision does not leave the guard stamped or the prototype half-patched', () => {
-    // Register a real global provider so the install takes the shared-mode path
-    // (no private provider, no beforeExit hook) — keeps this test focused purely
-    // on the guard-ordering/rollback behavior, not the flush-hook plumbing.
+    // Real global provider: shared-mode path (no private provider, no
+    // beforeExit hook), keeping this test focused on rollback behavior.
     const provider = new NodeTracerProvider();
     provider.register();
     try {
-      // An AgentSession whose `steer` getter throws the first time the
-      // instrumentation probes `typeof proto.steer === 'function'` during setup,
-      // standing in for ANY exception thrown partway through installing the
-      // patches. prompt() is patched before that probe, so a naive install
-      // leaves prompt half-wrapped when the probe throws.
+      // `steer` throws the first time the instrumentation probes it during
+      // setup, standing in for any exception thrown partway through
+      // installing the patches (prompt() is patched before that probe).
       class ThrowingSteerSession {
         sessionId = 's';
         prompt(): void {}
@@ -830,15 +741,11 @@ describe('install rollback', () => {
   });
 
   it('a throw from the final WRAPPED stamp rolls every method patch back to its original', () => {
-    // Shared-mode path (a real global provider registered) so the install does
-    // not build a private provider or a beforeExit hook — keeps this focused on
-    // the stamp-failure rollback, not flush plumbing.
     const provider = new NodeTracerProvider();
     provider.register();
     try {
-      // A fully-patchable AgentSession: prompt/subscribe/steer/followUp/dispose
-      // all present, so EVERY method patch below succeeds and the install reaches
-      // its final stamping step with the prototype fully patched.
+      // Every method is present, so every patch below succeeds and the
+      // install reaches its final stamping step fully patched.
       class FullSession {
         sessionId = 's';
         prompt(): void {}
@@ -851,13 +758,11 @@ describe('install rollback', () => {
       }
       const proto = FullSession.prototype as unknown as Record<PropertyKey, unknown>;
 
-      // Booby-trap the final stamp: pre-define WRAPPED as a NON-configurable,
-      // non-writable data property whose value is falsy. The falsy value lets the
-      // early `if (proto[WRAPPED])` guard pass (so setup proceeds and all method
-      // patches apply), but the closing Object.defineProperty(proto, WRAPPED,
-      // { value: true, ... }) cannot redefine a non-configurable property to a new
-      // value — it throws a TypeError, standing in for a frozen/sealed prototype
-      // or a genuine WRAPPED-key collision at that exact final step.
+      // Pre-define WRAPPED as non-configurable with a falsy value: the early
+      // guard passes (so setup proceeds), but the closing
+      // Object.defineProperty at the final stamp cannot redefine a
+      // non-configurable property, so it throws — standing in for a
+      // frozen/sealed prototype at that exact final step.
       Object.defineProperty(proto, WRAPPED, {
         value: false,
         configurable: false,
@@ -871,17 +776,15 @@ describe('install rollback', () => {
       const originalDispose = proto.dispose;
       const sdk = { AgentSession: FullSession };
 
-      // (a) The stamp failure must surface as a clear, rethrown install error.
       assert.throws(
         () => instrumentPiCodingAgent(sdk, {}),
         /failed to install/i,
         'a throw from the final WRAPPED stamp must surface as an instrumentation-install error',
       );
 
-      // (b) Every method patch must be rolled back to its ORIGINAL function, even
-      // though all of them succeeded and only the trailing stamp failed. Without
-      // rollback covering the stamp, these would remain wrapped while the guard
-      // is unset — the exact state that double-instruments on the next call.
+      // Every patch must roll back even though only the trailing stamp
+      // failed — otherwise these stay wrapped while the guard is unset, the
+      // exact state that double-instruments on the next call.
       assert.equal(proto.prompt, originalPrompt, 'prompt must be rolled back to the original');
       assert.equal(proto.steer, originalSteer, 'steer must be rolled back to the original');
       assert.equal(
@@ -897,23 +800,14 @@ describe('install rollback', () => {
 });
 
 describe('close-root-span backward scan', () => {
-  /**
-   * Lens: stampRootOutput's search for the last assistant message
-   * (src/spans.ts) — a correct scan must keep walking past trailing
-   * non-assistant messages instead of stopping at the wrong one.
-   *
-   * stampRootOutput() only stamps output.value; it does not end the span (that
-   * is finalizeRootSpan's job, called once when the enclosing prompt() call's
-   * own promise settles — see instrumentation.ts's module header for the split
-   * rationale), so the test below ends the span explicitly to make it visible
-   * to the capturing exporter.
-   */
+  // stampRootOutput's search for the last assistant message must keep
+  // walking past trailing non-assistant messages instead of stopping at the
+  // wrong one. It only stamps output.value (finalizeRootSpan ends the span
+  // separately), so the test below ends the span explicitly to make it
+  // visible to the capturing exporter.
 
-  // closeRootSpan only needs a real Span (setAttribute/end), not the full
-  // instrumentPiCodingAgent event pipeline — a direct NodeTracerProvider +
-  // SimpleSpanProcessor rig (same shape as src/provider.ts's createTracing,
-  // minus the OTLP exporter) is the most direct way to unit-test this
-  // function in isolation.
+  // A direct NodeTracerProvider + SimpleSpanProcessor rig is the most direct
+  // way to unit-test this function without the full event pipeline.
   function makeTracer() {
     const capture = new CapturingExporter();
     const provider = new NodeTracerProvider();
@@ -954,9 +848,7 @@ describe('close-root-span backward scan', () => {
     const { tracer, capture } = makeTracer();
     const span = tracer.startSpan('AgentSession.prompt');
 
-    // The assistant reply is buried, not the final entry — a correct backward
-    // scan must keep walking past the trailing non-assistant messages instead
-    // of stopping at the wrong one.
+    // The assistant reply is buried, not the final entry.
     const finalMessages: AgentMessage[] = [
       userMessage('question'),
       assistantMessage('the real answer'),
@@ -980,35 +872,16 @@ describe('close-root-span backward scan', () => {
 });
 
 describe('tracer reresolution', () => {
-  /**
-   * Lens: tracer re-resolution across a shutdown()/initialize() provider swap.
-   *
-   * Ported from packages/pi/tests/provider-shared-mode-behavior.test.ts, which
-   * is otherwise deleted for this in-tree migration (it mostly probed the old
-   * standalone package's private-vs-shared-provider mode detection — apiKey,
-   * _spanExporter, hasRealGlobalProvider() — none of which exist in this
-   * integration; see packages/traceroot/src/pi.ts's own header: there
-   * is no export-pipeline configuration here at all, since core always
-   * guarantees a real, globally-registered OTel provider before
-   * instrumentPiCodingAgent() ever runs). This one scenario survives because it
-   * proves something still true and still load-bearing: the collapsed
-   * tracer-acquisition approach (see instrumentation.ts's
-   * createReresolvingTracer) must keep exporting through a provider SWAP, not
-   * just through the single provider that was live at wrap time.
-   *
-   * TraceRoot.shutdown() (and anything else that calls trace.disable()) swaps
-   * the OTel API's internal ProxyTracerProvider for a brand-new instance rather
-   * than mutating the old one, so a tracer captured once at wrap time and
-   * closed over forever would stay bound to the old, now-detached provider —
-   * every subsequent span would go dark permanently after a
-   * shutdown()/initialize() cycle, with no recovery path (the Symbol.for()
-   * wrap-once guard blocks re-instrumenting to pick up a fresh tracer).
-   * createReresolvingTracer instead re-resolves through the global `trace`
-   * facade on every span-open, so this reproduces the exact repro: register
-   * provider A, instrument, run once (lands in A), run the shutdown reset
-   * sequence, register provider B, run again on the SAME already-instrumented
-   * session (must land in B).
-   */
+  // TraceRoot.shutdown() swaps the OTel API's internal ProxyTracerProvider
+  // for a brand-new instance rather than mutating the old one, so a tracer
+  // captured once at wrap time and closed over forever would stay bound to
+  // the old, detached provider — spans would go dark permanently after a
+  // shutdown()/initialize() cycle (the Symbol.for() guard blocks
+  // re-instrumenting to pick up a fresh tracer). createReresolvingTracer
+  // instead re-resolves through the global `trace` facade on every
+  // span-open: register provider A, instrument, run once (lands in A), run
+  // the shutdown reset sequence, register provider B, run again on the SAME
+  // already-instrumented session (must land in B).
 
   function registerProvider(): { provider: NodeTracerProvider; exporter: InMemorySpanExporter } {
     const exporter = new InMemorySpanExporter();
@@ -1018,8 +891,7 @@ describe('tracer reresolution', () => {
     return { provider, exporter };
   }
 
-  // Exactly the three process-wide resets TraceRoot.shutdown() performs, after
-  // tearing down its own provider.
+  // The three process-wide resets TraceRoot.shutdown() performs.
   async function runShutdownSequence(provider: NodeTracerProvider): Promise<void> {
     await provider.shutdown();
     trace.disable();
@@ -1035,7 +907,6 @@ describe('tracer reresolution', () => {
       const sdk = { AgentSession: Session };
       instrumentPiCodingAgent(sdk, {}); // wraps the prototype once, tracer re-resolved per span
 
-      // First run lands in A.
       const s1 = new Session();
       const done1 = s1.prompt('first run');
       s1.emit({ type: 'agent_start' });
@@ -1050,9 +921,8 @@ describe('tracer reresolution', () => {
         'sanity: the first run must export through provider A',
       );
 
-      // Simulate TraceRoot.shutdown() -> TraceRoot.initialize(): the prototype is
-      // still wrapped (Symbol.for() guard blocks re-instrumentation), so recovery
-      // depends entirely on the captured tracer re-resolving, not re-wrapping.
+      // The prototype stays wrapped (Symbol.for() guard blocks
+      // re-instrumentation), so recovery depends on the tracer re-resolving.
       await runShutdownSequence(a.provider);
       b = registerProvider();
 
@@ -1081,32 +951,17 @@ describe('tracer reresolution', () => {
 });
 
 describe('real SDK shape smoke', () => {
-  /**
-   * Lens: the private @earendil-works/pi-coding-agent internals that
-   * src/instrumentation.ts and src/pi.ts document by hand.
-   *
-   * Those files cite specific fields and methods of the real, installed SDK --
-   * the private `_eventListeners` listener array, the `isStreaming` getter,
-   * and the standalone steer()/followUp()/dispose() entry points -- all read
-   * straight out of the installed source, none of them part of a stable
-   * public contract. This test verifies those hand-mirrored shapes against
-   * the actual installed `@earendil-works/pi-coding-agent@0.80.x`
-   * devDependency, so a version bump that renames or drops any of them fails
-   * loudly here instead of silently shipping broken instrumentation.
-   *
-   * It asserts shape only -- it never constructs a live AgentSession (the
-   * real constructor needs a full agent/session/settings runtime) or
-   * performs any agent work.
-   */
+  // src/pi.ts hand-cites private internals of the real SDK — the
+  // `_eventListeners` array, the `isStreaming` getter, and the standalone
+  // steer()/followUp()/dispose() entry points — none part of a stable public
+  // contract. These tests verify those hand-mirrored shapes against the
+  // actual installed devDependency, so a version bump that renames or drops
+  // any of them fails loudly here instead of silently shipping broken
+  // instrumentation. Shape only — never constructs a live AgentSession.
 
-  // @earendil-works/pi-coding-agent is ESM-only (its package.json exports only an
-  // `import` condition), so it is loaded via a dynamic import() -- which always
-  // goes through Node's ESM resolver and matches that condition -- rather than a
-  // static import that this CommonJS-compiled test file would turn into a
-  // require() the package deliberately does not support. Cached so the (heavy)
-  // module graph is only evaluated once across the tests below. Accessing exports
-  // off a loose record means a REMOVED export surfaces as a clear assertion
-  // failure below, not an opaque module-link error.
+  // ESM-only, so loaded via dynamic import() rather than a static import
+  // this CommonJS test file would turn into a require() the package doesn't
+  // support. Cached so the module graph is evaluated once across all tests.
   type RealSdk = {
     AgentSession?: { prototype: Record<string, unknown> };
   };
@@ -1124,8 +979,7 @@ describe('real SDK shape smoke', () => {
     assert.equal(typeof AgentSession, 'function', 'AgentSession must still be an exported class');
     const proto = AgentSession!.prototype;
 
-    // prompt + subscribe are REQUIRED by instrumentation.ts's install guard --
-    // it disables itself entirely if either is missing.
+    // Required by the install guard, which disables itself if either is missing.
     assert.equal(
       typeof proto.prompt,
       'function',
@@ -1137,10 +991,7 @@ describe('real SDK shape smoke', () => {
       'AgentSession.prototype.subscribe must exist -- the entire span tree is built from one subscribe() listener',
     );
 
-    // steer/followUp/dispose are optional-guarded in the patch layer, but
-    // instrumentation.ts's comments assert they ARE present on the real SDK; if
-    // that stops being true the comments (and the behavior they justify) are
-    // stale.
+    // Optional-guarded in the patch layer, but expected present on the real SDK.
     assert.equal(
       typeof proto.steer,
       'function',
@@ -1157,13 +1008,10 @@ describe('real SDK shape smoke', () => {
       'AgentSession.prototype.dispose must exist -- patched to force-close in-flight spans on teardown',
     );
 
-    // isStreaming is a getter, not a plain data property -- instrumentation.ts's
-    // proto.prompt reads it live on every prompt() call (isQueueOnlySteer) to
-    // detect a mid-stream queue-only steer/followUp. A future SDK bump that
-    // renames or drops this getter would not throw -- isQueueOnlySteer would
-    // just silently and permanently evaluate to false, reintroducing the
-    // mid-stream-steer trace-beheading bug that check exists to prevent -- so
-    // assert its shape here rather than let that regression ship silently.
+    // isStreaming is a getter, read live on every prompt() call to detect a
+    // mid-stream queue-only steer/followUp. A renamed/dropped getter would
+    // not throw — it would silently reintroduce the mid-stream-steer
+    // trace-beheading bug that check exists to prevent.
     assert.equal(
       typeof Object.getOwnPropertyDescriptor(proto, 'isStreaming')?.get,
       'function',
@@ -1173,14 +1021,12 @@ describe('real SDK shape smoke', () => {
 
   it('the real AgentSession.subscribe() still pushes onto a private _eventListeners array its unsubscribe closure splices back out', async () => {
     const sdk = await loadRealSdk();
-    // instrumentation.ts's module header and its "no cleanup needed" design rest
-    // entirely on this: subscribe(listener) pushes onto a private array field
-    // literally named _eventListeners, and dispose() reassigns that same field to
-    // [] to stop delivery -- with no per-listener unsubscribe() call from our
-    // side. A bare prototype instance (the real constructor needs a full runtime,
-    // so it is deliberately bypassed) with the field pre-seeded lets us drive the
-    // REAL subscribe()/unsubscribe() and confirm they still operate on a field of
-    // exactly that name; a rename leaves this seeded array untouched and fails.
+    // The "no cleanup needed" design rests entirely on subscribe() pushing
+    // onto a private array field literally named _eventListeners, which
+    // dispose() reassigns to [] to stop delivery. A bare prototype instance
+    // (bypassing the real constructor, which needs a full runtime) with the
+    // field pre-seeded drives the real subscribe()/unsubscribe() to confirm
+    // the field name; a rename leaves this seeded array untouched and fails.
     const proto = sdk.AgentSession!.prototype as unknown as { subscribe(l: unknown): () => void };
     const instance = Object.create(proto) as {
       _eventListeners: unknown[];
@@ -1193,7 +1039,7 @@ describe('real SDK shape smoke', () => {
     assert.equal(typeof unsubscribe, 'function', 'subscribe() must return an unsubscribe closure');
     assert.ok(
       instance._eventListeners.includes(listener),
-      "subscribe() must push the listener onto a private array field named _eventListeners -- instrumentation.ts's no-cleanup design depends on this exact field name",
+      "subscribe() must push the listener onto a private array field named _eventListeners -- pi.ts's no-cleanup design depends on this exact field name",
     );
 
     unsubscribe();
