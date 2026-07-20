@@ -74,13 +74,6 @@ interface SessionSpanState {
   // traceroot.pi.retry_count when the window's prompt() promise settles (see
   // finalizeRootSpan in spans.ts).
   retryCount: number;
-  // True when dispose()'s force-close swept this window's still-open root
-  // span (only dispose() ever sets this true), so agent_end can tell that
-  // apart from the root simply still being mid-flight. Covers a host that
-  // calls session.dispose() synchronously from its own agent_end listener:
-  // pi's own agent_end handler still runs afterward and would otherwise
-  // silently find state.rootSpan already undefined with no other signal.
-  rootForceClosedBySweep: boolean;
 }
 
 // Force-closes every span left open by an abandoned run: every open tool
@@ -230,7 +223,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
       });
       state.rootSpan = rootSpan;
       state.rootCtx = trace.setSpan(parentCtx, rootSpan);
-      state.rootForceClosedBySweep = false;
       state.retryCount = 0;
 
       // Ends and clears THIS window's root exactly once, guarded by identity
@@ -342,12 +334,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
         // dispose().
         const state = sessionSpanState.get(this);
         if (state) {
-          // Whether this dispose() force-closed a still-open root span. If a
-          // host's own agent_end listener triggered this dispose()
-          // reentrantly, pi's own agent_end handler still runs afterward and
-          // must be able to tell its root span was force-closed out from
-          // under it (see SessionSpanState.rootForceClosedBySweep).
-          const hadOpenRootSpan = state.rootSpan !== undefined;
           try {
             sweepDanglingSpans(state, { includeRoot: true });
           } catch (err) {
@@ -359,7 +345,6 @@ export function instrumentPiCodingAgent(sdk: unknown, config?: PiInstrumentation
               err,
             );
           } finally {
-            if (hadOpenRootSpan) state.rootForceClosedBySweep = true;
             state.rootSpan = undefined;
             state.rootCtx = undefined;
             state.llmSpan = undefined;
@@ -422,7 +407,6 @@ function attachSpanListener(
     llmCtx: undefined,
     toolSpans: new Map(),
     retryCount: 0,
-    rootForceClosedBySweep: false,
   };
   // Reachable from AgentSession.prototype.dispose so a mid-run dispose() can
   // force-close whatever this session's listener callback below left open.
@@ -550,22 +534,6 @@ function handleEvent(
         // output always reflects the prompt() call's true final result
         // rather than an intermediate attempt's.
         stampRootOutput(state.rootSpan, event.messages, config.captureContent);
-      } else if (state.rootForceClosedBySweep) {
-        // This attempt's root span is gone because a reentrant dispose() (a
-        // host's own earlier-registered agent_end listener disposing the
-        // session synchronously — see session-dispose.test.ts) force-closed
-        // it before this handler got to run for the same event. This is the
-        // ONLY reachable cause: proto.prompt's own OVERLAP SAFETY sweep
-        // never sets this flag, and proto.prompt always clears it back to
-        // false the instant it opens a new window's root. The real stamp can
-        // no longer happen, so the exported AGENT span is a FORCE_CLOSED one
-        // missing this attempt's output — surface that rather than silently
-        // dropping the completion data.
-        console.warn(
-          "[traceroot-pi] agent_end arrived after this run's root span was already force-closed " +
-            'by a reentrant dispose(); the exported AGENT span is missing its final output/retry ' +
-            'attributes.',
-        );
       }
       // Stamped onto the root as traceroot.pi.retry_count once the enclosing
       // prompt() call's own promise settles (see finalizeRootSpan in spans.ts).

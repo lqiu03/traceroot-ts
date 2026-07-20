@@ -1301,7 +1301,7 @@ describe('close-event idempotency and content safety', () => {
     );
   });
 
-  it('agent_end firing twice for one attempt before prompt() settles stamps output idempotently and does not emit a spurious reentrant-dispose warning', async () => {
+  it('agent_end firing twice for one attempt before prompt() settles stamps output idempotently', async () => {
     // Under the pre-fix (agent_end-anchored) model, agent_end closed the root
     // itself, so a duplicate agent_end risked a double-close. Flipped here:
     // agent_end no longer closes the root at all (see instrumentation.ts's
@@ -1312,22 +1312,13 @@ describe('close-event idempotency and content safety', () => {
     const { capture, Session } = makeRig();
     const session = new Session();
 
-    const warnings: unknown[][] = [];
-    const originalWarn = console.warn;
-    console.warn = (...args: unknown[]) => {
-      warnings.push(args);
-    };
-    try {
-      const done = session.prompt('a duplicate agent_end fires for one run');
-      session.emit({ type: 'agent_start' });
+    const done = session.prompt('a duplicate agent_end fires for one run');
+    session.emit({ type: 'agent_start' });
+    session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
+    assert.doesNotThrow(() => {
       session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
-      assert.doesNotThrow(() => {
-        session.emit({ type: 'agent_end', messages: [assistantMessage()], willRetry: false });
-      });
-      await done;
-    } finally {
-      console.warn = originalWarn;
-    }
+    });
+    await done;
 
     const rootSpans = capture.spans.filter((s) => attrs(s)['openinference.span.kind'] === 'AGENT');
     assert.equal(rootSpans.length, 1, 'the root span must be closed and exported exactly once');
@@ -1335,13 +1326,6 @@ describe('close-event idempotency and content safety', () => {
       attrs(rootSpans[0]!)['traceroot.pi.force_closed'],
       undefined,
       'the root span closed normally when prompt() settled',
-    );
-    assert.ok(
-      !warnings.some(
-        (args) => typeof args[0] === 'string' && args[0].includes('reentrant dispose'),
-      ),
-      'a second agent_end (root span still open, never force-closed) must not be mistaken for a ' +
-        'reentrant-dispose force-close',
     );
   });
 
