@@ -7,8 +7,7 @@ import type { Context, ContextManager, SpanContext } from '@opentelemetry/api';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
-import type { AgentEvent, AssistantMessage } from '../src/pi/types';
+import { instrumentPiCodingAgent, type AgentEvent, type AssistantMessage } from '../src/pi';
 
 describe('span lifecycle event ordering', () => {
   /**
@@ -635,7 +634,7 @@ describe('span context parenting', () => {
     const sdk = { AgentSession: FakeAgentSession };
     // Real global provider per rig, not a private exporter injection —
     // PiInstrumentationConfig no longer has an apiKey/_spanExporter escape
-    // hatch (see packages/traceroot/src/pi/config.ts). trace.disable() first
+    // hatch (see packages/traceroot/src/pi.ts). trace.disable() first
     // clears any prior rig's registration so this file's tests stay isolated
     // from one another (see pi-test-helpers.ts's makeRig() for the full
     // rationale, mirrored here since this file keeps its own local rig).
@@ -1416,7 +1415,7 @@ describe('dangling-span sweep deduplication', () => {
   /**
    * Behavioral guard that the "force-close every open tool span, then the LLM
    * span, then (sometimes) the root span" dangling-span sweep actually runs at
-   * every call site that needs it in packages/traceroot/src/pi/instrumentation.ts
+   * every call site that needs it in packages/traceroot/src/pi.ts
    * — agent_start, turn_end, agent_end, proto.prompt's overlap-safety check, and
    * dispose().
    *

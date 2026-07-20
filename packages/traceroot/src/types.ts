@@ -1,5 +1,5 @@
 // src/types.ts
-import type { PiInstrumentationConfig } from './pi/config';
+import type { PiInstrumentationConfig } from './pi';
 
 export type SpanType = 'span' | 'agent' | 'tool' | 'llm';
 
@@ -102,14 +102,14 @@ export interface InitializeOptions {
     openaiAgents?: unknown;
     /**
      * @earendil-works/pi-coding-agent instrumentation, built in to this
-     * package (packages/traceroot/src/pi/). Accepts either:
+     * package (packages/traceroot/src/pi.ts). Accepts either:
      *  - the bare module ref: `import * as pi from '@earendil-works/pi-coding-agent'`; or
      *  - a {@link PiCodingAgentInstrumentation} wrapper: `{ module: pi, config: {...} }`,
      *    to override capture behavior (`captureContent`/`captureToolIo`) —
      *    the deliberate divergence from {@link claudeAgentSDK}, which has no
      *    config at all.
      *
-     * Delegates directly to instrumentPiCodingAgent() (./pi/instrumentation.ts),
+     * Delegates directly to instrumentPiCodingAgent() (./pi.ts),
      * which auto-discovers the already-registered global OTel provider core
      * sets up, so pi's spans land in the same shared pipeline as the rest of
      * TraceRoot's traces. No separate package install, no lazy-loading, and

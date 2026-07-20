@@ -1,7 +1,6 @@
 // src/instrumentation.ts
 import { registerInstrumentations, type Instrumentation } from '@opentelemetry/instrumentation';
-import type { PiInstrumentationConfig } from './pi/config';
-import { instrumentPiCodingAgent } from './pi/instrumentation';
+import { instrumentPiCodingAgent, type PiInstrumentationConfig } from './pi';
 import type { InitializeOptions, PiCodingAgentInstrumentation } from './types';
 import { wireOpenAIAgentsProcessor } from './openai-agents';
 import { wireClaudeAgentSDKInstrumentation } from './claude-agent-sdk';
@@ -51,7 +50,7 @@ function isPiCodingAgentWrapper(entry: unknown): entry is PiCodingAgentInstrumen
 
 /**
  * Unwraps the { module, config } form if given, then delegates directly to
- * the in-tree instrumentPiCodingAgent() (./pi/instrumentation) -- pi is a
+ * the in-tree instrumentPiCodingAgent() (./pi) -- pi is a
  * core module now, not a separately-installed package, so there's no dynamic
  * require() or missing-optional-peer diagnosis.
  *
@@ -59,7 +58,7 @@ function isPiCodingAgentWrapper(entry: unknown): entry is PiCodingAgentInstrumen
  * captureToolIo -- see PiCodingAgentInstrumentation in types.ts) and passes
  * it through unmerged; there is no apiKey/baseUrl to thread, since this
  * in-tree integration builds no export pipeline of its own (see
- * pi/config.ts's module header).
+ * pi.ts's module header).
  *
  * A failure thrown by instrumentPiCodingAgent() itself is intentionally NOT
  * caught here -- it surfaces, same as the OpenInference loop below.

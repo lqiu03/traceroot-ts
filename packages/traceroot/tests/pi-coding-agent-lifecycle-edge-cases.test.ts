@@ -4,9 +4,14 @@ import { SpanStatusCode, context, propagation, trace } from '@opentelemetry/api'
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
-import { stampRootOutput } from '../src/pi/spans';
-import type { AgentEvent, AgentMessage, AssistantMessage, UserMessage } from '../src/pi/types';
+import {
+  instrumentPiCodingAgent,
+  stampRootOutput,
+  type AgentEvent,
+  type AgentMessage,
+  type AssistantMessage,
+  type UserMessage,
+} from '../src/pi';
 import {
   CapturingExporter,
   assistantMessage,
@@ -982,7 +987,7 @@ describe('tracer reresolution', () => {
    * is otherwise deleted for this in-tree migration (it mostly probed the old
    * standalone package's private-vs-shared-provider mode detection — apiKey,
    * _spanExporter, hasRealGlobalProvider() — none of which exist in this
-   * integration; see packages/traceroot/src/pi/config.ts's own header: there
+   * integration; see packages/traceroot/src/pi.ts's own header: there
    * is no export-pipeline configuration here at all, since core always
    * guarantees a real, globally-registered OTel provider before
    * instrumentPiCodingAgent() ever runs). This one scenario survives because it
@@ -1078,7 +1083,7 @@ describe('tracer reresolution', () => {
 describe('real SDK shape smoke', () => {
   /**
    * Lens: the private @earendil-works/pi-coding-agent internals that
-   * src/instrumentation.ts and src/pi/types.ts document by hand.
+   * src/instrumentation.ts and src/pi.ts document by hand.
    *
    * Those files cite specific fields and methods of the real, installed SDK --
    * the private `_eventListeners` listener array, the `isStreaming` getter,

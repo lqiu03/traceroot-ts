@@ -21,4 +21,4 @@ export { OpenAIAgentsProcessor } from './openai-agents';
 export { startSpan, usingSpan } from './spans';
 export type { Span } from './spans';
 export type { StartSpanOptions, SpanUpdate, TokenUsage } from './types';
-export type { PiInstrumentationConfig } from './pi/config';
+export type { PiInstrumentationConfig } from './pi';

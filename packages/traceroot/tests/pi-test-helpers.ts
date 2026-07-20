@@ -4,7 +4,7 @@
  * Moved from packages/pi/tests/test-helpers.ts as part of folding the
  * standalone @traceroot-ai/pi package's behavioral test suite into
  * @traceroot-ai/traceroot's own in-tree pi instrumentation
- * (packages/traceroot/src/pi/*). The old rig injected a private span
+ * (packages/traceroot/src/pi.ts). The old rig injected a private span
  * exporter into pi's config (a `_spanExporter` field that no longer
  * exists on PiInstrumentationConfig — the in-tree integration never owns
  * its own TracerProvider). This version instead registers a REAL global
@@ -14,7 +14,7 @@
  *
  * ── prompt()'s returned promise settles on the FINAL agent_end, not eagerly ──
  * The root AGENT span is now anchored on the wrapped prompt() call's own
- * promise window (see src/pi/instrumentation.ts's module header) — verified
+ * promise window (see src/pi.ts's module header) — verified
  * against the real SDK, prompt() awaits its whole internal retry/compaction/
  * follow-up loop, so every attempt's agent_end fires before prompt() itself
  * resolves. FakeAgentSession mirrors that here: prompt()'s returned promise
@@ -52,9 +52,13 @@ import { ExportResultCode } from '@opentelemetry/core';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
-import type { PiInstrumentationConfig } from '../src/pi/config';
-import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
-import type { AgentEvent, AssistantMessage, PromptOptions } from '../src/pi/types';
+import {
+  instrumentPiCodingAgent,
+  type AgentEvent,
+  type AssistantMessage,
+  type PiInstrumentationConfig,
+  type PromptOptions,
+} from '../src/pi';
 
 /**
  * Capturing exporter — wired into a real, freshly-registered global
@@ -195,7 +199,7 @@ export function makeFakeSessionClass(shouldReject?: (text: string) => boolean) {
  * LOAD-BEARING for per-test isolation. The in-tree instrumentation never
  * builds its own TracerProvider; it always re-resolves the tracer through
  * the OTel API's global `trace` facade (see
- * packages/traceroot/src/pi/instrumentation.ts's createReresolvingTracer).
+ * packages/traceroot/src/pi.ts's createReresolvingTracer).
  * Without disabling the previous rig's registration first, a later
  * provider.register() call would layer a second global provider on top
  * of / behind the first (OTel's global registration is last-write-wins but

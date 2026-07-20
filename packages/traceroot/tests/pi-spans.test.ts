@@ -4,9 +4,9 @@ import { ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { resolveConfig } from '../src/pi/config';
-import { instrumentPiCodingAgent } from '../src/pi/instrumentation';
 import {
+  resolveConfig,
+  instrumentPiCodingAgent,
   describeToolCallSpan,
   openRootSpan,
   stampRootOutput,
@@ -17,8 +17,10 @@ import {
   closeToolSpan,
   closeDanglingSpan,
   sliceSurrogateSafe,
-} from '../src/pi/spans';
-import type { AgentEvent, AgentMessage, AssistantMessage } from '../src/pi/types';
+  type AgentEvent,
+  type AgentMessage,
+  type AssistantMessage,
+} from '../src/pi';
 import { CapturingExporter } from './pi-test-helpers';
 
 describe('span name', () => {
@@ -249,7 +251,7 @@ describe('spans and config boundary coverage', () => {
    *
    * Two subjects from the original packages/pi version of this file are
    * deliberately NOT carried over: baseUrl whitespace normalization (config.ts
-   * no longer has a baseUrl field — see packages/traceroot/src/pi/config.ts)
+   * no longer has a baseUrl field — see packages/traceroot/src/pi.ts)
    * and provider forceFlush idempotency (this in-tree integration never builds
    * or owns its own TracerProvider — see instrumentation.ts's
    * createReresolvingTracer — so there is no createTracing()/forceFlush() of
@@ -755,7 +757,7 @@ describe('spans truncation', () => {
     const sdk = { AgentSession: FakeAgentSession };
     // Real global provider per rig, not a private exporter injection —
     // PiInstrumentationConfig no longer has an apiKey/_spanExporter escape
-    // hatch (see packages/traceroot/src/pi/config.ts); the in-tree
+    // hatch (see packages/traceroot/src/pi.ts); the in-tree
     // integration always re-resolves its tracer through the OTel API's
     // global `trace` facade. trace.disable() first clears any prior rig's
     // registration so this file's 11 sequential makeRig() calls stay
@@ -1164,7 +1166,7 @@ describe('spans truncation', () => {
 
 describe('config resolution', () => {
   /**
-   * Lens: config resolution (packages/traceroot/src/pi/config.ts).
+   * Lens: config resolution (packages/traceroot/src/pi.ts).
    *
    * Split out of packages/pi/tests/config-resolution.test.ts: this in-tree
    * integration's PiInstrumentationConfig no longer has apiKey/baseUrl fields
