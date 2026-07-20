@@ -32,13 +32,12 @@ function loadInstrumentation(pkg: string, exportName: string): InstrumentationCt
 }
 
 /**
- * An `instrumentModules.piCodingAgent` value is the bare `{ module, config }`
+ * An `instrumentModules.piCodingAgent` value is the `{ module, config }`
  * wrapper form (as opposed to a raw `@earendil-works/pi-coding-agent` module
  * ref) when it carries a `module` property and is NOT itself a pi module
- * namespace. The negative `AgentSession` check guards the (unlikely) case of a
- * future pi module that happens to also export a `module` symbol: the real pi
- * namespace exposes `AgentSession`, the wrapper does not, so the two are
- * always distinguishable.
+ * namespace. The negative `AgentSession` check guards against a future pi
+ * module that also exports a `module` symbol: the real pi namespace exposes
+ * `AgentSession`, the wrapper does not, so the two stay distinguishable.
  */
 function isPiCodingAgentWrapper(entry: unknown): entry is PiCodingAgentInstrumentation {
   return (
@@ -52,20 +51,18 @@ function isPiCodingAgentWrapper(entry: unknown): entry is PiCodingAgentInstrumen
 
 /**
  * Unwraps the { module, config } form if given, then delegates directly to
- * the in-tree instrumentPiCodingAgent() (./pi/instrumentation) -- mirroring
- * how wireClaudeAgentSDKInstrumentation() below calls straight into its
- * in-tree integration, with no dynamic require() and no missing-optional-peer
- * diagnosis: pi is a core module now, not a separately-installed package.
+ * the in-tree instrumentPiCodingAgent() (./pi/instrumentation) -- pi is a
+ * core module now, not a separately-installed package, so there's no dynamic
+ * require() or missing-optional-peer diagnosis.
  *
  * Unlike claudeAgentSDK, pi keeps its own `config` (captureContent/
- * captureToolIo) -- that divergence is intentional (see PiCodingAgentInstrumentation
- * in types.ts) and passes straight through unmerged with anything else;
- * there is no apiKey/baseUrl to thread, since this in-tree integration builds
- * no export pipeline of its own (see pi/config.ts's module header).
+ * captureToolIo -- see PiCodingAgentInstrumentation in types.ts) and passes
+ * it through unmerged; there is no apiKey/baseUrl to thread, since this
+ * in-tree integration builds no export pipeline of its own (see
+ * pi/config.ts's module header).
  *
  * A failure thrown by instrumentPiCodingAgent() itself is intentionally NOT
- * caught here -- it surfaces, just as a throwing new Ctor()/manuallyInstrument()
- * does in the OpenInference loop below.
+ * caught here -- it surfaces, same as the OpenInference loop below.
  */
 function wirePiCodingAgentInstrumentation(entry: unknown): void {
   let mod: unknown = entry;

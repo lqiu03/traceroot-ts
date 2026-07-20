@@ -32,18 +32,16 @@ const DEFAULT_BASE_URL = 'https://app.traceroot.ai';
 let _isInitialized = false;
 let _provider: NodeTracerProvider | undefined;
 // The beforeExit listener initialize() installed, so shutdown()/_resetForTesting()
-// can remove exactly that one instead of leaving it to fire (harmlessly, but as an
-// accumulating listener) on every future process exit after a shutdown.
+// can remove exactly that listener instead of letting it accumulate across
+// repeated init/shutdown cycles.
 let _beforeExitHandler: (() => void) | undefined;
 // The exact ContextManager / TextMapPropagator instances TraceRoot ATTEMPTED to
 // register at initialize() time. NodeTracerProvider.register(config) mutates the
-// config object it's handed, filling in config.contextManager (always) and
-// config.propagator (from env defaults, may stay undefined) with the concrete
-// instances it tried to install — regardless of whether those specific
-// registrations actually WON the process-wide first-write-wins slot. Captured
-// here so shutdown() can verify, per-slot and by reference identity, whether
-// TraceRoot still owns each of context/propagation before resetting it. See the
-// three ownership predicates below.
+// config object, filling in config.contextManager (always) and config.propagator
+// (may stay undefined) with the instances it tried to install — regardless of
+// whether they won the process-wide first-write-wins slot. Used by shutdown() to
+// verify, per-slot and by reference identity, whether TraceRoot still owns each
+// slot. See the ownership predicates below.
 let _registeredContextManager: unknown;
 let _registeredPropagator: unknown;
 
@@ -80,9 +78,8 @@ function isActiveGlobalDelegate(provider: NodeTracerProvider): boolean {
  * is the exact instance TraceRoot registered — i.e. TraceRoot won the `context`
  * slot and it hasn't since been replaced. context._getContextManager() is an
  * underscore-prefixed-by-convention runtime accessor on the ContextAPI
- * singleton (not truly private — same duck-typing isActiveGlobalDelegate() uses
- * for getDelegate()); reached via bracket notation since the .d.ts doesn't
- * expose it. Returns false when TraceRoot never registered one.
+ * singleton, reached via bracket notation since the .d.ts doesn't expose it.
+ * Returns false when TraceRoot never registered one.
  */
 function isActiveContextManager(): boolean {
   if (_registeredContextManager === undefined) return false;
@@ -110,15 +107,13 @@ function isActivePropagator(): boolean {
 
 /**
  * Resets exactly the global trace/context/propagation slots THIS module's
- * registration still owns, per the three independent ownership predicates
- * above, and clears the bookkeeping fields that back them. Shared by
- * shutdown() (the normal teardown path) and initialize()'s wiring-failure
- * rollback (an abnormal teardown of a provider that only ever got as far as
- * register()) — both need the identical per-slot ownership dance, and
- * duplicating it would leave two copies of a subtle invariant to keep in
- * sync. Does NOT touch _isInitialized, _provider, or call provider.shutdown()
- * — callers own those since the two call sites differ on exactly those
- * points (sync vs async, and what "provider" even means at that point).
+ * registration still owns, per the ownership predicates above, and clears the
+ * bookkeeping fields that back them. Shared by shutdown() (normal teardown)
+ * and initialize()'s wiring-failure rollback (an abnormal teardown of a
+ * provider that only ever got as far as register()). Does NOT touch
+ * _isInitialized, _provider, or call provider.shutdown() — callers own those
+ * since the two call sites differ on exactly those points (sync vs async, and
+ * what "provider" even means at that point).
  */
 function _releaseGlobalSlots(provider: NodeTracerProvider | undefined): void {
   if (provider && isActiveGlobalDelegate(provider)) {
@@ -261,9 +256,9 @@ export class TraceRoot {
       new TraceRootSpanProcessor(innerProcessor, { environment, gitRepo, gitRef }),
     );
     // Pass our own config object into register() so we can read back the exact
-    // ContextManager / TextMapPropagator instances it tried to install (it
-    // mutates this object in place — see _registeredContextManager's comment).
-    // These are what shutdown()'s per-slot ownership checks compare against.
+    // ContextManager / TextMapPropagator instances it tried to install (mutates
+    // this object in place). These are what shutdown()'s ownership checks
+    // compare against.
     const registerConfig: SDKRegistrationConfig = {};
     _provider.register(registerConfig);
     _registeredContextManager = registerConfig.contextManager;
@@ -273,14 +268,13 @@ export class TraceRoot {
       wireInstrumentations(options.instrumentModules);
     } catch (error) {
       // register() above already won the global trace/context/propagation
-      // slots. If wiring then throws (e.g. a misshaped instrumentModules
-      // entry), leaving that registration in place would break the
-      // "a registered global provider <=> _isInitialized === true" invariant:
-      // _isInitialized stays false, so the double-init guard never fires, but
-      // a retried initialize()'s new provider would lose the first-write-wins
-      // race for slots this orphaned provider still holds — silently
-      // stranding the process without a working export pipeline. Tear down
-      // exactly what this call registered before re-throwing.
+      // slots. If wiring then throws, leaving that registration in place would
+      // break the "a registered global provider <=> _isInitialized === true"
+      // invariant: _isInitialized stays false, so the double-init guard never
+      // fires, but a retried initialize()'s new provider would lose the
+      // first-write-wins race for slots this orphaned provider still holds —
+      // silently stranding the process without a working export pipeline.
+      // Tear down exactly what this call registered before re-throwing.
       const orphaned = _provider;
       _releaseGlobalSlots(orphaned);
       _provider = undefined;
@@ -310,22 +304,15 @@ export class TraceRoot {
     _provider = undefined;
     _resetObserveState();
     // trace/context/propagation .disable() reset OTel's PROCESS-WIDE global
-    // singletons, not just this provider. Without them, OTel's global
-    // registration stays pinned to the now-shut-down provider: a subsequent
-    // initialize()'s register() is silently rejected (registration is
-    // first-write-wins), so every tracer -- new and old -- resolves to the
-    // dead provider and its spans are never exported for the rest of the
-    // process. But reset each slot ONLY when TraceRoot still owns THAT slot.
-    // trace/context/propagation are THREE independent first-write-wins slots
-    // (see the ownership predicates above), so ownership is checked per-slot,
-    // not as one combined check: a host can win the `context` slot on its own
-    // (context.setGlobalContextManager() directly) while TraceRoot still owns
-    // `trace` and `propagation`. A single combined gate keyed only on the
-    // trace-delegate check would then see "true" and call context.disable()
-    // anyway, silently wiping a context manager TraceRoot never owned. Gating
-    // each disable() on its own ownership predicate tears down exactly what
-    // TraceRoot registered and nothing else. (A host that shares TraceRoot's
-    // OWN registered instances without registering its own cannot be
+    // singletons, not just this provider. Without them, a subsequent
+    // initialize()'s register() is silently rejected (first-write-wins), so
+    // every tracer -- new and old -- resolves to the dead provider and spans
+    // are never exported for the rest of the process. Each slot is reset ONLY
+    // when TraceRoot still owns it (see the ownership predicates above) --
+    // trace/context/propagation are three independent first-write-wins slots,
+    // so a host that won e.g. the `context` slot on its own must not have it
+    // wiped by TraceRoot's teardown. (A host that shares TraceRoot's OWN
+    // registered instances without registering its own cannot be
     // distinguished here and will still see the reset -- an accepted
     // limitation.) _resetForTesting() below is unconditional because tests
     // always want a clean slate.

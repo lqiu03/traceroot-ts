@@ -7,13 +7,13 @@
 // the old one, so a Tracer captured once at wrap time (via a single
 // trace.getTracer() call) stays permanently bound to the old, now-detached
 // provider -- after a shutdown()/initialize() cycle every span it opens goes
-// silently dark. An integration's wrap-once guard also means it is only ever
-// wrapped once, so there is no later re-wrap to pick up a fresh tracer.
-// Re-resolving through the global `trace` facade on every span-open instead
-// mirrors ProxyTracer's own lazy-delegate-rebind pattern one level up:
-// whatever TracerProvider is globally active at the moment a span is opened is
-// the one that span routes to. In steady state (no disable() ever called) this
-// behaves identically to a tracer captured once.
+// silently dark, and an integration's wrap-once guard means there is no later
+// re-wrap to pick up a fresh tracer. Re-resolving through the global `trace`
+// facade on every span-open instead mirrors ProxyTracer's own
+// lazy-delegate-rebind pattern one level up: whatever TracerProvider is
+// globally active at the moment a span is opened is the one that span routes
+// to. In steady state (no disable() ever called) this behaves identically to
+// a tracer captured once.
 import { trace } from '@opentelemetry/api';
 import type { Context, Span, SpanOptions, Tracer } from '@opentelemetry/api';
 
