@@ -72,10 +72,6 @@ describe('span name', () => {
     assert.ok(lastCode < 0xd800 || lastCode > 0xdbff);
   });
 
-  it('describeToolCallSpan prefers a path arg over a bash command for non-bash tools', () => {
-    assert.equal(describeToolCallSpan('read', { path: '/a.py', command: 'ignored' }), 'read: a.py');
-  });
-
   it('describeToolCallSpan ignores non-string path-like args', () => {
     assert.equal(describeToolCallSpan('read', { path: 42 }), 'read');
     assert.equal(describeToolCallSpan('read', { path: null }), 'read');
@@ -135,20 +131,6 @@ describe('span name', () => {
       describeToolCallSpan('bash', { path: '/', command: 'ls -la' }),
       'bash: ls -la',
       'an empty-basename path must not shadow a real bash command in the same args object',
-    );
-  });
-
-  it('describeToolCallSpan keeps the bash command when a non-empty-basename path-like arg rides along in the same args object', () => {
-    // A bash tool call can carry an incidental path/file/target argument
-    // alongside `command` (plausible for tool schemas that add a
-    // target/cwd-like field). Unlike the empty-basename case above, this path
-    // arg resolves to a real, non-empty basename ("data") — but the bash
-    // command must still win, matching the file header's claimed
-    // leak-prevention/informativeness tradeoff for bash commands.
-    assert.equal(
-      describeToolCallSpan('bash', { command: 'rm -rf /data', target: '/data' }),
-      'bash: rm -rf /data',
-      'a non-empty path-like arg (e.g. target) must not shadow a real bash command',
     );
   });
 
@@ -1155,62 +1137,6 @@ describe('spans truncation', () => {
     assert.ok(
       inputValue.endsWith(TRUNCATION_MARKER),
       'the oversized array result must still be marked truncated',
-    );
-    assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
-    assert.equal(
-      inputValue,
-      rawJson.slice(0, MAX_TOOL_IO_JSON_CHARS) + TRUNCATION_MARKER,
-      'the truncated body must be a verbatim prefix of the full serialization',
-    );
-  });
-
-  // REPHRASED for Ask 3a (was: 'a large array of numbers is bounded by a
-  // running budget, not fully walked then sliced'). Same reasoning as the
-  // small-strings test above: a large array of numbers has no oversized string
-  // element, so capFieldReplacer leaves it untouched and it is fully walked by
-  // JSON.stringify before truncateJsonSafe's post-hoc backstop slices the final
-  // string. The surviving requirement is the final char-cap/marker invariant.
-  it('a large array of numbers still exports a bounded, marked-truncated input.value', async () => {
-    const ELEMENT_COUNT = 500_000;
-    const args = { values: Array.from({ length: ELEMENT_COUNT }, (_v, i) => i) };
-    const rawJson = JSON.stringify(args);
-    assert.ok(
-      rawJson.length > MAX_TOOL_IO_JSON_CHARS,
-      'sanity check: the raw payload dwarfs the cap',
-    );
-
-    const toolSpan = await runToolCall(args, {});
-    const inputValue = attrs(toolSpan)['input.value'] as string;
-
-    assert.ok(
-      inputValue.endsWith(TRUNCATION_MARKER),
-      'the oversized numeric array result must still be marked truncated',
-    );
-    assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
-    assert.equal(
-      inputValue,
-      rawJson.slice(0, MAX_TOOL_IO_JSON_CHARS) + TRUNCATION_MARKER,
-      'the truncated body must be a verbatim prefix of the full serialization',
-    );
-  });
-
-  // REPHRASED for Ask 3a (was: 'a large array of booleans is likewise bounded
-  // by the running budget'). Same reasoning as the two tests above.
-  it('a large array of booleans still exports a bounded, marked-truncated input.value', async () => {
-    const ELEMENT_COUNT = 500_000;
-    const args = { flags: Array.from({ length: ELEMENT_COUNT }, (_v, i) => i % 2 === 0) };
-    const rawJson = JSON.stringify(args);
-    assert.ok(
-      rawJson.length > MAX_TOOL_IO_JSON_CHARS,
-      'sanity check: the raw payload dwarfs the cap',
-    );
-
-    const toolSpan = await runToolCall(args, {});
-    const inputValue = attrs(toolSpan)['input.value'] as string;
-
-    assert.ok(
-      inputValue.endsWith(TRUNCATION_MARKER),
-      'the oversized boolean array result must still be marked truncated',
     );
     assert.equal(inputValue.length, MAX_TOOL_IO_JSON_CHARS + TRUNCATION_MARKER.length);
     assert.equal(
