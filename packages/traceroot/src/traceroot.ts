@@ -9,6 +9,7 @@ import {
 } from '@opentelemetry/api';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import type { SDKRegistrationConfig } from '@opentelemetry/sdk-trace-base';
 import {
   OpenInferenceBatchSpanProcessor,
   OpenInferenceSimpleSpanProcessor,
@@ -30,6 +31,103 @@ const DEFAULT_BASE_URL = 'https://app.traceroot.ai';
 
 let _isInitialized = false;
 let _provider: NodeTracerProvider | undefined;
+// The beforeExit listener initialize() installed, so shutdown()/_resetForTesting()
+// can remove exactly that listener instead of letting it accumulate across
+// repeated init/shutdown cycles.
+let _beforeExitHandler: (() => void) | undefined;
+// The exact ContextManager / TextMapPropagator instances TraceRoot ATTEMPTED to
+// register at initialize() time. NodeTracerProvider.register(config) mutates the
+// config object, filling in config.contextManager (always) and config.propagator
+// (may stay undefined) with the instances it tried to install — regardless of
+// whether they won the process-wide first-write-wins slot. Used by shutdown() to
+// verify, per-slot and by reference identity, whether TraceRoot still owns each
+// slot. See the ownership predicates below.
+let _registeredContextManager: unknown;
+let _registeredPropagator: unknown;
+
+/**
+ * OpenTelemetry's global registry (@opentelemetry/api's internal
+ * global-utils.js) tracks `trace`, `context`, and `propagation` as THREE
+ * SEPARATE first-write-wins slots. TraceRoot can win some and lose others — a
+ * host can win the `context` slot on its own (e.g. context.setGlobalContextManager()
+ * directly, with no tracer provider) while TraceRoot still wins `trace` and
+ * `propagation`. So ownership of each slot must be checked independently before
+ * tearing it down; a single combined check would let shutdown() destroy a slot
+ * TraceRoot never owned.
+ */
+
+/**
+ * True when `provider` is the concrete TracerProvider the OTel global proxy
+ * currently delegates to — i.e. TraceRoot's registration still owns the `trace`
+ * slot, so it's safe to reset it on teardown. Duck-typed on getDelegate()
+ * (matching pi's own provider detection) rather than instanceof
+ * ProxyTracerProvider, which is defeated by a dual-copy @opentelemetry/api
+ * install.
+ */
+function isActiveGlobalDelegate(provider: NodeTracerProvider): boolean {
+  const globalProvider = trace.getTracerProvider() as { getDelegate?: () => unknown };
+  const delegate =
+    typeof globalProvider.getDelegate === 'function'
+      ? globalProvider.getDelegate()
+      : globalProvider;
+  return delegate === provider;
+}
+
+/**
+ * True when the ContextManager currently installed in the global `context` slot
+ * is the exact instance TraceRoot registered — i.e. TraceRoot won the `context`
+ * slot and it hasn't since been replaced. context._getContextManager() is an
+ * underscore-prefixed-by-convention runtime accessor on the ContextAPI
+ * singleton, reached via bracket notation since the .d.ts doesn't expose it.
+ * Returns false when TraceRoot never registered one.
+ */
+function isActiveContextManager(): boolean {
+  if (_registeredContextManager === undefined) return false;
+  const current = (
+    context as unknown as { _getContextManager?: () => unknown }
+  )._getContextManager?.();
+  return current === _registeredContextManager;
+}
+
+/**
+ * True when the TextMapPropagator currently installed in the global
+ * `propagation` slot is the exact instance TraceRoot registered — i.e. TraceRoot
+ * won the `propagation` slot and it hasn't since been replaced.
+ * propagation._getGlobalPropagator() is the analogous runtime accessor on the
+ * PropagationAPI singleton. Returns false when TraceRoot never registered one
+ * (e.g. OTEL_PROPAGATORS resolved to nothing, leaving config.propagator unset).
+ */
+function isActivePropagator(): boolean {
+  if (_registeredPropagator === undefined) return false;
+  const current = (
+    propagation as unknown as { _getGlobalPropagator?: () => unknown }
+  )._getGlobalPropagator?.();
+  return current === _registeredPropagator;
+}
+
+/**
+ * Resets exactly the global trace/context/propagation slots THIS module's
+ * registration still owns, per the ownership predicates above, and clears the
+ * bookkeeping fields that back them. Shared by shutdown() (normal teardown)
+ * and initialize()'s wiring-failure rollback (an abnormal teardown of a
+ * provider that only ever got as far as register()). Does NOT touch
+ * _isInitialized, _provider, or call provider.shutdown() — callers own those
+ * since the two call sites differ on exactly those points (sync vs async, and
+ * what "provider" even means at that point).
+ */
+function _releaseGlobalSlots(provider: NodeTracerProvider | undefined): void {
+  if (provider && isActiveGlobalDelegate(provider)) {
+    trace.disable();
+  }
+  if (isActiveContextManager()) {
+    context.disable();
+  }
+  if (isActivePropagator()) {
+    propagation.disable();
+  }
+  _registeredContextManager = undefined;
+  _registeredPropagator = undefined;
+}
 
 export class TraceRoot {
   private constructor() {}
@@ -157,14 +255,38 @@ export class TraceRoot {
     _provider.addSpanProcessor(
       new TraceRootSpanProcessor(innerProcessor, { environment, gitRepo, gitRef }),
     );
-    _provider.register();
+    // Pass our own config object into register() so we can read back the exact
+    // ContextManager / TextMapPropagator instances it tried to install (mutates
+    // this object in place). These are what shutdown()'s ownership checks
+    // compare against.
+    const registerConfig: SDKRegistrationConfig = {};
+    _provider.register(registerConfig);
+    _registeredContextManager = registerConfig.contextManager;
+    _registeredPropagator = registerConfig.propagator;
 
-    wireInstrumentations(options.instrumentModules);
+    try {
+      wireInstrumentations(options.instrumentModules);
+    } catch (error) {
+      // register() above already won the global trace/context/propagation
+      // slots. If wiring then throws, leaving that registration in place would
+      // break the "a registered global provider <=> _isInitialized === true"
+      // invariant: _isInitialized stays false, so the double-init guard never
+      // fires, but a retried initialize()'s new provider would lose the
+      // first-write-wins race for slots this orphaned provider still holds —
+      // silently stranding the process without a working export pipeline.
+      // Tear down exactly what this call registered before re-throwing.
+      const orphaned = _provider;
+      _releaseGlobalSlots(orphaned);
+      _provider = undefined;
+      void orphaned?.shutdown().catch(() => {});
+      throw error;
+    }
 
     _isInitialized = true;
-    process.once('beforeExit', () => {
+    _beforeExitHandler = () => {
       void _provider?.forceFlush();
-    });
+    };
+    process.once('beforeExit', _beforeExitHandler);
   }
 
   static async flush(): Promise<void> {
@@ -172,10 +294,29 @@ export class TraceRoot {
   }
 
   static async shutdown(): Promise<void> {
-    await _provider?.shutdown();
+    const provider = _provider;
+    if (_beforeExitHandler) {
+      process.removeListener('beforeExit', _beforeExitHandler);
+      _beforeExitHandler = undefined;
+    }
+    await provider?.shutdown();
     _isInitialized = false;
     _provider = undefined;
     _resetObserveState();
+    // trace/context/propagation .disable() reset OTel's PROCESS-WIDE global
+    // singletons, not just this provider. Without them, a subsequent
+    // initialize()'s register() is silently rejected (first-write-wins), so
+    // every tracer -- new and old -- resolves to the dead provider and spans
+    // are never exported for the rest of the process. Each slot is reset ONLY
+    // when TraceRoot still owns it (see the ownership predicates above) --
+    // trace/context/propagation are three independent first-write-wins slots,
+    // so a host that won e.g. the `context` slot on its own must not have it
+    // wiped by TraceRoot's teardown. (A host that shares TraceRoot's OWN
+    // registered instances without registering its own cannot be
+    // distinguished here and will still see the reset -- an accepted
+    // limitation.) _resetForTesting() below is unconditional because tests
+    // always want a clean slate.
+    _releaseGlobalSlots(provider);
   }
 }
 
@@ -183,6 +324,12 @@ export class TraceRoot {
 export function _resetForTesting(): void {
   _isInitialized = false;
   _provider = undefined;
+  if (_beforeExitHandler) {
+    process.removeListener('beforeExit', _beforeExitHandler);
+    _beforeExitHandler = undefined;
+  }
+  _registeredContextManager = undefined;
+  _registeredPropagator = undefined;
   _resetObserveState();
   _resetGitContextCache();
   trace.disable();
