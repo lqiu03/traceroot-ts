@@ -699,6 +699,128 @@ describe('Claude Agent SDK instrumentation', () => {
     assert.equal(querySpans[0].status.code, 1);
   });
 
+  it('starts the underlying query once and reuses the same iterator across repeated iteration', async () => {
+    let callCount = 0;
+    const sdk = {
+      async *query(_params: QueryParams) {
+        callCount += 1;
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_one',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 1, output_tokens: 1 },
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        };
+        yield { type: 'result', result: 'done', usage: { input_tokens: 1, output_tokens: 1 } };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    const handle = sdk.query({ prompt: 'test prompt', options: { model: 'claude-opus-4-7' } });
+
+    const firstPass: unknown[] = [];
+    for await (const message of handle) {
+      firstPass.push(message);
+    }
+
+    const secondPass: unknown[] = [];
+    for await (const message of handle) {
+      secondPass.push(message);
+    }
+
+    assert.equal(
+      callCount,
+      1,
+      'original query() should only be invoked once per wrappedQuery() call',
+    );
+    assert.equal(firstPass.length, 2);
+    assert.equal(
+      secondPass.length,
+      0,
+      'the already-exhausted iterator should not re-run the agent',
+    );
+
+    const querySpans = exporter.getFinishedSpans().filter((s) => s.name === 'ClaudeAgent.query');
+    assert.equal(querySpans.length, 1);
+  });
+
+  it('does not start original() or leak a span when the returned iterable is never iterated', async () => {
+    let callCount = 0;
+    const sdk = {
+      async *query(_params: QueryParams) {
+        callCount += 1;
+        yield { type: 'result', result: 'done', usage: { input_tokens: 1, output_tokens: 1 } };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    // Obtain the handle but never iterate it.
+    const _handle = sdk.query({ prompt: 'test prompt', options: { model: 'claude-opus-4-7' } });
+
+    assert.equal(callCount, 0, 'original() must not run before the handle is iterated');
+
+    const spans = exporter.getFinishedSpans();
+    assert.equal(spans.length, 0, 'no spans should be started or ended for an unconsumed handle');
+  });
+
+  it('drives one underlying execution and one query span across two [Symbol.asyncIterator]() calls', async () => {
+    let callCount = 0;
+    const sdk = {
+      async *query(_params: QueryParams) {
+        callCount += 1;
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_one',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 1, output_tokens: 1 },
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        };
+        yield { type: 'result', result: 'done', usage: { input_tokens: 1, output_tokens: 1 } };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    const handle = sdk.query({ prompt: 'test prompt', options: { model: 'claude-opus-4-7' } });
+
+    const firstIterator = handle[Symbol.asyncIterator]();
+    const secondIterator = handle[Symbol.asyncIterator]();
+
+    assert.equal(callCount, 0, 'original() must not run until the first next() call');
+    assert.equal(
+      firstIterator,
+      secondIterator,
+      'repeated [Symbol.asyncIterator]() calls must return the same iterator instance',
+    );
+
+    const results: unknown[] = [];
+    for (
+      let result = await firstIterator.next();
+      !result.done;
+      result = await firstIterator.next()
+    ) {
+      results.push(result.value);
+    }
+
+    assert.equal(
+      callCount,
+      1,
+      'original() should only be invoked once regardless of how many times the iterable is obtained',
+    );
+    assert.equal(results.length, 2);
+
+    const querySpans = exporter.getFinishedSpans().filter((s) => s.name === 'ClaudeAgent.query');
+    assert.equal(querySpans.length, 1);
+  });
+
   it('uses final result usage to correct the last pending assistant group', async () => {
     const sdk = {
       async *query(params: QueryParams) {
@@ -765,5 +887,262 @@ describe('Claude Agent SDK instrumentation', () => {
     assert.equal(llmSpans[1].attributes['llm.token_count.completion'], 100);
     assert.equal(llmSpans[1].attributes['llm.token_count.prompt_details.cache_read'], 20);
     assert.equal(llmSpans[1].attributes['llm.token_count.prompt_details.cache_creation'], 30);
+  });
+
+  it('does not mutate the host-yielded assistant message when correcting usage from the result', async () => {
+    const sdk = {
+      async *query(_params: QueryParams) {
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_final',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 200, output_tokens: 1 },
+            content: [{ type: 'text', text: 'final answer' }],
+          },
+        };
+        yield {
+          type: 'result',
+          result: 'final answer',
+          usage: {
+            input_tokens: 300,
+            output_tokens: 110,
+            cache_read_input_tokens: 20,
+            cache_creation_input_tokens: 30,
+          },
+        };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    const seenAssistantMessages: Array<{ message?: { usage?: Record<string, unknown> } }> = [];
+    for await (const message of sdk.query({
+      prompt: 'test prompt',
+      options: { model: 'claude-opus-4-7' },
+    })) {
+      if ((message as { type?: string }).type === 'assistant') {
+        seenAssistantMessages.push(message as { message?: { usage?: Record<string, unknown> } });
+      }
+    }
+
+    // The instrumentation computes a corrected usage for span attributes, but the
+    // object the SDK consumer received during iteration must remain exactly as
+    // the host produced it -- instrumentation must never write through to it.
+    assert.equal(seenAssistantMessages.length, 1);
+    assert.deepEqual(seenAssistantMessages[0].message?.usage, {
+      input_tokens: 200,
+      output_tokens: 1,
+    });
+  });
+
+  it('marks the tool span ERROR with the hook-reported message on PostToolUseFailure', async () => {
+    const sdk = {
+      async *query(params: QueryParams) {
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_fail',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 10, output_tokens: 1 },
+            content: [{ type: 'tool_use', id: 'toolu_fail_1', name: 'Bash', input: {} }],
+          },
+        };
+        await runHooks(
+          params,
+          'PreToolUse',
+          { tool_name: 'Bash', tool_input: { command: 'exit 1' } },
+          'toolu_fail_1',
+        );
+        await runHooks(
+          params,
+          'PostToolUseFailure',
+          { tool_name: 'Bash', error: 'command exited 1' },
+          'toolu_fail_1',
+        );
+        yield { type: 'result', result: 'done', usage: { input_tokens: 10, output_tokens: 1 } };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+    await exhaustQuery(sdk);
+
+    const toolSpans = exporter.getFinishedSpans().filter((s) => s.name === 'Bash');
+    // The failure must settle the span exactly once: endInFlight() at query end
+    // must not find it still registered and end it a second time.
+    assert.equal(toolSpans.length, 1);
+    const tool = toolSpans[0];
+    assert.equal(tool.status.code, 2);
+    assert.equal(tool.status.message, 'command exited 1');
+    assert.ok(
+      tool.events.some((e) => e.name === 'exception'),
+      'expected a recorded exception event on the failed tool span',
+    );
+  });
+
+  it('ends the query span with ERROR and sweeps in-flight tool spans when the consumer calls iterator.throw()', async () => {
+    let firePreToolUse: (() => Promise<void>) | undefined;
+    const sdk = {
+      async *query(params: QueryParams) {
+        firePreToolUse = () =>
+          runHooks(
+            params,
+            'PreToolUse',
+            { tool_name: 'WebSearch', tool_input: { query: 'q' } },
+            'toolu_abandoned_1',
+          );
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_throw',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 10, output_tokens: 1 },
+            content: [{ type: 'tool_use', id: 'toolu_abandoned_1', name: 'WebSearch', input: {} }],
+          },
+        };
+        yield { type: 'result', result: 'never reached' };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    const iterable = sdk.query({ prompt: 'test prompt', options: { model: 'claude-opus-4-7' } });
+    const iterator = iterable[Symbol.asyncIterator]();
+    await iterator.next();
+    // Tool started (hook fired) but its PostToolUse never arrives.
+    await firePreToolUse!();
+    await assert.rejects(
+      () => iterator.throw!(new Error('consumer abandoned')),
+      /consumer abandoned/,
+    );
+
+    const spans = exporter.getFinishedSpans();
+    const query = spans.find((s) => s.name === 'ClaudeAgent.query')!;
+    assert.ok(query, 'query span missing');
+    assert.equal(query.status.code, 2);
+    assert.equal(query.status.message, 'consumer abandoned');
+
+    const tool = spans.find((s) => s.name === 'WebSearch')!;
+    assert.ok(tool, 'in-flight tool span was never ended/exported after iterator.throw()');
+    assert.equal(tool.status.code, 2);
+  });
+
+  it('SubagentStop ends the subagent span with OK status and the last assistant message as output', async () => {
+    const sdk = {
+      async *query(params: QueryParams) {
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_main',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 10, output_tokens: 1 },
+            content: [{ type: 'tool_use', id: 'toolu_agent_stop', name: 'Agent', input: {} }],
+          },
+        };
+        await runHooks(
+          params,
+          'PreToolUse',
+          { tool_name: 'Agent', tool_input: {} },
+          'toolu_agent_stop',
+        );
+        await runHooks(
+          params,
+          'SubagentStart',
+          { agent_id: 'agent-stop-1', agent_type: 'researcher' },
+          'toolu_agent_stop',
+        );
+        await runHooks(
+          params,
+          'SubagentStop',
+          { agent_id: 'agent-stop-1', last_assistant_message: 'subagent findings' },
+          'toolu_agent_stop',
+        );
+        await runHooks(
+          params,
+          'PostToolUse',
+          { tool_name: 'Agent', tool_response: {} },
+          'toolu_agent_stop',
+        );
+        yield { type: 'result', result: 'done', usage: { input_tokens: 10, output_tokens: 1 } };
+      },
+    };
+
+    wireClaudeAgentSDKInstrumentation(sdk);
+    await exhaustQuery(sdk);
+
+    const subagentSpans = exporter.getFinishedSpans().filter((s) => s.name === 'Subagent');
+    // SubagentStop ended it; the later PostToolUse and query-end sweep must not
+    // end it again (subagent.ended guards both paths).
+    assert.equal(subagentSpans.length, 1);
+    const subagent = subagentSpans[0];
+    assert.equal(subagent.status.code, 1);
+    assert.equal(subagent.attributes['output.value'], 'subagent findings');
+    assert.equal(subagent.attributes['claude_agent_sdk.agent_id'], 'agent-stop-1');
+    assert.equal(subagent.attributes['claude_agent_sdk.agent_type'], 'researcher');
+  });
+
+  it('keeps exporting spans after a shutdown()/re-initialize() cycle', async () => {
+    const sdk = {
+      async *query(_params: QueryParams) {
+        yield {
+          type: 'assistant',
+          message: {
+            id: 'msg_cycle',
+            role: 'assistant',
+            model: 'claude-opus-4-7',
+            usage: { input_tokens: 10, output_tokens: 1 },
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        };
+        yield { type: 'result', result: 'done', usage: { input_tokens: 10, output_tokens: 1 } };
+      },
+    };
+
+    // wireClaudeAgentSDKInstrumentation() is only ever called once for this
+    // `sdk` object -- the WRAPPED guard on the module namespace means a
+    // second initialize() below never re-wraps query() or re-captures a
+    // tracer. The fix under test is that the tracer wrapQuery() captured
+    // still routes spans to whatever provider is globally registered at
+    // span-open time, not the one that was active when wireClaudeAgentSDKInstrumentation()
+    // first ran.
+    wireClaudeAgentSDKInstrumentation(sdk);
+
+    // Simulates the first TraceRoot.initialize(): `provider`/`exporter` are
+    // already registered by the outer beforeEach().
+    await exhaustQuery(sdk);
+    const firstQuerySpans = exporter
+      .getFinishedSpans()
+      .filter((s) => s.name === 'ClaudeAgent.query');
+    assert.equal(firstQuerySpans.length, 1, 'first initialize() should export a query span');
+
+    // Simulates TraceRoot.shutdown(): tears down the current provider and
+    // swaps in a fresh ProxyTracerProvider delegate via trace.disable().
+    await provider.shutdown();
+    trace.disable();
+
+    // Simulates a second TraceRoot.initialize(): a brand-new provider is
+    // globally registered in the same process.
+    const secondExporter = new InMemorySpanExporter();
+    const secondProvider = new NodeTracerProvider();
+    secondProvider.addSpanProcessor(new SimpleSpanProcessor(secondExporter));
+    secondProvider.register();
+
+    try {
+      await exhaustQuery(sdk);
+      const secondQuerySpans = secondExporter
+        .getFinishedSpans()
+        .filter((s) => s.name === 'ClaudeAgent.query');
+      assert.equal(
+        secondQuerySpans.length,
+        1,
+        'spans opened after re-initialize() must export through the new provider, not go silently dark',
+      );
+    } finally {
+      await secondProvider.shutdown();
+    }
   });
 });
